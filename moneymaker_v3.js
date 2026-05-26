@@ -23,14 +23,14 @@
  * - Optional WebSocket: npm install ws
  *
  * Run:
- *   npm install ws
- *   node moneymaker_v3.js
+ * npm install ws
+ * node moneymaker_v3.js
  *
  * Safer test:
- *   INITIAL_CASH=10000 BASE_ORDER_USD=10 MAX_POSITION_USD=100 node moneymaker_v3.js
+ * INITIAL_CASH=10000 BASE_ORDER_USD=10 MAX_POSITION_USD=100 node moneymaker_v3.js
  *
  * Aggressive paper research:
- *   HUNTER_MODE=true ENABLE_WS=true MAX_MARKETS=25 BASE_ORDER_USD=20 node moneymaker_v3.js
+ * HUNTER_MODE=true ENABLE_WS=true MAX_MARKETS=25 BASE_ORDER_USD=20 node moneymaker_v3.js
  */
 
 // =========================
@@ -1019,377 +1019,27 @@ function confidenceFromPrice(mid) {
 // =========================
 
 class RiskEngine {
-  constructor(config, portfolio, orders, cache, volGuard) {
-    this.config = config;
-    this.portfolio = portfolio;
-    this.orders = orders;
-    this.cache = cache;
-    this.volGuard = volGuard;
-    this.blacklist = new Set();
-  }
-
-  approve(signal, book) {
-    if (!signal) return deny('empty signal');
-    if (!['buy', 'sell'].includes(signal.side)) return deny('invalid side');
-    if (!isBookComplete(book)) return deny('incomplete book');
-    if (this.blacklist.has(signal.marketId) || this.blacklist.has(signal.tokenId)) return deny('blacklisted');
-
-    if (signal.expectedEdge < this.config.minSignalEdge) return deny(`edge too low ${signal.expectedEdge.toFixed(4)}`);
-    if (signal.confidence < this.config.minConfidence) return deny(`confidence too low ${signal.confidence.toFixed(2)}`);
-
-    if (this.volGuard.isTripped(signal.tokenId) && !this.config.quoteDuringVolatility) {
-      return deny('volatility guard active');
-    }
-
-    const price = signal.price;
-    if (!Number.isFinite(price) || price <= 0 || price >= 1) return deny('bad price');
-
-    const usd = signal.sizeUsd;
-    if (!Number.isFinite(usd) || usd < this.config.minOrderUsd) return deny('size too small');
-
-    const openOrderUsd = this.orders.totalOpenUsd();
-    if (openOrderUsd + usd > this.config.maxTotalOpenOrderUsd) return deny('open order usd limit');
-    if (this.orders.openOrders.size >= this.config.maxOpenOrders) return deny('max open orders');
-
-    const mark = book.midpoint;
-    const currentAssetUsd = this.portfolio.positionUsd(signal.tokenId, mark);
-    const nextAssetUsd = currentAssetUsd + (signal.side === 'buy' ? usd : -usd);
-
-    if (Math.abs(nextAssetUsd) > this.config.maxPositionUsdPerAsset) {
-      return deny('asset exposure limit');
-    }
-
-    const marketExposure = this.portfolio.marketExposureUsd(signal.marketId, this.cache.markPrices()) + usd;
-    if (marketExposure > this.config.maxMarketExposureUsd) {
-      return deny('market exposure limit');
-    }
-
-    const totalExposure = this.portfolio.totalGrossExposureUsd(this.cache.markPrices()) + usd;
-    if (totalExposure > this.config.maxTotalExposureUsd) {
-      return deny('total exposure limit');
-    }
-
-    const equity = this.portfolio.equity(this.cache.markPrices());
-    if (signal.side === 'buy' && this.portfolio.cash < usd) return deny('insufficient paper cash');
-    if (equity <= 0) return deny('bad equity');
-
-    if (signal.side === 'sell') {
-      const qty = this.portfolio.position(signal.tokenId);
-      const requestedQty = usd / price;
-      if (qty <= 0 || requestedQty > qty * 1.05) {
-        return deny('cannot sell more paper inventory than held');
-      }
-    }
-
-    return { ok: true, reason: 'approved' };
-  }
-}
-
-function deny(reason) {
-  return { ok: false, reason };
-}
-
-// =========================
-// PAPER PORTFOLIO
-// =========================
-
-class PaperPortfolio {
-  constructor(initialCash) {
-    this.initialCash = initialCash;
-    this.cash = initialCash;
-    this.positions = new Map();
-    this.lots = new Map();
-    this.fills = [];
-    this.realizedVolume = 0;
-    this.realizedPnlByStrategy = new Map();
-    this.peakEquity = initialCash;
-  }
-
-  position(tokenId) {
-    return this.positions.get(String(tokenId)) || 0;
-  }
-
-  positionUsd(tokenId, mark) {
-    return this.position(tokenId) * (Number.isFinite(mark) ? mark : 0);
-  }
-
-  marketExposureUsd(marketId, marks) {
-    let total = 0;
-    for (const [tokenId, qty] of this.positions.entries()) {
-      const lot = this.lots.get(tokenId);
-      if (lot?.marketId === marketId) {
-        total += Math.abs(qty * (marks.get(tokenId) || lot.avgPrice || 0));
-      }
-    }
-    return total;
-  }
-
-  totalGrossExposureUsd(marks) {
-    let total = 0;
-    for (const [tokenId, qty] of this.positions.entries()) {
-      const lot = this.lots.get(tokenId);
-      total += Math.abs(qty * (marks.get(tokenId) || lot?.avgPrice || 0));
-    }
-    return total;
-  }
-
-  applyFill(fill) {
-    const tokenId = String(fill.tokenId);
-    const oldQty = this.position(tokenId);
-    const signedQty = fill.side === 'buy' ? fill.size : -fill.size;
-    const newQty = oldQty + signedQty;
-    const value = fill.price * fill.size;
-
-    if (fill.side === 'buy') {
-      this.cash -= value;
-      this.updateLotOnBuy(fill, oldQty, newQty);
-    } else {
-      this.cash += value;
-      this.updateLotOnSell(fill, oldQty, newQty);
-    }
-
-    if (Math.abs(newQty) < 1e-9) {
-      this.positions.delete(tokenId);
-    } else {
-      this.positions.set(tokenId, newQty);
-    }
-
-    this.realizedVolume += value;
-    this.fills.push(fill);
-  }
-
-  updateLotOnBuy(fill, oldQty, newQty) {
-    const tokenId = String(fill.tokenId);
-    const lot = this.lots.get(tokenId) || {
-      qty: 0,
-      avgPrice: 0,
-      strategy: fill.strategy,
-      marketId: fill.marketId,
-      openedAt: fill.timestamp,
-      marketQuestion: fill.marketQuestion,
-      outcome: fill.outcome,
-    };
-
-    const oldCost = Math.max(0, oldQty) * lot.avgPrice;
-    const addCost = fill.size * fill.price;
-    const nextQty = Math.max(0, newQty);
-
-    lot.qty = nextQty;
-    lot.avgPrice = nextQty > 0 ? (oldCost + addCost) / nextQty : 0;
-    lot.strategy = lot.strategy || fill.strategy;
-    lot.marketId = fill.marketId;
-    lot.marketQuestion = fill.marketQuestion;
-    lot.outcome = fill.outcome;
-    this.lots.set(tokenId, lot);
-  }
-
-  updateLotOnSell(fill, oldQty, newQty) {
-    const tokenId = String(fill.tokenId);
-    const lot = this.lots.get(tokenId);
-
-    if (lot && oldQty > 0) {
-      const closedQty = Math.min(fill.size, oldQty);
-      const pnl = (fill.price - lot.avgPrice) * closedQty;
-      const prev = this.realizedPnlByStrategy.get(fill.strategy) || 0;
-      this.realizedPnlByStrategy.set(fill.strategy, prev + pnl);
-    }
-
-    if (newQty <= 1e-9) {
-      this.lots.delete(tokenId);
-    } else if (lot) {
-      lot.qty = newQty;
-      this.lots.set(tokenId, lot);
-    }
-  }
-
-  equity(marks) {
-    let total = this.cash;
-    for (const [tokenId, qty] of this.positions.entries()) {
-      const lot = this.lots.get(tokenId);
-      total += qty * (marks.get(tokenId) || lot?.avgPrice || 0);
-    }
-    return total;
-  }
-
-  drawdownPct(marks) {
-    const eq = this.equity(marks);
-    this.peakEquity = Math.max(this.peakEquity, eq);
-    if (this.peakEquity <= 0) return 0;
-    return ((this.peakEquity - eq) / this.peakEquity) * 100;
-  }
-
-  toJSON() {
-    return {
-      initialCash: this.initialCash,
-      cash: this.cash,
-      positions: Object.fromEntries(this.positions.entries()),
-      lots: Object.fromEntries(this.lots.entries()),
-      fills: this.fills.slice(-1000),
-      realizedVolume: this.realizedVolume,
-      realizedPnlByStrategy: Object.fromEntries(this.realizedPnlByStrategy.entries()),
-      peakEquity: this.peakEquity,
-    };
-  }
-
-  static fromJSON(data, fallbackInitialCash) {
-    const p = new PaperPortfolio(data?.initialCash || fallbackInitialCash);
-    p.cash = Number.isFinite(data?.cash) ? data.cash : p.initialCash;
-    p.positions = new Map(Object.entries(data?.positions || {}).map(([k, v]) => [k, Number(v)]));
-    p.lots = new Map(Object.entries(data?.lots || {}));
-    p.fills = Array.isArray(data?.fills) ? data.fills : [];
-    p.realizedVolume = Number.isFinite(data?.realizedVolume) ? data.realizedVolume : 0;
-    p.realizedPnlByStrategy = new Map(Object.entries(data?.realizedPnlByStrategy || {}).map(([k, v]) => [k, Number(v)]));
-    p.peakEquity = Number.isFinite(data?.peakEquity) ? data.peakEquity : p.initialCash;
-    return p;
-  }
-}
-
-// =========================
-// PAPER ORDER MANAGER
-// =========================
-
-class PaperOrderManager {
   constructor(config, portfolio) {
     this.config = config;
     this.portfolio = portfolio;
-    this.openOrders = new Map();
-    this.fillStats = {
-      placed: 0,
-      filled: 0,
-      cancelled: 0,
-      denied: 0,
-    };
   }
 
-  place(signal, book, asset) {
-    const tick = book.tickSize || 0.01;
-    const price = roundToTick(signal.price, tick);
-    const minSize = book.minOrderSize || 5;
-    const size = Math.max(minSize, signal.sizeUsd / price);
+  evaluate(signal) {
+    if (signal.confidence < this.config.minConfidence) return null;
 
-    const order = {
-      id: crypto.randomUUID(),
-      signalId: signal.id,
-      strategy: signal.strategy,
-      tokenId: signal.tokenId,
-      marketId: signal.marketId,
-      side: signal.side,
-      price,
-      size,
-      value: price * size,
-      tickSize: tick,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + signal.ttlMs,
-      maxHoldMs: signal.maxHoldMs,
-      expectedEdge: signal.expectedEdge,
-      confidence: signal.confidence,
-      reason: signal.reason,
-      exitPlan: signal.exitPlan,
-      marketQuestion: asset.market.question,
-      outcome: asset.outcome,
-      status: 'OPEN',
-    };
+    const openUsd = this.portfolio.totalOpenOrderUsd();
+    if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return null;
 
-    this.openOrders.set(order.id, order);
-    this.fillStats.placed++;
-    return order;
+    const totalEx = this.portfolio.totalExposureUsd();
+    if (totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return null;
+
+    const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
+    if (mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return null;
+
+    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return null;
+
+    return signal;
   }
-
-  cancelStale() {
-    const now = Date.now();
-    let n = 0;
-
-    for (const [id, order] of this.openOrders.entries()) {
-      if (order.expiresAt <= now) {
-        this.openOrders.delete(id);
-        this.fillStats.cancelled++;
-        n++;
-      }
-    }
-
-    return n;
-  }
-
-  cancelForToken(tokenId) {
-    let n = 0;
-    for (const [id, order] of this.openOrders.entries()) {
-      if (order.tokenId === String(tokenId)) {
-        this.openOrders.delete(id);
-        this.fillStats.cancelled++;
-        n++;
-      }
-    }
-    return n;
-  }
-
-  totalOpenUsd() {
-    return [...this.openOrders.values()].reduce((sum, o) => sum + o.value, 0);
-  }
-
-  simulateFills(asset, book) {
-    const fills = [];
-
-    for (const [id, order] of this.openOrders.entries()) {
-      if (order.tokenId !== asset.tokenId) continue;
-
-      const result = shouldPaperFill(order, book);
-      if (!result.fill) continue;
-
-      this.openOrders.delete(id);
-      this.fillStats.filled++;
-
-      fills.push({
-        id: crypto.randomUUID(),
-        orderId: id,
-        signalId: order.signalId,
-        strategy: order.strategy,
-        tokenId: order.tokenId,
-        marketId: order.marketId,
-        side: order.side,
-        price: order.price,
-        size: order.size,
-        value: order.price * order.size,
-        expectedEdge: order.expectedEdge,
-        confidence: order.confidence,
-        marketQuestion: order.marketQuestion,
-        outcome: order.outcome,
-        timestamp: Date.now(),
-        reason: result.reason,
-      });
-    }
-
-    return fills;
-  }
-
-  toJSON() {
-    return {
-      openOrders: [...this.openOrders.values()],
-      fillStats: this.fillStats,
-    };
-  }
-
-  loadJSON(data) {
-    this.openOrders = new Map();
-    for (const order of data?.openOrders || []) {
-      if (order?.id) this.openOrders.set(order.id, order);
-    }
-    if (data?.fillStats) this.fillStats = { ...this.fillStats, ...data.fillStats };
-  }
-}
-
-function shouldPaperFill(order, book) {
-  // Conservative maker-fill simulation:
-  // - Buy fills only if live ask moves down through our bid.
-  // - Sell fills only if live bid moves up through our ask.
-  if (order.side === 'buy' && Number.isFinite(book.bestAsk) && book.bestAsk <= order.price) {
-    return { fill: true, reason: `bestAsk ${fmtPrice(book.bestAsk)} <= bid ${fmtPrice(order.price)}` };
-  }
-
-  if (order.side === 'sell' && Number.isFinite(book.bestBid) && book.bestBid >= order.price) {
-    return { fill: true, reason: `bestBid ${fmtPrice(book.bestBid)} >= ask ${fmtPrice(order.price)}` };
-  }
-
-  return { fill: false, reason: 'not crossed' };
 }
 
 // =========================
@@ -1400,466 +1050,207 @@ class VolatilityGuard {
   constructor(config) {
     this.config = config;
     this.history = new Map();
-    this.trippedUntilByToken = new Map();
+    this.tripped = new Map();
   }
 
-  update(tokenId, price) {
-    if (!Number.isFinite(price)) return false;
+  record(tokenId, midpoint) {
+    if (!Number.isFinite(midpoint)) return;
+    const now = Date.now();
+    if (!this.history.has(tokenId)) this.history.set(tokenId, []);
 
-    const key = String(tokenId);
-    const arr = this.history.get(key) || [];
-    arr.push(price);
-    while (arr.length > this.config.historyLookback) arr.shift();
-    this.history.set(key, arr);
+    const arr = this.history.get(tokenId);
+    arr.push({ ts: now, price: midpoint });
 
-    const volPct = this.getVolPct(key);
-    if (volPct > this.config.volatilityTripPct) {
-      this.trippedUntilByToken.set(key, Date.now() + this.config.volatilityCooldownMs);
-      warn(`Volatility guard tripped: ${shortId(key)} vol=${volPct.toFixed(2)}%`);
-      return true;
+    while (arr.length > 0 && arr[0].ts < now - this.config.historyLookback * 1000) {
+      arr.shift();
     }
 
-    return false;
-  }
+    if (arr.length > 2) {
+      const min = Math.min(...arr.map((x) => x.price));
+      const max = Math.max(...arr.map((x) => x.price));
+      const diffPct = ((max - min) / midpoint) * 100;
 
-  getVolPct(tokenId) {
-    const arr = this.history.get(String(tokenId)) || [];
-    if (arr.length < 6) return 0;
-
-    const returns = [];
-    for (let i = 1; i < arr.length; i++) {
-      returns.push((arr[i] - arr[i - 1]) / Math.max(0.0001, arr[i - 1]));
+      if (diffPct > this.config.volatilityTripPct) {
+        this.tripped.set(tokenId, now + this.config.volatilityCooldownMs);
+      }
     }
-
-    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const variance = returns.reduce((s, r) => s + Math.pow(r - mean, 2), 0) / returns.length;
-    return Math.sqrt(variance) * 100;
-  }
-
-  getVolMultiplier(tokenId) {
-    const volPct = this.getVolPct(tokenId);
-    return clamp(1 + (volPct / Math.max(1, this.config.volatilityTripPct)), 1, 3);
   }
 
   isTripped(tokenId) {
-    const until = this.trippedUntilByToken.get(String(tokenId)) || 0;
-    return Date.now() < until;
+    const expires = this.tripped.get(tokenId) || 0;
+    return Date.now() < expires;
+  }
+
+  getVolMultiplier(tokenId) {
+    return this.isTripped(tokenId) ? 2.0 : 1.0;
   }
 }
 
 // =========================
-// PERFORMANCE ENGINE
+// PORTFOLIO & EXECUTION
 // =========================
 
-class PerformanceEngine {
-  constructor(portfolio, orders, cache) {
-    this.portfolio = portfolio;
-    this.orders = orders;
-    this.cache = cache;
-    this.adverseSamples = [];
-  }
-
-  recordFillQuality(fill, bookAfter) {
-    if (!bookAfter || !Number.isFinite(bookAfter.midpoint)) return;
-
-    const signed = fill.side === 'buy'
-      ? bookAfter.midpoint - fill.price
-      : fill.price - bookAfter.midpoint;
-
-    this.adverseSamples.push({
-      timestamp: Date.now(),
-      strategy: fill.strategy,
-      tokenId: fill.tokenId,
-      signedEdgeNow: signed,
-      fillPrice: fill.price,
-      mark: bookAfter.midpoint,
-    });
-
-    if (this.adverseSamples.length > 1000) this.adverseSamples.shift();
-  }
-
-  strategySummary() {
-    const summary = new Map();
-
-    for (const fill of this.portfolio.fills) {
-      const s = summary.get(fill.strategy) || {
-        fills: 0,
-        volume: 0,
-        avgExpectedEdge: 0,
-      };
-
-      s.fills++;
-      s.volume += fill.value;
-      s.avgExpectedEdge += fill.expectedEdge || 0;
-      summary.set(fill.strategy, s);
-    }
-
-    for (const s of summary.values()) {
-      s.avgExpectedEdge = s.fills > 0 ? s.avgExpectedEdge / s.fills : 0;
-    }
-
-    return summary;
-  }
-
-  adverseSummary() {
-    if (this.adverseSamples.length === 0) return { count: 0, avg: 0 };
-    const avg = this.adverseSamples.reduce((sum, x) => sum + x.signedEdgeNow, 0) / this.adverseSamples.length;
-    return { count: this.adverseSamples.length, avg };
-  }
-}
-
-// =========================
-// BOT ENGINE
-// =========================
-
-class BotEngine {
+class Portfolio {
   constructor(config) {
     this.config = config;
-    this.poly = new PolymarketPublicClient(config);
-    this.cache = new MarketCache(this.poly);
-    this.research = new ResearchEngine(this.poly, this.cache, config);
-    this.portfolio = this.loadPortfolio();
-    this.orders = new PaperOrderManager(config, this.portfolio);
-    this.volGuard = new VolatilityGuard(config);
-    this.risk = new RiskEngine(config, this.portfolio, this.orders, this.cache, this.volGuard);
-    this.performance = new PerformanceEngine(this.portfolio, this.orders, this.cache);
+    this.cash = config.initialCash;
+    this.equity = config.initialCash;
+    this.peakEquity = config.initialCash;
+    this.positions = new Map();
+    this.openOrders = new Map();
+    this.pnlByStrategy = new Map();
 
-    this.strategies = [
-      new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
-      new ComplementArbStrategy(config, this.cache, this.portfolio, this.volGuard),
-      new InventoryExitStrategy(config, this.cache, this.portfolio, this.volGuard),
-      new TailEndMispricingStrategy(config, this.cache, this.portfolio, this.volGuard),
-    ];
-
-    this.candidates = [];
-    this.cycle = 0;
-    this.running = true;
-    this.wsRefreshInFlight = new Set();
-
-    this.clobWs = null;
-    if (config.enableWs) {
-      this.clobWs = new CLOBWebSocketClient({
-        url: config.clobWsUrl,
-        onMessage: (msg) => this.handleWsMessage(msg),
-      });
-    }
-
-    this.loadOrders();
+    this.loadState();
   }
 
-  async start() {
-    banner();
-
-    if (typeof fetch !== 'function') {
-      throw new Error('Node.js 18+ is required because this script uses built-in fetch.');
-    }
-
-    info('Starting MoneyMaker V3 in PAPER mode.');
-    info(`Cash=$${this.portfolio.cash.toFixed(2)} State=${this.config.stateFile}`);
-
-    if (this.clobWs) this.clobWs.connect();
-
-    await this.refreshResearch();
-
-    while (this.running) {
-      try {
-        this.cycle++;
-
-        if (this.cycle % this.config.marketRefreshEveryCycles === 0 || this.candidates.length === 0) {
-          await this.refreshResearch();
-        }
-
-        const cancelled = this.orders.cancelStale();
-        if (cancelled > 0) info(`Cancelled ${cancelled} stale paper orders.`);
-
-        for (const asset of this.candidates) {
-          await this.processAsset(asset);
-          await sleep(50);
-        }
-
-        const dd = this.portfolio.drawdownPct(this.cache.markPrices());
-        if (dd >= this.config.maxDrawdownPct) {
-          warn(`Max paper drawdown hit: ${dd.toFixed(2)}%. Stopping.`);
-          this.running = false;
-        }
-
-        if (this.cycle % this.config.reportEveryCycles === 0) {
-          this.report();
-        }
-
-        this.saveState();
-        await sleep(this.config.loopDelayMs);
-      } catch (e) {
-        errlog(`Main loop error: ${e.stack || e.message}`);
-        await sleep(5_000);
-      }
-    }
-
-    this.report();
-    this.saveState();
-    info('MoneyMaker V3 stopped.');
-  }
-
-  async refreshResearch() {
-    this.candidates = await this.research.discoverCandidates();
-    this.cache.setCandidates(this.candidates);
-
-    if (this.clobWs && this.candidates.length > 0) {
-      this.clobWs.subscribe(this.candidates.map((a) => a.tokenId));
-    }
-  }
-
-  handleWsMessage(msg) {
-    const eventType = msg.event_type || msg.type;
-    const tokenId = String(msg.asset_id || msg.assetId || msg.token_id || msg.tokenId || '');
-
-    if (!tokenId) return;
-
-    if (eventType === 'book' && Array.isArray(msg.bids) && Array.isArray(msg.asks)) {
-      const book = normalizeBook(msg, tokenId);
-      this.cache.setBook(tokenId, book);
-    }
-
-    if (eventType === 'best_bid_ask') {
-      const cached = this.cache.getBook(tokenId) || {
-        assetId: tokenId,
-        bids: [],
-        asks: [],
-        tickSize: 0.01,
-        minOrderSize: 5,
-      };
-
-      const bestBid = toNum(msg.best_bid ?? msg.bestBid ?? msg.bid, NaN);
-      const bestAsk = toNum(msg.best_ask ?? msg.bestAsk ?? msg.ask, NaN);
-
-      if (Number.isFinite(bestBid)) cached.bestBid = bestBid;
-      if (Number.isFinite(bestAsk)) cached.bestAsk = bestAsk;
-      if (Number.isFinite(cached.bestBid) && Number.isFinite(cached.bestAsk)) {
-        cached.midpoint = (cached.bestBid + cached.bestAsk) / 2;
-        cached.spread = cached.bestAsk - cached.bestBid;
-        cached.cachedAt = Date.now();
-        this.cache.setBook(tokenId, cached);
-      }
-    }
-
-    if (['book', 'price_change', 'last_trade_price', 'best_bid_ask'].includes(eventType)) {
-      this.queueWsAssetProcess(tokenId);
-    }
-  }
-
-  queueWsAssetProcess(tokenId) {
-    const key = String(tokenId);
-    if (this.wsRefreshInFlight.has(key)) return;
-
-    this.wsRefreshInFlight.add(key);
-    setTimeout(async () => {
-      try {
-        const asset = this.cache.getAsset(key);
-        if (asset) await this.processAsset(asset);
-      } catch (e) {
-        warn(`WS-triggered processing failed for ${shortId(key)}: ${e.message}`);
-      } finally {
-        this.wsRefreshInFlight.delete(key);
-      }
-    }, this.config.wsDebounceMs);
-  }
-
-  async processAsset(asset) {
-    let book;
+  loadState() {
+    if (!this.config.saveState) return;
     try {
-      book = await this.cache.getFreshBook(asset.tokenId);
+      if (fs.existsSync(this.config.stateFile)) {
+        const raw = fs.readFileSync(this.config.stateFile, 'utf8');
+        const data = JSON.parse(raw);
+        this.cash = data.cash || this.cash;
+        this.equity = data.equity || this.equity;
+        this.peakEquity = data.peakEquity || this.peakEquity;
+        if (data.positions) this.positions = new Map(Object.entries(data.positions));
+        if (data.pnlByStrategy) this.pnlByStrategy = new Map(Object.entries(data.pnlByStrategy));
+        info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity.toFixed(2)}`);
+      }
     } catch (e) {
-      warn(`Book refresh failed for ${shortId(asset.tokenId)}: ${e.message}`);
-      return;
-    }
-
-    if (!isBookComplete(book)) return;
-
-    this.volGuard.update(asset.tokenId, book.midpoint);
-
-    const fills = this.orders.simulateFills(asset, book);
-    for (const fill of fills) {
-      this.portfolio.applyFill(fill);
-      this.performance.recordFillQuality(fill, book);
-      info(
-        `PAPER FILL ${fill.strategy} ${fill.side.toUpperCase()} ${fill.outcome} ` +
-        `${fill.size.toFixed(2)} @ ${fmtPrice(fill.price)} value=$${fill.value.toFixed(2)} :: ${fill.reason}`
-      );
-    }
-
-    if (this.volGuard.isTripped(asset.tokenId) && !this.config.quoteDuringVolatility) {
-      const n = this.orders.cancelForToken(asset.tokenId);
-      if (n > 0) warn(`Volatility active; cancelled ${n} orders for ${shortId(asset.tokenId)}.`);
-      return;
-    }
-
-    const signals = [];
-    for (const strategy of this.strategies) {
-      try {
-        const generated = await strategy.generate(asset, book);
-        signals.push(...generated);
-      } catch (e) {
-        warn(`Strategy ${strategy.name} failed: ${e.message}`);
-      }
-    }
-
-    signals.sort((a, b) => {
-      const av = a.expectedEdge * a.confidence;
-      const bv = b.expectedEdge * b.confidence;
-      return bv - av;
-    });
-
-    for (const signal of signals.slice(0, 3)) {
-      const approval = this.risk.approve(signal, book);
-      if (!approval.ok) {
-        this.orders.fillStats.denied++;
-        continue;
-      }
-
-      const order = this.orders.place(signal, book, asset);
-      if (order) {
-        info(
-          `PAPER ORDER ${order.strategy} ${order.side.toUpperCase()} ${asset.outcome.padEnd(8)} ` +
-          `${order.size.toFixed(2)} @ ${fmtPrice(order.price)} edge=${signal.expectedEdge.toFixed(4)} ` +
-          `conf=${signal.confidence.toFixed(2)} :: ${signal.reason}`
-        );
-      }
-    }
-  }
-
-  report() {
-    const marks = this.cache.markPrices();
-    const equity = this.portfolio.equity(marks);
-    const pnl = equity - this.portfolio.initialCash;
-    const pnlPct = (pnl / this.portfolio.initialCash) * 100;
-    const dd = this.portfolio.drawdownPct(marks);
-    const adverse = this.performance.adverseSummary();
-    const strategySummary = this.performance.strategySummary();
-
-    console.log('\n================ MONEYMAKER V3 PAPER REPORT ================');
-    console.log(`Cycle:          ${this.cycle}`);
-    console.log(`Cash:           $${this.portfolio.cash.toFixed(2)}`);
-    console.log(`Equity:         $${equity.toFixed(2)}`);
-    console.log(`PnL:            $${pnl.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
-    console.log(`Drawdown:       ${dd.toFixed(2)}%`);
-    console.log(`Volume:         $${this.portfolio.realizedVolume.toFixed(2)}`);
-    console.log(`Fills:          ${this.portfolio.fills.length}`);
-    console.log(`Open orders:    ${this.orders.openOrders.size} ($${this.orders.totalOpenUsd().toFixed(2)})`);
-    console.log(`Selected assets:${this.candidates.length}`);
-    console.log(`Fill stats:     placed=${this.orders.fillStats.placed} filled=${this.orders.fillStats.filled} cancelled=${this.orders.fillStats.cancelled} denied=${this.orders.fillStats.denied}`);
-    console.log(`Adverse sample: n=${adverse.count} avgNow=${adverse.avg.toFixed(4)}`);
-
-    if (strategySummary.size > 0) {
-      console.log('Strategy summary:');
-      for (const [name, s] of strategySummary.entries()) {
-        console.log(`  - ${name}: fills=${s.fills} volume=$${s.volume.toFixed(2)} avgEdge=${s.avgExpectedEdge.toFixed(4)}`);
-      }
-    }
-
-    const positions = [...this.portfolio.positions.entries()]
-      .filter(([, qty]) => Math.abs(qty) > 1e-8)
-      .slice(0, 12);
-
-    if (positions.length > 0) {
-      console.log('Positions:');
-      for (const [tokenId, qty] of positions) {
-        const lot = this.portfolio.lots.get(tokenId);
-        const mark = marks.get(tokenId) || lot?.avgPrice || 0;
-        const pnl = lot ? (mark - lot.avgPrice) * qty : 0;
-        console.log(
-          `  - ${shortId(tokenId)} qty=${qty.toFixed(2)} mark=${fmtPrice(mark)} ` +
-          `avg=${fmtPrice(lot?.avgPrice || 0)} uPnL=$${pnl.toFixed(2)} ${lot?.outcome || ''}`
-        );
-      }
-    }
-
-    console.log('============================================================\n');
-  }
-
-  stop() {
-    this.running = false;
-  }
-
-  loadPortfolio() {
-    if (!this.config.saveState || !fs.existsSync(this.config.stateFile)) {
-      return new PaperPortfolio(this.config.initialCash);
-    }
-
-    try {
-      const data = JSON.parse(fs.readFileSync(this.config.stateFile, 'utf8'));
-      return PaperPortfolio.fromJSON(data.portfolio, this.config.initialCash);
-    } catch (e) {
-      warn(`Could not load state; starting fresh: ${e.message}`);
-      return new PaperPortfolio(this.config.initialCash);
-    }
-  }
-
-  loadOrders() {
-    if (!this.config.saveState || !fs.existsSync(this.config.stateFile)) return;
-
-    try {
-      const data = JSON.parse(fs.readFileSync(this.config.stateFile, 'utf8'));
-      this.orders.loadJSON(data.orders);
-    } catch (e) {
-      warn(`Could not load orders: ${e.message}`);
+      warn(`Failed to load state: ${e.message}`);
     }
   }
 
   saveState() {
     if (!this.config.saveState) return;
+    try {
+      const data = {
+        cash: this.cash,
+        equity: this.equity,
+        peakEquity: this.peakEquity,
+        positions: Object.fromEntries(this.positions),
+        pnlByStrategy: Object.fromEntries(this.pnlByStrategy),
+      };
+      fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
+    } catch (e) {
+      warn(`Failed to save state: ${e.message}`);
+    }
+  }
 
-    const state = {
-      savedAt: new Date().toISOString(),
-      mode: 'paper',
-      config: {
-        initialCash: this.config.initialCash,
-        baseOrderUsd: this.config.baseOrderUsd,
-        maxPositionUsdPerAsset: this.config.maxPositionUsdPerAsset,
-        maxTotalExposureUsd: this.config.maxTotalExposureUsd,
-      },
-      portfolio: this.portfolio.toJSON(),
-      orders: this.orders.toJSON(),
-    };
+  position(tokenId) {
+    return this.positions.get(String(tokenId)) || 0;
+  }
 
-    fs.writeFileSync(this.config.stateFile, JSON.stringify(state, null, 2));
+  positionUsd(tokenId, markPrice) {
+    return this.position(tokenId) * (markPrice || 0);
+  }
+
+  totalOpenOrderUsd() {
+    let total = 0;
+    for (const order of this.openOrders.values()) total += order.sizeUsd;
+    return total;
+  }
+
+  totalExposureUsd() {
+    return this.cash < this.equity ? this.equity - this.cash : 0;
+  }
+
+  marketExposureUsd(marketId) {
+    return 0; // Requires linking token positions strictly to market IDs. Stubbed for now.
+  }
+
+  getDrawdownPct() {
+    if (this.peakEquity <= 0) return 0;
+    return ((this.peakEquity - this.equity) / this.peakEquity) * 100;
+  }
+
+  addOrder(signal) {
+    this.openOrders.set(signal.id, signal);
+    info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
+  }
+
+  processBooks(cache) {
+    const now = Date.now();
+    for (const [id, order] of this.openOrders.entries()) {
+      if (now - order.createdAt > order.ttlMs) {
+        this.openOrders.delete(id);
+        continue;
+      }
+
+      const book = cache.getBook(order.tokenId);
+      if (!book) continue;
+
+      let filled = false;
+      if (order.side === 'buy' && book.bestAsk <= order.price) filled = true;
+      if (order.side === 'sell' && book.bestBid >= order.price) filled = true;
+
+      if (filled) {
+        const qty = order.sizeUsd / order.price;
+        const currentQty = this.position(order.tokenId);
+        const newQty = order.side === 'buy' ? currentQty + qty : currentQty - qty;
+
+        this.positions.set(order.tokenId, newQty);
+        this.cash += order.side === 'buy' ? -order.sizeUsd : order.sizeUsd;
+
+        const stratPnl = this.pnlByStrategy.get(order.strategy) || 0;
+        this.pnlByStrategy.set(order.strategy, stratPnl + (order.side === 'sell' ? order.sizeUsd : 0));
+
+        this.openOrders.delete(id);
+        info(`[FILL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} qty=${qty.toFixed(2)} @ ${fmtPrice(order.price)}`);
+      }
+    }
+
+    let invVal = 0;
+    for (const [tokenId, qty] of this.positions.entries()) {
+      const book = cache.getBook(tokenId);
+      if (book && Number.isFinite(book.midpoint)) {
+        invVal += qty * book.midpoint;
+      }
+    }
+
+    this.equity = this.cash + invVal;
+    if (this.equity > this.peakEquity) this.peakEquity = this.equity;
+  }
+
+  report() {
+    info(`--- PORTFOLIO REPORT ---`);
+    info(`Equity: $${this.equity.toFixed(2)} | Cash: $${this.cash.toFixed(2)} | Drawdown: ${this.getDrawdownPct().toFixed(2)}%`);
+    info(`Open Orders: ${this.openOrders.size}`);
+    this.saveState();
   }
 }
 
 // =========================
-// HELPERS
+// UTILITIES
 // =========================
 
-function toNum(value, fallback = NaN) {
-  if (value === null || value === undefined || value === '') return fallback;
-  const n = Number(value);
+function clamp(val, min, max) {
+  return Math.max(min, Math.min(max, val));
+}
+
+function roundToTick(val, tick) {
+  return Math.round(val / tick) * tick;
+}
+
+function toNum(val, fallback) {
+  const n = Number(val);
   return Number.isFinite(n) ? n : fallback;
 }
 
-function firstFinite(...values) {
-  for (const value of values) {
-    const n = toNum(value, NaN);
+function firstFinite(...args) {
+  for (const a of args) {
+    const n = Number(a);
     if (Number.isFinite(n)) return n;
   }
-  return 0;
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function roundToTick(price, tick) {
-  const t = Number.isFinite(tick) && tick > 0 ? tick : 0.01;
-  return Math.round(price / t) * t;
-}
-
-function fmtPrice(x) {
-  return Number.isFinite(x) ? Number(x).toFixed(3) : 'N/A';
+  return NaN;
 }
 
 function shortId(id) {
-  const s = String(id || '');
-  if (s.length <= 12) return s;
-  return `${s.slice(0, 6)}…${s.slice(-4)}`;
+  return String(id).slice(0, 8);
+}
+
+function fmtPrice(p) {
+  return Number.isFinite(p) ? '$' + Number(p).toFixed(3) : 'N/A';
 }
 
 function sleep(ms) {
@@ -1867,47 +1258,101 @@ function sleep(ms) {
 }
 
 function chunks(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
+  const res = [];
+  for (let i = 0; i < arr.length; i += size) res.push(arr.slice(i, i + size));
+  return res;
 }
 
-function msUntil(dateString) {
-  if (!dateString) return NaN;
-  const t = Date.parse(dateString);
-  if (!Number.isFinite(t)) return NaN;
-  return t - Date.now();
+function msUntil(dateStr) {
+  if (!dateStr) return NaN;
+  return new Date(dateStr).getTime() - Date.now();
 }
 
-function hoursUntil(dateString) {
-  return msUntil(dateString) / (60 * 60 * 1000);
-}
-
-function banner() {
-  console.log('='.repeat(76));
-  console.log('POLYMARKET MONEYMAKER V3 - PAPER EV ENGINE');
-  console.log('Strategies: SpreadHunter | ComplementArb | InventoryExit | TailEndMispricing');
-  console.log('Public data only. No private key. No real orders. Review before live trading.');
-  console.log('='.repeat(76));
+function hoursUntil(dateStr) {
+  return msUntil(dateStr) / (1000 * 60 * 60);
 }
 
 // =========================
-// STARTUP
+// MAIN ENTRYPOINT
 // =========================
 
-const bot = new BotEngine(CONFIG);
+async function main() {
+  info('Starting Polymarket MoneyMaker V3 (Paper)...');
+  const poly = new PolymarketPublicClient(CONFIG);
+  const cache = new MarketCache(poly);
+  const portfolio = new Portfolio(CONFIG);
+  const volGuard = new VolatilityGuard(CONFIG);
+  const risk = new RiskEngine(CONFIG, portfolio);
+  const research = new ResearchEngine(poly, cache, CONFIG);
 
-process.on('SIGINT', () => {
-  console.log('\nReceived SIGINT. Stopping after current cycle...');
-  bot.stop();
-});
+  const strategies = [
+    new SpreadHunterStrategy(CONFIG, cache, portfolio, volGuard),
+    new InventoryExitStrategy(CONFIG, cache, portfolio, volGuard),
+    new ComplementArbStrategy(CONFIG, cache, portfolio, volGuard),
+    new TailEndMispricingStrategy(CONFIG, cache, portfolio, volGuard),
+  ];
 
-process.on('SIGTERM', () => {
-  console.log('\nReceived SIGTERM. Stopping after current cycle...');
-  bot.stop();
-});
+  let wsClient = null;
+  if (CONFIG.enableWs) {
+    wsClient = new CLOBWebSocketClient({
+      url: CONFIG.clobWsUrl,
+      onMessage: (msg) => {
+        if (msg.event === 'price_change' && msg.asset_id) {
+          const book = cache.getBook(msg.asset_id) || {};
+          book.bids = normalizeLevels(msg.bids, 'bid');
+          book.asks = normalizeLevels(msg.asks, 'ask');
+          book.bestBid = book.bids[0]?.price || null;
+          book.bestAsk = book.asks[0]?.price || null;
+          if (book.bestBid && book.bestAsk) {
+            book.midpoint = (book.bestBid + book.bestAsk) / 2;
+            book.spread = book.bestAsk - book.bestBid;
+            volGuard.record(msg.asset_id, book.midpoint);
+          }
+          book.cachedAt = Date.now();
+          cache.setBook(msg.asset_id, book);
+        }
+      },
+    });
+    wsClient.connect();
+  }
 
-bot.start().catch((e) => {
-  errlog(`Fatal error: ${e.stack || e.message}`);
-  process.exit(1);
-});
+  let cycles = 0;
+
+  while (true) {
+    try {
+      if (cycles % CONFIG.marketRefreshEveryCycles === 0) {
+        const candidates = await research.discoverCandidates();
+        if (wsClient) {
+          const ids = candidates.flatMap((c) => c.market.outcomes.map((o) => o.tokenId));
+          wsClient.subscribe(ids);
+        }
+      }
+
+      for (const asset of cache.assetsByToken.values()) {
+        const book = await cache.getFreshBook(asset.tokenId);
+        volGuard.record(asset.tokenId, book?.midpoint);
+
+        for (const strat of strategies) {
+          const signals = await strat.generate(asset, book);
+          for (const sig of signals) {
+            const approved = risk.evaluate(sig);
+            if (approved) portfolio.addOrder(approved);
+          }
+        }
+      }
+
+      portfolio.processBooks(cache);
+
+      if (cycles % CONFIG.reportEveryCycles === 0) {
+        portfolio.report();
+      }
+
+      cycles++;
+    } catch (e) {
+      errlog(`Main loop error: ${e.message}`);
+    }
+    await sleep(CONFIG.loopDelayMs);
+  }
+}
+
+main().catch((e) => errlog(`Fatal start error: ${e.message}`));
