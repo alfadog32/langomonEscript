@@ -1,0 +1,14 @@
+{
+  "name": "polymarket-moneymaker-v3-paper",
+  "version": "3.0.0",
+  "description": "Polymarket MoneyMaker V3 paper EV engine: public data research, modular strategies, paper execution, risk controls.",
+  "main": "moneymaker_v3.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node moneymaker_v3.js",
+    "check": "node --check moneymaker_v3.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
