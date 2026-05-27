@@ -61,7 +61,7 @@ const CONFIG = {
   saveState: envBool('SAVE_STATE', true),
   stateFile: envStr('STATE_FILE', path.join(process.cwd(), 'moneymaker_v3_state.json')),
 
-  initialCash: envNum('INITIAL_CASH', 10_000),
+  initialCash: envNum('INITIAL_CASH', 250),
 
   eventLimit: envInt('EVENT_LIMIT', 100),
   eventPages: envInt('EVENT_PAGES', 2),
@@ -86,7 +86,7 @@ const CONFIG = {
   maxMarketExposureUsd: envNum('MAX_MARKET_EXPOSURE_USD', 350),
   maxTotalExposureUsd: envNum('MAX_TOTAL_EXPOSURE_USD', 1_500),
   maxTotalOpenOrderUsd: envNum('MAX_TOTAL_OPEN_ORDER_USD', 1_000),
-  maxOpenOrders: envInt('MAX_OPEN_ORDERS', 200),
+  maxOpenOrders: envInt('MAX_OPEN_ORDERS', 250),
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
