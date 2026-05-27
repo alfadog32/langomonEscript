@@ -504,15 +504,17 @@ class CLOBWebSocketClient {
   startPing() {
     this.stopPing();
 
+    // Polymarket WebSocket heartbeat expects the literal string "PING".
+    // Sending "{}" causes "INVALID OPERATION" responses from the server.
     this.pingTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocketImpl.OPEN) {
         try {
-          this.ws.send('{}');
+          this.ws.send('PING');
         } catch (e) {
           warn(`WS ping failed: ${e.message}`);
         }
       }
-    }, 25_000);
+    }, 10_000);
   }
 
   stopPing() {
@@ -553,10 +555,16 @@ class CLOBWebSocketClient {
   }
 
   handleRawMessage(raw) {
-    try {
-      const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
-      if (!text || text === 'PONG') return;
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
+    if (!text || text === 'PONG') return;
 
+    // Server can send plain text protocol errors. Do not JSON.parse those.
+    if (text.startsWith('INVALID OPERATION')) {
+      warn(`CLOB WS protocol warning: ${text}`);
+      return;
+    }
+
+    try {
       const parsed = JSON.parse(text);
       const messages = Array.isArray(parsed) ? parsed : [parsed];
 
@@ -1294,22 +1302,82 @@ async function main() {
 
   let wsClient = null;
   if (CONFIG.enableWs) {
+    const wsRefreshTimers = new Map();
+
+    const scheduleRestBookRefresh = (assetId) => {
+      if (!assetId || wsRefreshTimers.has(assetId)) return;
+
+      const timer = setTimeout(async () => {
+        wsRefreshTimers.delete(assetId);
+        try {
+          const fresh = await poly.getOrderBook(assetId);
+          cache.setBook(assetId, fresh);
+          volGuard.record(assetId, fresh?.midpoint);
+        } catch (e) {
+          warn(`WS-triggered REST book refresh failed for ${shortId(assetId)}: ${e.message}`);
+        }
+      }, CONFIG.wsDebounceMs);
+
+      wsRefreshTimers.set(assetId, timer);
+    };
+
+    const updateBestBidAsk = (assetId, bestBidRaw, bestAskRaw) => {
+      if (!assetId) return;
+
+      const book = cache.getBook(assetId) || {
+        assetId: String(assetId),
+        bids: [],
+        asks: [],
+        minOrderSize: 5,
+        tickSize: 0.01,
+      };
+
+      const bestBid = toNum(bestBidRaw, NaN);
+      const bestAsk = toNum(bestAskRaw, NaN);
+
+      if (Number.isFinite(bestBid)) book.bestBid = bestBid;
+      if (Number.isFinite(bestAsk)) book.bestAsk = bestAsk;
+
+      if (Number.isFinite(book.bestBid) && Number.isFinite(book.bestAsk) && book.bestBid < book.bestAsk) {
+        book.midpoint = (book.bestBid + book.bestAsk) / 2;
+        book.spread = book.bestAsk - book.bestBid;
+        volGuard.record(assetId, book.midpoint);
+      }
+
+      book.cachedAt = Date.now();
+      cache.setBook(assetId, book);
+    };
+
     wsClient = new CLOBWebSocketClient({
       url: CONFIG.clobWsUrl,
       onMessage: (msg) => {
-        if (msg.event === 'price_change' && msg.asset_id) {
-          const book = cache.getBook(msg.asset_id) || {};
-          book.bids = normalizeLevels(msg.bids, 'bid');
-          book.asks = normalizeLevels(msg.asks, 'ask');
-          book.bestBid = book.bids[0]?.price || null;
-          book.bestAsk = book.asks[0]?.price || null;
-          if (book.bestBid && book.bestAsk) {
-            book.midpoint = (book.bestBid + book.bestAsk) / 2;
-            book.spread = book.bestAsk - book.bestBid;
-            volGuard.record(msg.asset_id, book.midpoint);
-          }
-          book.cachedAt = Date.now();
+        const eventType = msg.event_type || msg.event || msg.type;
+
+        if (eventType === 'book' && msg.asset_id) {
+          const book = normalizeBook(msg, msg.asset_id);
           cache.setBook(msg.asset_id, book);
+          volGuard.record(msg.asset_id, book?.midpoint);
+          return;
+        }
+
+        if (eventType === 'best_bid_ask' && msg.asset_id) {
+          updateBestBidAsk(msg.asset_id, msg.best_bid ?? msg.bestBid, msg.best_ask ?? msg.bestAsk);
+          return;
+        }
+
+        // price_change is a delta/change event, not a full book snapshot.
+        // Use best_bid/best_ask from each delta when present, then debounce a REST refresh.
+        if (eventType === 'price_change' && Array.isArray(msg.price_changes)) {
+          for (const change of msg.price_changes) {
+            if (!change.asset_id) continue;
+            updateBestBidAsk(change.asset_id, change.best_bid ?? change.bestBid, change.best_ask ?? change.bestAsk);
+            scheduleRestBookRefresh(change.asset_id);
+          }
+          return;
+        }
+
+        if ((eventType === 'last_trade_price' || eventType === 'tick_size_change') && msg.asset_id) {
+          scheduleRestBookRefresh(msg.asset_id);
         }
       },
     });
