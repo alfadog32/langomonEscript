@@ -504,8 +504,6 @@ class CLOBWebSocketClient {
   startPing() {
     this.stopPing();
 
-    // Polymarket WebSocket heartbeat expects the literal string "PING".
-    // Sending "{}" causes "INVALID OPERATION" responses from the server.
     this.pingTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocketImpl.OPEN) {
         try {
@@ -558,7 +556,6 @@ class CLOBWebSocketClient {
     const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw);
     if (!text || text === 'PONG') return;
 
-    // Server can send plain text protocol errors. Do not JSON.parse those.
     if (text.startsWith('INVALID OPERATION')) {
       warn(`CLOB WS protocol warning: ${text}`);
       return;
@@ -1365,8 +1362,6 @@ async function main() {
           return;
         }
 
-        // price_change is a delta/change event, not a full book snapshot.
-        // Use best_bid/best_ask from each delta when present, then debounce a REST refresh.
         if (eventType === 'price_change' && Array.isArray(msg.price_changes)) {
           for (const change of msg.price_changes) {
             if (!change.asset_id) continue;
