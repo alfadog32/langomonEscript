@@ -98,6 +98,14 @@ const CONFIG = {
   partialFillDepthFraction: envNum('PARTIAL_FILL_DEPTH_FRACTION', 0.35),
   minFillUsd: envNum('MIN_FILL_USD', 1),
 
+  // Multi-view consensus gate. This is the reports.js idea rebuilt with real
+  // MoneyMaker data instead of random fake scouts or a second wallet engine.
+  enableConsensus: envBool('ENABLE_CONSENSUS', true),
+  consensusThreshold: envNum('CONSENSUS_THRESHOLD', 0.68),
+  consensusLogRejected: envBool('CONSENSUS_LOG_REJECTED', false),
+  consensusBoostMax: envNum('CONSENSUS_BOOST_MAX', 1.15),
+  consensusPenaltyMin: envNum('CONSENSUS_PENALTY_MIN', 0.70),
+
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
   slippageBuffer: envNum('SLIPPAGE_BUFFER', 0.004),
@@ -1030,6 +1038,221 @@ function confidenceFromPrice(mid) {
 }
 
 // =========================
+// MULTI-VIEW CONSENSUS ENGINE
+// =========================
+
+class MultiConsensusEngine {
+  constructor(config) {
+    this.config = config;
+    this.midHistory = new Map();
+  }
+
+  evaluateSignal(signal, asset, book, cache, portfolio, volGuard) {
+    if (!signal || !asset || !book) return null;
+
+    const protectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
+    if (protectiveExit) {
+      signal.metadata = {
+        ...(signal.metadata || {}),
+        consensus: {
+          score: 1,
+          authorized: true,
+          reason: 'Protective exit bypasses consensus gate',
+        },
+      };
+      return signal;
+    }
+
+    this.recordMid(signal.tokenId, book.midpoint);
+
+    const components = {
+      structure: this.scoreStructure(signal, asset, book, cache),
+      depth: this.scoreDepth(book),
+      momentum: this.scoreMomentum(signal, book),
+      volatility: this.scoreVolatility(signal, book, volGuard),
+      portfolio: this.scorePortfolio(signal, book, portfolio),
+      timing: this.scoreTiming(signal, asset),
+    };
+
+    const weights = signal.strategy === 'ComplementArb'
+      ? { structure: 0.38, depth: 0.14, momentum: 0.10, volatility: 0.18, portfolio: 0.14, timing: 0.06 }
+      : { structure: 0.24, depth: 0.18, momentum: 0.16, volatility: 0.18, portfolio: 0.16, timing: 0.08 };
+
+    const score = Object.entries(weights).reduce((sum, [name, weight]) => {
+      return sum + (components[name] ?? 0) * weight;
+    }, 0);
+
+    const authorized = score >= this.config.consensusThreshold;
+
+    signal.metadata = {
+      ...(signal.metadata || {}),
+      consensus: {
+        score: Number(score.toFixed(4)),
+        authorized,
+        threshold: this.config.consensusThreshold,
+        components: Object.fromEntries(
+          Object.entries(components).map(([k, v]) => [k, Number(v.toFixed(4))])
+        ),
+      },
+    };
+
+    if (!authorized) {
+      if (this.config.consensusLogRejected) {
+        warn(`[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold}`);
+      }
+      return null;
+    }
+
+    // Consensus cannot bypass RiskEngine. It can only adjust quality scores
+    // before the hard exposure/cash/drawdown rules run.
+    const qualityMultiplier = clamp(
+      this.config.consensusPenaltyMin + score * 0.45,
+      this.config.consensusPenaltyMin,
+      this.config.consensusBoostMax
+    );
+
+    signal.confidence = clamp(signal.confidence * qualityMultiplier, 0, 0.99);
+    signal.expectedEdge = signal.expectedEdge * qualityMultiplier;
+
+    return signal;
+  }
+
+  recordMid(tokenId, midpoint) {
+    if (!Number.isFinite(midpoint)) return;
+    const id = String(tokenId);
+    if (!this.midHistory.has(id)) this.midHistory.set(id, []);
+    const arr = this.midHistory.get(id);
+    arr.push({ ts: Date.now(), mid: midpoint });
+    while (arr.length > 24) arr.shift();
+  }
+
+  scoreStructure(signal, asset, book, cache) {
+    let score = 0.50;
+
+    if (signal.strategy === 'ComplementArb') {
+      const siblings = cache.getMarketAssets(signal.marketId);
+      if (siblings.length >= 2) {
+        const books = siblings.slice(0, 2).map((s) => cache.getBook(s.tokenId));
+        if (books.every(isBookComplete)) {
+          const pairAsk = books[0].bestAsk + books[1].bestAsk;
+          if (pairAsk <= 0.96) score = 0.95;
+          else if (pairAsk <= 0.985) score = 0.82;
+          else if (pairAsk < 1.00) score = 0.68;
+          else if (pairAsk <= 1.02) score = 0.40;
+          else score = 0.15;
+        }
+      }
+      return clamp(score);
+    }
+
+    if (isBookComplete(book)) {
+      const spread = book.spread;
+      const mid = book.midpoint;
+
+      if (spread >= this.config.spreadHunterMinEdge && spread <= this.config.hunterMaxSpread) score += 0.18;
+      if (mid > 0.08 && mid < 0.92) score += 0.08;
+      if (mid <= 0.08 || mid >= 0.92) score -= 0.15;
+      if (spread > 0.14) score -= 0.10;
+    }
+
+    if (asset?.market?.volume24h >= this.config.minVolume24h) score += 0.06;
+    if (asset?.market?.liquidity >= this.config.minLiquidity) score += 0.06;
+
+    return clamp(score);
+  }
+
+  scoreDepth(book) {
+    if (!isBookComplete(book)) return 0.0;
+
+    const bidDepth = topDepthUsd(book.bids, 3);
+    const askDepth = topDepthUsd(book.asks, 3);
+    const oneSide = Math.min(bidDepth, askDepth);
+    const total = bidDepth + askDepth;
+
+    if (oneSide < this.config.hunterMinTopDepthUsd) return 0.20;
+    if (total <= 0) return 0.20;
+
+    const balance = oneSide / Math.max(bidDepth, askDepth, 1);
+    const depthBand = total > this.config.hunterMaxTopDepthUsd ? 0.55 : 0.72;
+    const spreadPenalty = book.spread > 0.16 ? 0.12 : 0;
+
+    return clamp(depthBand + balance * 0.20 - spreadPenalty);
+  }
+
+  scoreMomentum(signal, book) {
+    if (!isBookComplete(book)) return 0.0;
+    const arr = this.midHistory.get(String(signal.tokenId)) || [];
+    if (arr.length < 4) return 0.55;
+
+    const first = arr[0].mid;
+    const last = arr[arr.length - 1].mid;
+    if (!Number.isFinite(first) || first <= 0) return 0.55;
+
+    const movePct = (last - first) / first;
+
+    // Buy entries dislike fast downside drift; sell exits dislike fast upside drift.
+    if (signal.side === 'buy') {
+      if (movePct < -0.05) return 0.25;
+      if (movePct < -0.025) return 0.42;
+      if (movePct > 0.025) return 0.66;
+      return 0.58;
+    }
+
+    if (signal.side === 'sell') {
+      if (movePct > 0.05) return 0.25;
+      if (movePct > 0.025) return 0.42;
+      if (movePct < -0.025) return 0.66;
+      return 0.58;
+    }
+
+    return 0.50;
+  }
+
+  scoreVolatility(signal, book, volGuard) {
+    if (!isBookComplete(book)) return 0.0;
+    if (volGuard?.isTripped?.(signal.tokenId)) return this.config.quoteDuringVolatility ? 0.36 : 0.10;
+    if (book.spread > this.config.hunterMaxSpread) return 0.20;
+    if (book.spread > 0.16) return 0.44;
+    return 0.72;
+  }
+
+  scorePortfolio(signal, book, portfolio) {
+    if (!portfolio || !isBookComplete(book)) return 0.40;
+
+    if (signal.side === 'sell') {
+      const qty = portfolio.position(signal.tokenId);
+      return qty > 0 ? 0.75 : 0.0;
+    }
+
+    const currentPosUsd = portfolio.positionUsd(signal.tokenId, book.midpoint);
+    const nextPosUsd = currentPosUsd + signal.sizeUsd;
+    const assetRatio = nextPosUsd / Math.max(1, this.config.maxPositionUsdPerAsset);
+    const marketRatio = (portfolio.marketExposureUsd(signal.marketId) + signal.sizeUsd) / Math.max(1, this.config.maxMarketExposureUsd);
+    const totalRatio = (portfolio.totalExposureUsd() + signal.sizeUsd) / Math.max(1, this.config.maxTotalExposureUsd);
+    const cashRatio = signal.sizeUsd / Math.max(1, portfolio.cash);
+
+    const worst = Math.max(assetRatio, marketRatio, totalRatio, cashRatio);
+    return clamp(0.92 - worst * 0.55);
+  }
+
+  scoreTiming(signal, asset) {
+    const hrs = hoursUntil(asset?.market?.endDate);
+    if (!Number.isFinite(hrs)) return 0.55;
+
+    if (signal.strategy === 'TailEndMispricing') {
+      if (hrs <= 0) return 0.0;
+      if (hrs <= this.config.tailEndHours) return 0.74;
+      return 0.45;
+    }
+
+    if (hrs <= 0) return 0.0;
+    if (hrs < 2) return 0.20;
+    if (hrs < 8) return 0.42;
+    return 0.65;
+  }
+}
+
+// =========================
 // RISK ENGINE
 // =========================
 
@@ -1505,6 +1728,7 @@ async function main() {
   const volGuard = new VolatilityGuard(CONFIG);
   const risk = new RiskEngine(CONFIG, portfolio);
   const research = new ResearchEngine(poly, cache, CONFIG);
+  const consensus = CONFIG.enableConsensus ? new MultiConsensusEngine(CONFIG) : null;
 
   const strategies = [
     new SpreadHunterStrategy(CONFIG, cache, portfolio, volGuard),
@@ -1614,7 +1838,13 @@ async function main() {
         for (const strat of strategies) {
           const signals = await strat.generate(asset, book);
           for (const sig of signals) {
-            const approved = risk.evaluate(sig);
+            const consensusReviewed = consensus
+              ? consensus.evaluateSignal(sig, asset, book, cache, portfolio, volGuard)
+              : sig;
+
+            if (!consensusReviewed) continue;
+
+            const approved = risk.evaluate(consensusReviewed);
             if (approved) portfolio.addOrder(approved);
           }
         }
