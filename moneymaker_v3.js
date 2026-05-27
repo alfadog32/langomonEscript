@@ -89,6 +89,15 @@ const CONFIG = {
   maxOpenOrders: envInt('MAX_OPEN_ORDERS', 250),
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
+  // Practical revenue/risk optimization controls.
+  // These keep the paper engine realistic: no instant fantasy fills, no unlimited bags.
+  stopLossPct: envNum('STOP_LOSS_PCT', 8),
+  takeProfitPct: envNum('TAKE_PROFIT_PCT', 18),
+  enableTakeProfit: envBool('ENABLE_TAKE_PROFIT', true),
+  maxAdverseMovePct: envNum('MAX_ADVERSE_MOVE_PCT', 4),
+  partialFillDepthFraction: envNum('PARTIAL_FILL_DEPTH_FRACTION', 0.35),
+  minFillUsd: envNum('MIN_FILL_USD', 1),
+
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
   slippageBuffer: envNum('SLIPPAGE_BUFFER', 0.004),
@@ -930,6 +939,7 @@ class ComplementArbStrategy extends Strategy {
 
     const sizeUsdEach = Math.min(this.config.baseOrderUsd, this.config.maxMarketExposureUsd / 4);
     const confidence = clamp(0.65 + lockedEdge * 8, 0, 0.98);
+    const pairId = crypto.randomUUID();
 
     return [
       new Signal({
@@ -942,10 +952,10 @@ class ComplementArbStrategy extends Strategy {
         expectedEdge: lockedEdge / 2,
         confidence,
         reason: `Complement buy arb: askSum=${buyBothCost.toFixed(3)} lockedEdge=${lockedEdge.toFixed(3)}`,
-        exitPlan: 'Hold paired outcomes or exit if ask-sum normalizes',
+        exitPlan: 'Atomic paper pair: fill both legs together or cancel together',
         ttlMs: Math.min(this.config.orderTtlMs, 15_000),
         maxHoldMs: 24 * 60 * 60_000,
-        metadata: { pairId: `${a.tokenId}:${b.tokenId}`, leg: 1, marketQuestion: a.market.question, outcome: a.outcome },
+        metadata: { pairId, complementKey: `${a.tokenId}:${b.tokenId}`, leg: 1, marketQuestion: a.market.question, outcome: a.outcome },
       }),
       new Signal({
         strategy: this.name,
@@ -957,10 +967,10 @@ class ComplementArbStrategy extends Strategy {
         expectedEdge: lockedEdge / 2,
         confidence,
         reason: `Complement buy arb: askSum=${buyBothCost.toFixed(3)} lockedEdge=${lockedEdge.toFixed(3)}`,
-        exitPlan: 'Hold paired outcomes or exit if ask-sum normalizes',
+        exitPlan: 'Atomic paper pair: fill both legs together or cancel together',
         ttlMs: Math.min(this.config.orderTtlMs, 15_000),
         maxHoldMs: 24 * 60 * 60_000,
-        metadata: { pairId: `${a.tokenId}:${b.tokenId}`, leg: 2, marketQuestion: b.market.question, outcome: b.outcome },
+        metadata: { pairId, complementKey: `${a.tokenId}:${b.tokenId}`, leg: 2, marketQuestion: b.market.question, outcome: b.outcome },
       }),
     ];
   }
@@ -1030,16 +1040,43 @@ class RiskEngine {
   }
 
   evaluate(signal) {
-    if (signal.confidence < this.config.minConfidence) return null;
+    if (!signal) return null;
+    if (!['buy', 'sell'].includes(signal.side)) return null;
+    if (!Number.isFinite(signal.price) || signal.price <= 0) return null;
+    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) return null;
+
+    if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return null;
+
+    // Inventory exits and stop exits are allowed even if their edge is low because
+    // their job is capital protection. Entry strategies must clear the edge bar.
+    const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
+    if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return null;
+    if (!isProtectiveExit && signal.confidence < this.config.minConfidence) return null;
 
     const openUsd = this.portfolio.totalOpenOrderUsd();
     if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return null;
 
     const totalEx = this.portfolio.totalExposureUsd();
-    if (totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return null;
+    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return null;
 
     const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
-    if (mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return null;
+    if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return null;
+
+    const currentPosQty = this.portfolio.position(signal.tokenId);
+    const currentPosUsd = currentPosQty * signal.price;
+
+    if (signal.side === 'buy') {
+      if (this.portfolio.cash < signal.sizeUsd) return null;
+      if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return null;
+    }
+
+    if (signal.side === 'sell') {
+      if (currentPosQty <= 0) return null;
+      // Do not let paper accounting short-sell unless explicitly added later.
+      const maxSellUsd = currentPosQty * signal.price;
+      signal.sizeUsd = Math.min(signal.sizeUsd, maxSellUsd);
+      if (signal.sizeUsd < this.config.minOrderUsd) return null;
+    }
 
     if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return null;
 
@@ -1102,6 +1139,8 @@ class Portfolio {
     this.equity = config.initialCash;
     this.peakEquity = config.initialCash;
     this.positions = new Map();
+    this.avgCost = new Map();
+    this.tokenMarket = new Map();
     this.openOrders = new Map();
     this.pnlByStrategy = new Map();
 
@@ -1117,8 +1156,10 @@ class Portfolio {
         this.cash = data.cash || this.cash;
         this.equity = data.equity || this.equity;
         this.peakEquity = data.peakEquity || this.peakEquity;
-        if (data.positions) this.positions = new Map(Object.entries(data.positions));
-        if (data.pnlByStrategy) this.pnlByStrategy = new Map(Object.entries(data.pnlByStrategy));
+        if (data.positions) this.positions = new Map(Object.entries(data.positions).map(([k, v]) => [k, Number(v)]));
+        if (data.avgCost) this.avgCost = new Map(Object.entries(data.avgCost).map(([k, v]) => [k, Number(v)]));
+        if (data.tokenMarket) this.tokenMarket = new Map(Object.entries(data.tokenMarket));
+        if (data.pnlByStrategy) this.pnlByStrategy = new Map(Object.entries(data.pnlByStrategy).map(([k, v]) => [k, Number(v)]));
         info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity.toFixed(2)}`);
       }
     } catch (e) {
@@ -1134,6 +1175,8 @@ class Portfolio {
         equity: this.equity,
         peakEquity: this.peakEquity,
         positions: Object.fromEntries(this.positions),
+        avgCost: Object.fromEntries(this.avgCost),
+        tokenMarket: Object.fromEntries(this.tokenMarket),
         pnlByStrategy: Object.fromEntries(this.pnlByStrategy),
       };
       fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
@@ -1147,21 +1190,40 @@ class Portfolio {
   }
 
   positionUsd(tokenId, markPrice) {
-    return this.position(tokenId) * (markPrice || 0);
+    return this.position(tokenId) * (markPrice || this.avgCost.get(String(tokenId)) || 0);
   }
 
   totalOpenOrderUsd() {
     let total = 0;
-    for (const order of this.openOrders.values()) total += order.sizeUsd;
+    for (const order of this.openOrders.values()) total += (order.remainingUsd ?? order.sizeUsd);
     return total;
   }
 
   totalExposureUsd() {
-    return this.cash < this.equity ? this.equity - this.cash : 0;
+    let total = 0;
+    for (const [tokenId, qty] of this.positions.entries()) {
+      total += Math.abs(qty * (this.avgCost.get(tokenId) || 0));
+    }
+    return total;
   }
 
   marketExposureUsd(marketId) {
-    return 0; // Requires linking token positions strictly to market IDs. Stubbed for now.
+    if (!marketId) return 0;
+    let total = 0;
+
+    for (const [tokenId, qty] of this.positions.entries()) {
+      if (this.tokenMarket.get(tokenId) === marketId) {
+        total += Math.abs(qty * (this.avgCost.get(tokenId) || 0));
+      }
+    }
+
+    for (const order of this.openOrders.values()) {
+      if (order.marketId === marketId) {
+        total += order.remainingUsd ?? order.sizeUsd;
+      }
+    }
+
+    return total;
   }
 
   getDrawdownPct() {
@@ -1170,46 +1232,197 @@ class Portfolio {
   }
 
   addOrder(signal) {
-    this.openOrders.set(signal.id, signal);
-    info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
+    const order = {
+      ...signal,
+      remainingUsd: signal.sizeUsd,
+      createdMid: signal.metadata?.entryMid || signal.metadata?.midpoint || signal.price,
+    };
+
+    this.tokenMarket.set(order.tokenId, order.marketId);
+    this.openOrders.set(order.id, order);
+    info(`[ORDER] ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(order.price)} size=$${order.sizeUsd.toFixed(2)} [${order.strategy}]`);
   }
 
   processBooks(cache) {
     const now = Date.now();
+    const skipped = new Set();
+
+    // Atomic paper handling for ComplementArb: both legs fill together or both remain/cancel.
+    const pairs = new Map();
     for (const [id, order] of this.openOrders.entries()) {
+      if (order.strategy !== 'ComplementArb' || !order.metadata?.pairId) continue;
+      if (!pairs.has(order.metadata.pairId)) pairs.set(order.metadata.pairId, []);
+      pairs.get(order.metadata.pairId).push([id, order]);
+    }
+
+    for (const legs of pairs.values()) {
+      for (const [id] of legs) skipped.add(id);
+
+      const expired = legs.some(([, order]) => now - order.createdAt > order.ttlMs);
+      if (expired || legs.length < 2) {
+        for (const [id] of legs) this.openOrders.delete(id);
+        continue;
+      }
+
+      const fills = legs.map(([, order]) => this.computePartialFill(order, cache.getBook(order.tokenId), true));
+      if (fills.every((f) => f && f.fillUsd >= this.config.minFillUsd)) {
+        for (let i = 0; i < legs.length; i++) {
+          const [id, order] = legs[i];
+          this.applyFill(order, fills[i].fillPrice, fills[i].fillUsd, fills[i].fillQty);
+          this.openOrders.delete(id);
+        }
+      }
+    }
+
+    for (const [id, order] of [...this.openOrders.entries()]) {
+      if (skipped.has(id)) continue;
+
       if (now - order.createdAt > order.ttlMs) {
         this.openOrders.delete(id);
         continue;
       }
 
       const book = cache.getBook(order.tokenId);
-      if (!book) continue;
+      if (!book || !isBookComplete(book)) continue;
 
-      let filled = false;
-      if (order.side === 'buy' && book.bestAsk <= order.price) filled = true;
-      if (order.side === 'sell' && book.bestBid >= order.price) filled = true;
-
-      if (filled) {
-        const qty = order.sizeUsd / order.price;
-        const currentQty = this.position(order.tokenId);
-        const newQty = order.side === 'buy' ? currentQty + qty : currentQty - qty;
-
-        this.positions.set(order.tokenId, newQty);
-        this.cash += order.side === 'buy' ? -order.sizeUsd : order.sizeUsd;
-
-        const stratPnl = this.pnlByStrategy.get(order.strategy) || 0;
-        this.pnlByStrategy.set(order.strategy, stratPnl + (order.side === 'sell' ? order.sizeUsd : 0));
-
+      if (this.shouldCancelForAdverseMove(order, book)) {
         this.openOrders.delete(id);
-        info(`[FILL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} qty=${qty.toFixed(2)} @ ${fmtPrice(order.price)}`);
+        continue;
+      }
+
+      const fill = this.computePartialFill(order, book, false);
+      if (fill && fill.fillUsd >= this.config.minFillUsd) {
+        this.applyFill(order, fill.fillPrice, fill.fillUsd, fill.fillQty);
+        order.remainingUsd = Math.max(0, (order.remainingUsd ?? order.sizeUsd) - fill.fillUsd);
+
+        if (order.remainingUsd <= this.config.minFillUsd) {
+          this.openOrders.delete(id);
+        } else {
+          this.openOrders.set(id, order);
+          info(`[PARTIAL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} filled=$${fill.fillUsd.toFixed(2)} remaining=$${order.remainingUsd.toFixed(2)} @ ${fmtPrice(fill.fillPrice)}`);
+        }
       }
     }
 
+    this.applyStopLossAndTakeProfit(cache);
+    this.markToMarket(cache);
+  }
+
+  computePartialFill(order, book, requireFull = false) {
+    if (!book || !isBookComplete(book)) return null;
+
+    const remainingUsd = order.remainingUsd ?? order.sizeUsd;
+    if (remainingUsd <= 0) return null;
+
+    const levels = order.side === 'buy'
+      ? (book.asks || []).filter((lvl) => lvl.price <= order.price).sort((a, b) => a.price - b.price)
+      : (book.bids || []).filter((lvl) => lvl.price >= order.price).sort((a, b) => b.price - a.price);
+
+    if (levels.length === 0) return null;
+
+    let remainingQty = remainingUsd / order.price;
+    let fillQty = 0;
+    let notionalAtBook = 0;
+
+    for (const lvl of levels) {
+      const usableQty = lvl.size * clamp(this.config.partialFillDepthFraction, 0.05, 1);
+      const q = Math.min(remainingQty, usableQty);
+      if (q <= 0) continue;
+      fillQty += q;
+      notionalAtBook += q * lvl.price;
+      remainingQty -= q;
+      if (remainingQty <= 0) break;
+    }
+
+    if (fillQty <= 0) return null;
+
+    const fullQty = remainingUsd / order.price;
+    if (requireFull && fillQty + 1e-9 < fullQty) return null;
+
+    const fillPrice = notionalAtBook / fillQty;
+    const fillUsd = Math.min(remainingUsd, fillQty * fillPrice);
+
+    return { fillPrice, fillUsd, fillQty: fillUsd / fillPrice };
+  }
+
+  shouldCancelForAdverseMove(order, book) {
+    if (!Number.isFinite(book.midpoint) || !Number.isFinite(order.createdMid)) return false;
+    const adverse = this.config.maxAdverseMovePct / 100;
+    if (adverse <= 0) return false;
+
+    if (order.side === 'buy' && book.midpoint < order.createdMid * (1 - adverse)) return true;
+    if (order.side === 'sell' && book.midpoint > order.createdMid * (1 + adverse)) return true;
+    return false;
+  }
+
+  applyFill(order, fillPrice, fillUsd, fillQty) {
+    if (!Number.isFinite(fillPrice) || fillPrice <= 0 || fillUsd <= 0 || fillQty <= 0) return;
+
+    const tokenId = String(order.tokenId);
+    const currentQty = this.position(tokenId);
+    this.tokenMarket.set(tokenId, order.marketId);
+
+    if (order.side === 'buy') {
+      const oldCost = (this.avgCost.get(tokenId) || 0) * currentQty;
+      const newQty = currentQty + fillQty;
+      const newAvg = newQty > 0 ? (oldCost + fillUsd) / newQty : 0;
+      this.positions.set(tokenId, newQty);
+      this.avgCost.set(tokenId, newAvg);
+      this.cash -= fillUsd;
+    } else {
+      const sellQty = Math.min(fillQty, currentQty);
+      if (sellQty <= 0) return;
+
+      const sellUsd = sellQty * fillPrice;
+      const avg = this.avgCost.get(tokenId) || 0;
+      const realized = sellUsd - avg * sellQty;
+      const nextQty = currentQty - sellQty;
+
+      this.cash += sellUsd;
+      if (nextQty <= 1e-9) {
+        this.positions.delete(tokenId);
+        this.avgCost.delete(tokenId);
+        this.tokenMarket.delete(tokenId);
+      } else {
+        this.positions.set(tokenId, nextQty);
+      }
+
+      const stratPnl = this.pnlByStrategy.get(order.strategy) || 0;
+      this.pnlByStrategy.set(order.strategy, stratPnl + realized);
+    }
+
+    info(`[FILL] ${order.side.toUpperCase()} ${shortId(tokenId)} qty=${fillQty.toFixed(2)} @ ${fmtPrice(fillPrice)} value=$${fillUsd.toFixed(2)} [${order.strategy}]`);
+  }
+
+  applyStopLossAndTakeProfit(cache) {
+    for (const [tokenId, qty] of [...this.positions.entries()]) {
+      if (qty <= 0) continue;
+      const avg = this.avgCost.get(tokenId);
+      const book = cache.getBook(tokenId);
+      if (!book || !Number.isFinite(avg) || avg <= 0 || !Number.isFinite(book.midpoint)) continue;
+
+      const bestBid = Number.isFinite(book.bestBid) ? book.bestBid : book.midpoint;
+      const marketId = this.tokenMarket.get(tokenId) || '';
+
+      if (this.config.stopLossPct > 0 && book.midpoint <= avg * (1 - this.config.stopLossPct / 100)) {
+        this.applyFill({ tokenId, marketId, side: 'sell', strategy: 'StopLossExit' }, bestBid, qty * bestBid, qty);
+        continue;
+      }
+
+      if (this.config.enableTakeProfit && this.config.takeProfitPct > 0 && book.midpoint >= avg * (1 + this.config.takeProfitPct / 100)) {
+        this.applyFill({ tokenId, marketId, side: 'sell', strategy: 'TakeProfitExit' }, bestBid, qty * bestBid, qty);
+      }
+    }
+  }
+
+  markToMarket(cache) {
     let invVal = 0;
     for (const [tokenId, qty] of this.positions.entries()) {
       const book = cache.getBook(tokenId);
       if (book && Number.isFinite(book.midpoint)) {
         invVal += qty * book.midpoint;
+      } else {
+        invVal += qty * (this.avgCost.get(tokenId) || 0);
       }
     }
 
@@ -1220,7 +1433,10 @@ class Portfolio {
   report() {
     info(`--- PORTFOLIO REPORT ---`);
     info(`Equity: $${this.equity.toFixed(2)} | Cash: $${this.cash.toFixed(2)} | Drawdown: ${this.getDrawdownPct().toFixed(2)}%`);
-    info(`Open Orders: ${this.openOrders.size}`);
+    info(`Open Orders: ${this.openOrders.size} | Exposure: $${this.totalExposureUsd().toFixed(2)}`);
+    if (this.pnlByStrategy.size > 0) {
+      info(`Realized P&L by strategy: ${JSON.stringify(Object.fromEntries(this.pnlByStrategy))}`);
+    }
     this.saveState();
   }
 }
