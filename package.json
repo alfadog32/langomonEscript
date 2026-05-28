@@ -1,12 +1,31 @@
 {
   "name": "polymarket-moneymaker-v3-paper",
-  "version": "3.0.0",
-  "description": "Polymarket MoneyMaker V3 paper EV engine: public data research, modular strategies, paper execution, risk controls.",
+  "version": "3.1.0",
+  "description": "Polymarket MoneyMaker V3 paper EV engine with public data research, modular strategies, consensus routing, whale oracle, ghost calibration, paper execution, and risk controls.",
   "main": "moneymaker_v3.js",
   "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node moneymaker_v3.js",
-    "check": "node --check moneymaker_v3.js"
+    "check": "node --check moneymaker_v3.js",
+
+    "paper": "INITIAL_CASH=250 BASE_ORDER_USD=10 ENABLE_WS=false ENABLE_CONSENSUS=true node moneymaker_v3.js",
+
+    "paper:debug": "INITIAL_CASH=250 BASE_ORDER_USD=10 ENABLE_WS=false ENABLE_CONSENSUS=true CONSENSUS_LOG_REJECTED=true node moneymaker_v3.js",
+
+    "paper:whales": "INITIAL_CASH=250 BASE_ORDER_USD=10 ENABLE_WS=false ENABLE_CONSENSUS=true ENABLE_WHALE_TRACKING=true ENABLE_WHALE_COPY_STRATEGY=true CONSENSUS_LOG_REJECTED=true node moneymaker_v3.js",
+
+    "pm2:start": "INITIAL_CASH=250 BASE_ORDER_USD=10 ENABLE_WS=false ENABLE_CONSENSUS=true pm2 start ./moneymaker_v3.js --name langomonEscript --update-env",
+
+    "pm2:whales": "INITIAL_CASH=250 BASE_ORDER_USD=10 ENABLE_WS=false ENABLE_CONSENSUS=true ENABLE_WHALE_TRACKING=true ENABLE_WHALE_COPY_STRATEGY=true CONSENSUS_LOG_REJECTED=true pm2 start ./moneymaker_v3.js --name langomonEscript --update-env",
+
+    "pm2:restart": "pm2 restart langomonEscript --update-env",
+    "pm2:stop": "pm2 delete langomonEscript || true",
+    "pm2:logs": "pm2 logs langomonEscript --lines 120",
+    "pm2:flush": "pm2 flush",
+    "pm2:reset": "pm2 delete langomonEscript || true && pm2 flush && rm -f moneymaker_v3_state.json"
   },
   "dependencies": {
     "ws": "^8.18.0"
