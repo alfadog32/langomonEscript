@@ -97,6 +97,45 @@ const CONFIG = {
   maxAdverseMovePct: envNum('MAX_ADVERSE_MOVE_PCT', 4),
   partialFillDepthFraction: envNum('PARTIAL_FILL_DEPTH_FRACTION', 0.35),
   minFillUsd: envNum('MIN_FILL_USD', 1),
+  liquidityConsumedLimitPct: envNum('LIQUIDITY_CONSUMED_LIMIT_PCT', 0.20),
+  liquidityDecayPower: envNum('LIQUIDITY_DECAY_POWER', 6.0),
+
+  // Ghost mode records would-be orders and checks where the midpoint moved later.
+  // This helps calibrate quote offsets without pretending every order fills.
+  enableGhostMode: envBool('ENABLE_GHOST_MODE', true),
+  ghostHorizonMs: envInt('GHOST_HORIZON_MS', 60_000),
+  ghostMaxRecords: envInt('GHOST_MAX_RECORDS', 500),
+
+  // 1) Order-book imbalance signals.
+  enableImbalanceSignals: envBool('ENABLE_IMBALANCE_SIGNALS', true),
+  imbalanceDepthLevels: envInt('IMBALANCE_DEPTH_LEVELS', 3),
+  imbalanceStrongThreshold: envNum('IMBALANCE_STRONG_THRESHOLD', 0.25),
+  imbalanceBalancedThreshold: envNum('IMBALANCE_BALANCED_THRESHOLD', 0.12),
+
+  // 2) Adaptive position sizing.
+  enableAdaptiveSizing: envBool('ENABLE_ADAPTIVE_SIZING', true),
+  adaptiveMinSizeMultiplier: envNum('ADAPTIVE_MIN_SIZE_MULTIPLIER', 0.35),
+  adaptiveMaxSizeMultiplier: envNum('ADAPTIVE_MAX_SIZE_MULTIPLIER', 1.35),
+  adaptiveGhostPenalty: envNum('ADAPTIVE_GHOST_PENALTY', 0.65),
+
+  // 3) Whale tracking hook. This reads public/externally collected whale events
+  // from a local JSON file if you wire one in. It never invents whale data.
+  enableWhaleTracking: envBool('ENABLE_WHALE_TRACKING', true),
+  whaleEventsFile: envStr('WHALE_EVENTS_FILE', path.join(process.cwd(), 'whale_events.json')),
+  whaleLookbackMs: envInt('WHALE_LOOKBACK_MS', 120_000),
+  whaleMinUsd: envNum('WHALE_MIN_USD', 5_000),
+  whaleAlignmentBoost: envNum('WHALE_ALIGNMENT_BOOST', 0.12),
+  whaleDataApiUrl: envStr('WHALE_DATA_API_URL', 'https://data-api.polymarket.com'),
+  whaleWallets: envList('WHALE_WALLETS', []),
+  whalePollMs: envInt('WHALE_POLL_MS', 30_000),
+  whaleApiTimeoutMs: envInt('WHALE_API_TIMEOUT_MS', 8_000),
+  whaleTradesLimit: envInt('WHALE_TRADES_LIMIT', 50),
+  whaleBatchSize: envInt('WHALE_BATCH_SIZE', 3),
+  whaleBatchDelayMs: envInt('WHALE_BATCH_DELAY_MS', 1_000),
+  enableWhaleCopyStrategy: envBool('ENABLE_WHALE_COPY_STRATEGY', true),
+  whaleCopyFreshMs: envInt('WHALE_COPY_FRESH_MS', 30_000),
+  whaleCopyBaseMultiplier: envNum('WHALE_COPY_BASE_MULTIPLIER', 0.4),
+  whaleCopyWhaleFraction: envNum('WHALE_COPY_WHALE_FRACTION', 0.15),
 
   // Multi-view consensus gate. This is the reports.js idea rebuilt with real
   // MoneyMaker data instead of random fake scouts or a second wallet engine.
@@ -105,6 +144,14 @@ const CONFIG = {
   consensusLogRejected: envBool('CONSENSUS_LOG_REJECTED', false),
   consensusBoostMax: envNum('CONSENSUS_BOOST_MAX', 1.15),
   consensusPenaltyMin: envNum('CONSENSUS_PENALTY_MIN', 0.70),
+  consensusStableMaxSpread: envNum('CONSENSUS_STABLE_MAX_SPREAD', 0.12),
+  consensusTrendMovePct: envNum('CONSENSUS_TREND_MOVE_PCT', 0.035),
+  consensusSniperSizeMultiplier: envNum('CONSENSUS_SNIPER_SIZE_MULTIPLIER', 0.65),
+  consensusMakerBoost: envNum('CONSENSUS_MAKER_BOOST', 1.05),
+  targetWalletHandle: envStr('TARGET_WALLET_HANDLE', 'gabagool22'),
+  targetWalletMode: envBool('TARGET_WALLET_MODE', true),
+  targetWalletDisplacementPct: envNum('TARGET_WALLET_DISPLACEMENT_PCT', 0.015),
+  makerSpreadMultiplier: envNum('MAKER_SPREAD_MULTIPLIER', 1.2),
 
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
@@ -121,7 +168,10 @@ const CONFIG = {
 
   historyLookback: envInt('HISTORY_LOOKBACK', 30),
   volatilityTripPct: envNum('VOL_TRIP_PCT', 12),
-  volatilityCooldownMs: envInt('VOL_COOLDOWN_MS', 60_000),
+  // Binary markets can move violently. Keep cooldown short, but make edge demands
+  // stricter while volatility is elevated.
+  volatilityCooldownMs: envInt('VOL_COOLDOWN_MS', 5_000),
+  volatilityEdgeMultiplier: envNum('VOL_EDGE_MULTIPLIER', 1.75),
   quoteDuringVolatility: envBool('QUOTE_DURING_VOL', false),
 
   complementArbEnabled: envBool('STRAT_COMPLEMENT_ARB', true),
@@ -159,6 +209,15 @@ function envBool(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   return ['1', 'true', 'yes', 'y', 'on'].includes(String(raw).toLowerCase());
+}
+
+function envList(name, fallback = []) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  return String(raw)
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
 
 // =========================
@@ -716,6 +775,57 @@ function topDepthUsd(levels, n) {
   return (levels || []).slice(0, n).reduce((sum, level) => sum + level.price * level.size, 0);
 }
 
+function estimateLiquidityConsumption(book, side, sizeUsd, config = CONFIG) {
+  if (!book || !Number.isFinite(sizeUsd) || sizeUsd <= 0) {
+    return { consumedPct: 1, penalty: 0, topDepthUsd: 0 };
+  }
+
+  // For maker buys, queue/competition is best approximated by bid-side depth.
+  // For maker sells, queue/competition is best approximated by ask-side depth.
+  const depthUsd = side === 'buy'
+    ? topDepthUsd(book.bids, 3)
+    : topDepthUsd(book.asks, 3);
+
+  const consumedPct = depthUsd > 0 ? sizeUsd / depthUsd : 1;
+  const limit = Math.max(0.01, config.liquidityConsumedLimitPct || 0.20);
+
+  // Above the limit, assume fill probability decays exponentially instead of
+  // pretending the whole order gets equal queue priority.
+  const excess = Math.max(0, consumedPct - limit);
+  const penalty = excess <= 0
+    ? 1
+    : Math.exp(-excess * (config.liquidityDecayPower || 6.0));
+
+  return {
+    consumedPct,
+    penalty: clamp(penalty, 0.05, 1),
+    topDepthUsd: depthUsd,
+  };
+}
+
+function computeOrderBookImbalance(book, levels = CONFIG.imbalanceDepthLevels) {
+  if (!book || !Array.isArray(book.bids) || !Array.isArray(book.asks)) {
+    return { bidDepthUsd: 0, askDepthUsd: 0, imbalance: 0, direction: 'unknown', usable: false };
+  }
+
+  const bidDepthUsd = topDepthUsd(book.bids, levels);
+  const askDepthUsd = topDepthUsd(book.asks, levels);
+  const total = bidDepthUsd + askDepthUsd;
+  const imbalance = total > 0 ? (bidDepthUsd - askDepthUsd) / total : 0;
+
+  let direction = 'balanced';
+  if (imbalance >= CONFIG.imbalanceStrongThreshold) direction = 'bid_heavy';
+  if (imbalance <= -CONFIG.imbalanceStrongThreshold) direction = 'ask_heavy';
+
+  return {
+    bidDepthUsd,
+    askDepthUsd,
+    imbalance,
+    direction,
+    usable: total > 0,
+  };
+}
+
 function priceExtremePenalty(mid) {
   if (!Number.isFinite(mid)) return 100;
   if (mid > 0.12 && mid < 0.88) return 0;
@@ -815,10 +925,13 @@ class SpreadHunterStrategy extends Strategy {
     bid = clamp(roundToTick(bid, tick), 0.01, 0.99);
     ask = clamp(roundToTick(ask, tick), 0.01, 0.99);
 
+    // Boundary protection: inventory skew can shift the whole band. If bid/ask
+    // collapse into each other, back away instead of creating impossible quotes.
+    if (bid >= ask) {
+      bid = clamp(roundToTick(mark - tick, tick), 0.01, 0.99);
+      ask = clamp(roundToTick(mark + tick, tick), 0.01, 0.99);
+    }
     if (!(bid < ask)) return [];
-
-    const edgeEstimate = Math.max(0, (ask - bid) / 2 - this.config.slippageBuffer - this.config.adverseSelectionBuffer);
-    if (edgeEstimate < this.config.minSignalEdge) return [];
 
     let baseUsd = this.config.baseOrderUsd;
     if (this.config.hunterMode && spread > 0.08) {
@@ -828,6 +941,22 @@ class SpreadHunterStrategy extends Strategy {
 
     const buyUsd = Math.max(0, baseUsd * (1 - Math.max(0, invRatio)));
     const sellUsd = Math.max(0, baseUsd * (1 + Math.min(0, invRatio)));
+
+    const buyLiquidity = estimateLiquidityConsumption(book, 'buy', buyUsd || this.config.baseOrderUsd, this.config);
+    const sellLiquidity = estimateLiquidityConsumption(book, 'sell', sellUsd || this.config.baseOrderUsd, this.config);
+    const worstLiquidityPenalty = Math.max(buyLiquidity.penalty, sellLiquidity.penalty);
+    const volatilityEdgeMultiplier = this.volGuard.isTripped(asset.tokenId)
+      ? this.config.volatilityEdgeMultiplier
+      : 1;
+
+    const edgeEstimate = Math.max(
+      0,
+      ((ask - bid) / 2 - this.config.slippageBuffer - this.config.adverseSelectionBuffer) * worstLiquidityPenalty
+    );
+
+    const requiredEdge = this.config.minSignalEdge * volatilityEdgeMultiplier;
+    if (edgeEstimate < requiredEdge) return [];
+
     const confidence = clamp(0.35 + spread * 2 + Math.log10(1 + asset.market.volume24h) / 20, 0, 0.85);
 
     const signals = [];
@@ -842,11 +971,18 @@ class SpreadHunterStrategy extends Strategy {
         sizeUsd: buyUsd,
         expectedEdge: edgeEstimate,
         confidence,
-        reason: `Wide spread hunter: spread=${fmtPrice(spread)}, inv=${(invRatio * 100).toFixed(1)}%`,
+        reason: `Wide spread hunter: spread=${fmtPrice(spread)}, inv=${(invRatio * 100).toFixed(1)}%, liqUse=${(buyLiquidity.consumedPct * 100).toFixed(1)}%`,
         exitPlan: `Exit near ask ${fmtPrice(ask)} or stale/hold timeout`,
         ttlMs: this.config.orderTtlMs,
         maxHoldMs: this.config.maxHoldMs,
-        metadata: { askTarget: ask, marketQuestion: asset.market.question, outcome: asset.outcome },
+        metadata: {
+          askTarget: ask,
+          marketQuestion: asset.market.question,
+          outcome: asset.outcome,
+          liquidityConsumedPct: buyLiquidity.consumedPct,
+          liquidityPenalty: buyLiquidity.penalty,
+          entryMid: mark,
+        },
       }));
     }
 
@@ -860,11 +996,18 @@ class SpreadHunterStrategy extends Strategy {
         sizeUsd: sellUsd,
         expectedEdge: edgeEstimate,
         confidence,
-        reason: `Inventory/spread sell: spread=${fmtPrice(spread)}, inv=${(invRatio * 100).toFixed(1)}%`,
+        reason: `Inventory/spread sell: spread=${fmtPrice(spread)}, inv=${(invRatio * 100).toFixed(1)}%, liqUse=${(sellLiquidity.consumedPct * 100).toFixed(1)}%`,
         exitPlan: 'Reduce inventory at wide spread',
         ttlMs: this.config.orderTtlMs,
         maxHoldMs: this.config.maxHoldMs,
-        metadata: { bidTarget: bid, marketQuestion: asset.market.question, outcome: asset.outcome },
+        metadata: {
+          bidTarget: bid,
+          marketQuestion: asset.market.question,
+          outcome: asset.outcome,
+          liquidityConsumedPct: sellLiquidity.consumedPct,
+          liquidityPenalty: sellLiquidity.penalty,
+          entryMid: mark,
+        },
       }));
     }
 
@@ -1033,6 +1176,70 @@ class TailEndMispricingStrategy extends Strategy {
   }
 }
 
+class WhaleCopyStrategy extends Strategy {
+  constructor(config, cache, portfolio, volGuard, whaleWatcher) {
+    super('WhaleCopy', config, cache, portfolio, volGuard);
+    this.whaleWatcher = whaleWatcher;
+  }
+
+  async generate(asset, book) {
+    if (!this.config.enableWhaleTracking || !this.config.enableWhaleCopyStrategy || !this.whaleWatcher) return [];
+    if (!isBookComplete(book)) return [];
+
+    const recentWhale = this.whaleWatcher.findRecentForSignal({
+      tokenId: asset.tokenId,
+      marketId: asset.market.marketId,
+      metadata: { marketQuestion: asset.market.question },
+    });
+
+    if (!recentWhale) return [];
+    if (Date.now() - recentWhale.timestamp > this.config.whaleCopyFreshMs) return [];
+
+    // Opposite side: provide liquidity to the whale rather than blindly chasing.
+    const oppositeSide = recentWhale.side === 'buy' ? 'sell' : 'buy';
+    const offsetMultiplier = this.config.makerSpreadMultiplier || 1.2;
+    const tick = book.tickSize || 0.01;
+
+    let price;
+    if (oppositeSide === 'sell') {
+      price = clamp(roundToTick(book.bestAsk + book.spread * offsetMultiplier, tick), 0.01, 0.99);
+    } else {
+      price = clamp(roundToTick(book.bestBid - book.spread * offsetMultiplier, tick), 0.01, 0.99);
+    }
+
+    const sizeUsd = Math.min(
+      this.config.baseOrderUsd * this.config.whaleCopyBaseMultiplier,
+      recentWhale.sizeUsd * this.config.whaleCopyWhaleFraction
+    );
+
+    if (sizeUsd < this.config.minOrderUsd) return [];
+
+    return [new Signal({
+      strategy: this.name,
+      tokenId: asset.tokenId,
+      marketId: asset.market.marketId,
+      side: oppositeSide,
+      price,
+      sizeUsd,
+      expectedEdge: Math.max(this.config.minSignalEdge, book.spread * 0.70),
+      confidence: 0.65,
+      reason: `Whale ${shortId(recentWhale.wallet || recentWhale.handle)} ${recentWhale.side} $${recentWhale.sizeUsd.toFixed(0)} -> providing ${oppositeSide} liquidity`,
+      exitPlan: 'Whale-copy maker liquidity; exit on fill quality deterioration or timeout',
+      ttlMs: 25_000,
+      maxHoldMs: this.config.maxHoldMs,
+      metadata: {
+        marketQuestion: asset.market.question,
+        outcome: asset.outcome,
+        whaleWallet: recentWhale.wallet,
+        whaleSide: recentWhale.side,
+        whaleSizeUsd: recentWhale.sizeUsd,
+        whaleAgeMs: Date.now() - recentWhale.timestamp,
+        entryMid: book.midpoint,
+      },
+    })];
+  }
+}
+
 function confidenceFromPrice(mid) {
   return Math.abs(mid - 0.5) * 1.6;
 }
@@ -1041,13 +1248,196 @@ function confidenceFromPrice(mid) {
 // MULTI-VIEW CONSENSUS ENGINE
 // =========================
 
+class AsyncWhaleWatcher {
+  constructor(config) {
+    this.config = config;
+    this.baseUrl = config.whaleDataApiUrl;
+    this.wallets = config.whaleWallets || [];
+    this.whaleState = new Map();
+    this.events = [];
+    this.lastPollMs = 0;
+    this.inFlight = false;
+
+    if (config.enableWhaleTracking && this.wallets.length === 0) {
+      warn('[WhaleWatcher] Enabled but no WHALE_WALLETS configured. Tracking disabled until wallets are supplied.');
+      this.config.enableWhaleTracking = false;
+    }
+  }
+
+  tick() {
+    if (!this.config.enableWhaleTracking || this.wallets.length === 0) return;
+
+    const now = Date.now();
+    if (this.inFlight) return;
+    if (now - this.lastPollMs < this.config.whalePollMs) return;
+
+    this.lastPollMs = now;
+    this.updateWhaleIntel(this.wallets, this.config.whaleMinUsd).catch((e) => {
+      warn(`[WhaleOracle] background update failed: ${e.message}`);
+    });
+  }
+
+  async updateWhaleIntel(wallets, minUsd = this.config.whaleMinUsd) {
+    if (!Array.isArray(wallets) || wallets.length === 0) return;
+    if (this.inFlight) return;
+
+    this.inFlight = true;
+
+    try {
+      const batchSize = Math.max(1, this.config.whaleBatchSize || 3);
+
+      for (let i = 0; i < wallets.length; i += batchSize) {
+        const batch = wallets.slice(i, i + batchSize);
+        const promises = batch.map((wallet) => this.fetchWalletTrades(wallet, minUsd));
+        await Promise.allSettled(promises);
+
+        if (i + batchSize < wallets.length) {
+          await sleep(this.config.whaleBatchDelayMs || 1000);
+        }
+      }
+
+      this.prune();
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  async fetchWalletTrades(wallet, minUsd) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.whaleApiTimeoutMs);
+
+    try {
+      const url = new URL('/trades', this.baseUrl);
+      url.searchParams.set('user', wallet);
+      url.searchParams.set('limit', String(this.config.whaleTradesLimit));
+
+      const response = await fetch(url.toString(), {
+        headers: { accept: 'application/json' },
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      }
+
+      const payload = await response.json();
+      const trades = Array.isArray(payload) ? payload : payload?.trades || payload?.data || [];
+      if (!Array.isArray(trades)) return;
+
+      const normalized = trades
+        .map((trade) => this.normalizeTrade(wallet, trade))
+        .filter(Boolean)
+        .filter((trade) => trade.sizeUsd >= minUsd);
+
+      for (const trade of normalized) {
+        this.storeTrade(wallet, trade);
+      }
+    } catch (error) {
+      warn(`[WhaleOracle] Failed to update wallet ${shortId(wallet)}: ${error.message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  normalizeTrade(wallet, trade) {
+    if (!trade) return null;
+
+    const price = toNum(trade.price ?? trade.outcomePrice ?? trade.avgPrice, NaN);
+    const size = toNum(trade.size ?? trade.shares ?? trade.amount, NaN);
+    const directUsd = toNum(trade.sizeUsd ?? trade.usd ?? trade.notionalUsd ?? trade.value, NaN);
+    const sizeUsd = Number.isFinite(directUsd)
+      ? directUsd
+      : Number.isFinite(price) && Number.isFinite(size)
+        ? price * size
+        : 0;
+
+    const rawTs = trade.timestamp ?? trade.ts ?? trade.time ?? trade.createdAt ?? trade.created_at;
+    let timestamp = Number(rawTs);
+    if (Number.isFinite(timestamp) && timestamp < 10000000000) timestamp *= 1000;
+    if (!Number.isFinite(timestamp)) timestamp = Date.parse(rawTs || '');
+    if (!Number.isFinite(timestamp)) timestamp = Date.now();
+
+    const sideRaw = String(trade.side ?? trade.action ?? trade.type ?? '').toLowerCase();
+    const side = sideRaw.includes('sell') ? 'sell' : sideRaw.includes('buy') ? 'buy' : sideRaw;
+
+    return {
+      handle: wallet,
+      wallet,
+      tokenId: String(trade.tokenId ?? trade.assetId ?? trade.asset_id ?? trade.conditionTokenId ?? ''),
+      marketId: String(trade.marketId ?? trade.conditionId ?? trade.condition_id ?? ''),
+      marketTitle: String(trade.title ?? trade.marketTitle ?? trade.question ?? trade.market ?? ''),
+      side,
+      price,
+      sizeUsd,
+      timestamp,
+      source: 'polymarket_data_api',
+    };
+  }
+
+  storeTrade(wallet, trade) {
+    const key = `${wallet}:${trade.tokenId || trade.marketId || trade.marketTitle}:${trade.timestamp}:${trade.side}:${trade.sizeUsd}`;
+    if (this.events.some((e) => e.key === key)) return;
+
+    const event = { ...trade, key };
+    this.events.unshift(event);
+    this.whaleState.set(wallet, event);
+  }
+
+  prune() {
+    const now = Date.now();
+    this.events = this.events
+      .filter((event) => now - event.timestamp <= this.config.whaleLookbackMs)
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 500);
+  }
+
+  isWhaleActiveOnMarket(marketTitle) {
+    const now = Date.now();
+    const title = normalizeTitle(marketTitle);
+    const lookbackMs = this.config.whaleLookbackMs;
+
+    for (const event of this.events) {
+      if (now - event.timestamp > lookbackMs) continue;
+
+      if (normalizeTitle(event.marketTitle) === title) {
+        return { active: true, side: event.side, event, ageMs: now - event.timestamp };
+      }
+    }
+
+    return { active: false, side: null, event: null };
+  }
+
+  findRecentForSignal(signal) {
+    if (!this.config.enableWhaleTracking || !signal) return null;
+    this.prune();
+    const now = Date.now();
+
+    return this.events.find((event) => {
+      if (now - event.timestamp > this.config.whaleLookbackMs) return false;
+      const tokenMatch = event.tokenId && event.tokenId === signal.tokenId;
+      const marketMatch = event.marketId && event.marketId === signal.marketId;
+      const titleMatch = event.marketTitle && signal.metadata?.marketQuestion && normalizeTitle(event.marketTitle) === normalizeTitle(signal.metadata.marketQuestion);
+      return tokenMatch || marketMatch || titleMatch;
+    }) || null;
+  }
+}
+
+function normalizeTitle(value) {
+  const cleaned = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]/g, ' ');
+
+  return cleaned.split(' ').filter(Boolean).join(' ');
+}
+
 class MultiConsensusEngine {
   constructor(config) {
     this.config = config;
     this.midHistory = new Map();
   }
 
-  evaluateSignal(signal, asset, book, cache, portfolio, volGuard) {
+  evaluateSignal(signal, asset, book, cache, portfolio, volGuard, whaleTracker = null) {
     if (!signal || !asset || !book) return null;
 
     const protectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
@@ -1065,24 +1455,40 @@ class MultiConsensusEngine {
 
     this.recordMid(signal.tokenId, book.midpoint);
 
+    const whaleEvent = whaleTracker?.findRecentForSignal?.(signal) || null;
+
     const components = {
       structure: this.scoreStructure(signal, asset, book, cache),
       depth: this.scoreDepth(book),
+      imbalance: this.scoreImbalance(signal, book),
       momentum: this.scoreMomentum(signal, book),
       volatility: this.scoreVolatility(signal, book, volGuard),
       portfolio: this.scorePortfolio(signal, book, portfolio),
       timing: this.scoreTiming(signal, asset),
+      whale: this.scoreWhale(signal, whaleEvent),
     };
 
     const weights = signal.strategy === 'ComplementArb'
-      ? { structure: 0.38, depth: 0.14, momentum: 0.10, volatility: 0.18, portfolio: 0.14, timing: 0.06 }
-      : { structure: 0.24, depth: 0.18, momentum: 0.16, volatility: 0.18, portfolio: 0.16, timing: 0.08 };
+      ? { structure: 0.34, depth: 0.13, imbalance: 0.08, momentum: 0.08, volatility: 0.17, portfolio: 0.12, timing: 0.04, whale: 0.04 }
+      : { structure: 0.20, depth: 0.15, imbalance: 0.13, momentum: 0.13, volatility: 0.16, portfolio: 0.14, timing: 0.05, whale: 0.04 };
 
     const score = Object.entries(weights).reduce((sum, [name, weight]) => {
       return sum + (components[name] ?? 0) * weight;
     }, 0);
 
-    const authorized = score >= this.config.consensusThreshold;
+    const route = this.routeExecution({
+      signal,
+      asset,
+      book,
+      cache,
+      portfolio,
+      volGuard,
+      components,
+      score,
+      whaleEvent,
+    });
+
+    const authorized = score >= this.config.consensusThreshold && route.authorized;
 
     signal.metadata = {
       ...(signal.metadata || {}),
@@ -1093,15 +1499,28 @@ class MultiConsensusEngine {
         components: Object.fromEntries(
           Object.entries(components).map(([k, v]) => [k, Number(v.toFixed(4))])
         ),
+        route,
+        whaleEvent: whaleEvent ? {
+          handle: whaleEvent.handle,
+          side: whaleEvent.side,
+          sizeUsd: whaleEvent.sizeUsd,
+          price: whaleEvent.price,
+          source: whaleEvent.source,
+          ageMs: Date.now() - whaleEvent.timestamp,
+        } : null,
       },
     };
 
     if (!authorized) {
       if (this.config.consensusLogRejected) {
-        warn(`[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold}`);
+        warn(`[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold} route=${route.mode}:${route.state}`);
       }
       return null;
     }
+
+    this.applyExecutionRoute(signal, route);
+    this.applyWhaleConsensusAdjustment(signal, whaleEvent);
+    this.applyAdaptivePositionSizing(signal, components, route, book, portfolio);
 
     // Consensus cannot bypass RiskEngine. It can only adjust quality scores
     // before the hard exposure/cash/drawdown rules run.
@@ -1115,6 +1534,324 @@ class MultiConsensusEngine {
     signal.expectedEdge = signal.expectedEdge * qualityMultiplier;
 
     return signal;
+  }
+
+  routeExecution(marketData) {
+    const targetDisplacement = this.calculateTargetWalletDisplacement(marketData);
+    const volatilityState = this.calculateVolatility(marketData, targetDisplacement);
+
+    // New Sophie objective:
+    // Do not chase YES/NO purely because trend is high. If target-wallet style
+    // displacement appears, respond as a market maker around the displaced book.
+    if (this.config.targetWalletMode && targetDisplacement.detected) {
+      return this.executeMakerStrategy({
+        ...marketData,
+        targetDisplacement,
+        forcedReason: `${this.config.targetWalletHandle} style displacement detected`,
+      });
+    }
+
+    if (volatilityState === 'STABLE') {
+      return this.executeMakerStrategy({ ...marketData, targetDisplacement });
+    }
+
+    // Sniper mode is now secondary and conservative. It only runs when the
+    // signal is already aligned and no target-wallet displacement is available.
+    if (volatilityState === 'TRENDING') {
+      return this.executeSniperStrategy({ ...marketData, targetDisplacement });
+    }
+
+    return {
+      mode: 'WAIT',
+      state: volatilityState,
+      authorized: false,
+      reason: 'Market is neither stable enough for maker mode nor cleanly directional enough for sniper mode',
+      confidenceMultiplier: 0,
+      edgeMultiplier: 0,
+      sizeMultiplier: 0,
+      targetDisplacement,
+    };
+  }
+
+  calculateVolatility({ signal, book, volGuard }, targetDisplacement = null) {
+    if (!signal || !isBookComplete(book)) return 'WAIT';
+    if (volGuard?.isTripped?.(signal.tokenId) && !this.config.quoteDuringVolatility) return 'WAIT';
+
+    const arr = this.midHistory.get(String(signal.tokenId)) || [];
+    const first = arr[0]?.mid;
+    const last = arr[arr.length - 1]?.mid;
+    const trendMovePct = Number.isFinite(first) && first > 0 && Number.isFinite(last)
+      ? Math.abs((last - first) / first)
+      : 0;
+
+    if (book.spread > this.config.hunterMaxSpread) return 'WAIT';
+
+    // A target-wallet/order-book displacement should not automatically make us
+    // chase direction. It becomes a maker opportunity if spread/depth are usable.
+    if (targetDisplacement?.detected) {
+      return 'STABLE';
+    }
+
+    if (trendMovePct >= this.config.consensusTrendMovePct) {
+      return 'TRENDING';
+    }
+
+    if (book.spread <= this.config.consensusStableMaxSpread) {
+      return 'STABLE';
+    }
+
+    if (book.spread <= this.config.hunterMaxSpread && trendMovePct < this.config.consensusTrendMovePct * 0.65) {
+      return 'STABLE';
+    }
+
+    return 'WAIT';
+  }
+
+  executeMakerStrategy({ signal, book, components, targetDisplacement, forcedReason }) {
+    const makerStrategies = new Set(['SpreadHunter', 'ComplementArb']);
+    const authorized = makerStrategies.has(signal.strategy) && components.depth >= 0.45 && components.volatility >= 0.36;
+
+    const mid = book.midpoint;
+    const spread = Math.max(book.spread, book.tickSize || 0.01);
+    const offset = spread * this.config.makerSpreadMultiplier;
+    const tick = book.tickSize || 0.01;
+
+    const makerBid = clamp(roundToTick(mid - offset, tick), 0.01, 0.99);
+    const makerAsk = clamp(roundToTick(mid + offset, tick), 0.01, 0.99);
+
+    return {
+      mode: 'MAKER',
+      state: 'STABLE',
+      authorized,
+      reason: authorized
+        ? (forcedReason || 'Stable/displaced book: route to maker mode for spread capture')
+        : `Stable/displaced book but strategy ${signal.strategy} is not maker-compatible`,
+      confidenceMultiplier: targetDisplacement?.detected ? this.config.consensusMakerBoost * 1.05 : this.config.consensusMakerBoost,
+      edgeMultiplier: targetDisplacement?.detected ? this.config.consensusMakerBoost * 1.05 : this.config.consensusMakerBoost,
+      sizeMultiplier: 1.0,
+      makerBid,
+      makerAsk,
+      makerMid: Number(mid.toFixed(4)),
+      makerOffset: Number(offset.toFixed(4)),
+      spread: Number(book.spread.toFixed(4)),
+      targetDisplacement,
+    };
+  }
+
+  executeSniperStrategy({ signal, book, components }) {
+    const arr = this.midHistory.get(String(signal.tokenId)) || [];
+    const first = arr[0]?.mid;
+    const last = arr[arr.length - 1]?.mid;
+    const directionalMove = Number.isFinite(first) && Number.isFinite(last) ? last - first : 0;
+
+    const aligned =
+      (signal.side === 'buy' && directionalMove > 0) ||
+      (signal.side === 'sell' && directionalMove < 0);
+
+    const sniperCompatible = signal.strategy === 'TailEndMispricing' || aligned;
+    const authorized = sniperCompatible && components.volatility >= 0.36 && components.portfolio >= 0.35;
+
+    return {
+      mode: 'SNIPER',
+      state: 'TRENDING',
+      authorized,
+      reason: authorized
+        ? 'Directional move detected: route to sniper mode with reduced size'
+        : 'Trend detected but signal is not aligned with the move',
+      confidenceMultiplier: aligned ? 1.08 : 0.88,
+      edgeMultiplier: aligned ? 1.08 : 0.88,
+      sizeMultiplier: this.config.consensusSniperSizeMultiplier,
+      directionalMove: Number(directionalMove.toFixed(4)),
+      spread: Number(book.spread.toFixed(4)),
+    };
+  }
+
+  applyExecutionRoute(signal, route) {
+    if (!signal || !route) return signal;
+    signal.confidence = clamp(signal.confidence * (route.confidenceMultiplier ?? 1), 0, 0.99);
+    signal.expectedEdge = signal.expectedEdge * (route.edgeMultiplier ?? 1);
+
+    if (route.mode === 'MAKER') {
+      // Flip Sophie from directional YES/NO chasing into market-maker placement.
+      // Buy limits rest below midpoint; sell limits rest above midpoint.
+      if (signal.side === 'buy' && Number.isFinite(route.makerBid)) {
+        signal.price = route.makerBid;
+      }
+      if (signal.side === 'sell' && Number.isFinite(route.makerAsk)) {
+        signal.price = route.makerAsk;
+      }
+      signal.metadata = {
+        ...(signal.metadata || {}),
+        makerRoute: {
+          mid: route.makerMid,
+          bid: route.makerBid,
+          ask: route.makerAsk,
+          offset: route.makerOffset,
+          spread: route.spread,
+          targetDisplacement: route.targetDisplacement,
+        },
+      };
+      signal.exitPlan = `${signal.exitPlan} | Maker route: limit @ mid ± ${this.config.makerSpreadMultiplier}x spread`;
+    }
+
+    if (route.mode === 'SNIPER') {
+      signal.sizeUsd = Math.max(this.config.minOrderUsd, signal.sizeUsd * (route.sizeMultiplier ?? 1));
+      signal.ttlMs = Math.min(signal.ttlMs, 20_000);
+      signal.exitPlan = `${signal.exitPlan} | Sniper route: smaller size, faster timeout`;
+    }
+
+    return signal;
+  }
+
+  applyWhaleConsensusAdjustment(signal, whaleEvent) {
+    if (!this.config.enableWhaleTracking || !signal || !whaleEvent) return signal;
+
+    const whaleSide = String(whaleEvent.side || '').toLowerCase();
+    const aligned = whaleSide === signal.side;
+
+    signal.metadata = {
+      ...(signal.metadata || {}),
+      whaleSignal: {
+        aligned,
+        wallet: whaleEvent.wallet,
+        handle: whaleEvent.handle,
+        side: whaleEvent.side,
+        sizeUsd: whaleEvent.sizeUsd,
+        ageMs: Date.now() - whaleEvent.timestamp,
+      },
+    };
+
+    if (aligned) {
+      signal.confidence = Math.min(0.95, signal.confidence * 1.25);
+      signal.expectedEdge *= 1.15;
+      info(`[WHALE_BOOST] ${signal.strategy} aligned with whale ${shortId(whaleEvent.wallet || whaleEvent.handle)}`);
+    } else if (whaleSide) {
+      signal.confidence *= 0.70;
+      signal.expectedEdge *= 0.60;
+      warn(`[WHALE_VETO] ${signal.strategy} opposing whale ${shortId(whaleEvent.wallet || whaleEvent.handle)}`);
+    }
+
+    return signal;
+  }
+
+  applyAdaptivePositionSizing(signal, components, route, book, portfolio) {
+    if (!this.config.enableAdaptiveSizing || !signal || signal.side !== 'buy') return signal;
+
+    const edgeQuality = clamp(signal.expectedEdge / Math.max(this.config.minSignalEdge, 0.0001), 0.35, 1.35);
+    const depthQuality = clamp(components.depth || 0.5, 0.25, 1.0);
+    const imbalanceQuality = clamp(components.imbalance || 0.5, 0.25, 1.0);
+    const volatilityQuality = clamp(components.volatility || 0.5, 0.20, 1.0);
+    const portfolioQuality = clamp(components.portfolio || 0.5, 0.20, 1.0);
+    const whaleQuality = clamp(components.whale || 0.5, 0.40, 1.0);
+    const routeQuality = route?.mode === 'MAKER' ? 1.0 : route?.mode === 'SNIPER' ? 0.75 : 0.50;
+
+    let ghostQuality = 1.0;
+    if (portfolio?.ghostStats?.total >= 10) {
+      const favorableRate = portfolio.ghostStats.favorable / Math.max(1, portfolio.ghostStats.total);
+      if (favorableRate < 0.45) ghostQuality = this.config.adaptiveGhostPenalty;
+      if (favorableRate > 0.60) ghostQuality = 1.12;
+    }
+
+    const liquidity = estimateLiquidityConsumption(book, signal.side, signal.sizeUsd, this.config);
+    const liquidityQuality = clamp(liquidity.penalty, 0.20, 1.0);
+
+    const multiplier = clamp(
+      edgeQuality * depthQuality * imbalanceQuality * volatilityQuality * portfolioQuality * whaleQuality * routeQuality * ghostQuality * liquidityQuality,
+      this.config.adaptiveMinSizeMultiplier,
+      this.config.adaptiveMaxSizeMultiplier
+    );
+
+    const originalSizeUsd = signal.sizeUsd;
+    signal.sizeUsd = Math.max(this.config.minOrderUsd, signal.sizeUsd * multiplier);
+    signal.metadata = {
+      ...(signal.metadata || {}),
+      adaptiveSizing: {
+        originalSizeUsd: Number(originalSizeUsd.toFixed(2)),
+        finalSizeUsd: Number(signal.sizeUsd.toFixed(2)),
+        multiplier: Number(multiplier.toFixed(4)),
+        edgeQuality: Number(edgeQuality.toFixed(4)),
+        depthQuality: Number(depthQuality.toFixed(4)),
+        imbalanceQuality: Number(imbalanceQuality.toFixed(4)),
+        volatilityQuality: Number(volatilityQuality.toFixed(4)),
+        portfolioQuality: Number(portfolioQuality.toFixed(4)),
+        whaleQuality: Number(whaleQuality.toFixed(4)),
+        ghostQuality: Number(ghostQuality.toFixed(4)),
+        liquidityQuality: Number(liquidityQuality.toFixed(4)),
+      },
+    };
+
+    return signal;
+  }
+
+  calculateTargetWalletDisplacement({ signal, book, whaleEvent }) {
+    if (!this.config.targetWalletMode || !signal || !isBookComplete(book)) {
+      return { detected: false, reason: 'target wallet mode disabled or incomplete book' };
+    }
+
+    if (whaleEvent) {
+      const mid = book.midpoint;
+      const price = toNum(whaleEvent.price, NaN);
+      const displacementPct = Number.isFinite(price) && mid > 0 ? Math.abs(price - mid) / mid : 0;
+      return {
+        detected: true,
+        source: whaleEvent.source || 'whale_tracker',
+        handle: whaleEvent.handle || this.config.targetWalletHandle,
+        side: whaleEvent.side,
+        sizeUsd: whaleEvent.sizeUsd,
+        price,
+        displacementPct: Number(displacementPct.toFixed(4)),
+        reason: 'Recent whale/target-wallet event matched this market or token',
+      };
+    }
+
+    // If a future wallet-tracker module tags a signal with the observed target
+    // execution, honor that direct evidence first. This avoids pretending we
+    // have wallet-flow data when we only have public book movement.
+    const direct = signal.metadata?.targetWalletExecution;
+    if (direct) {
+      const sizeUsd = toNum(direct.sizeUsd, 0);
+      const price = toNum(direct.price, NaN);
+      const side = String(direct.side || '').toLowerCase();
+      const mid = book.midpoint;
+      const displacementPct = Number.isFinite(price) && mid > 0 ? Math.abs(price - mid) / mid : 0;
+
+      return {
+        detected: true,
+        source: 'direct_target_wallet_execution',
+        handle: direct.handle || this.config.targetWalletHandle,
+        side,
+        sizeUsd,
+        price,
+        displacementPct: Number(displacementPct.toFixed(4)),
+        reason: 'Direct target-wallet execution metadata attached to signal',
+      };
+    }
+
+    // Fallback proxy: infer displacement from midpoint movement since Sophie
+    // started watching this token. This is NOT wallet identity; it is public
+    // order-book displacement only.
+    const arr = this.midHistory.get(String(signal.tokenId)) || [];
+    if (arr.length < 4) return { detected: false, reason: 'not enough midpoint history' };
+
+    const first = arr[0].mid;
+    const last = arr[arr.length - 1].mid;
+    if (!Number.isFinite(first) || first <= 0 || !Number.isFinite(last)) {
+      return { detected: false, reason: 'invalid midpoint history' };
+    }
+
+    const displacementPct = Math.abs((last - first) / first);
+    const detected = displacementPct >= this.config.targetWalletDisplacementPct;
+
+    return {
+      detected,
+      source: 'orderbook_displacement_proxy',
+      handle: this.config.targetWalletHandle,
+      side: last > first ? 'upward_displacement' : 'downward_displacement',
+      displacementPct: Number(displacementPct.toFixed(4)),
+      reason: detected
+        ? 'Public order-book midpoint displacement crossed target-wallet threshold'
+        : 'No meaningful displacement detected',
+    };
   }
 
   recordMid(tokenId, midpoint) {
@@ -1177,6 +1914,44 @@ class MultiConsensusEngine {
     const spreadPenalty = book.spread > 0.16 ? 0.12 : 0;
 
     return clamp(depthBand + balance * 0.20 - spreadPenalty);
+  }
+
+  scoreImbalance(signal, book) {
+    if (!this.config.enableImbalanceSignals || !isBookComplete(book)) return 0.55;
+
+    const info = computeOrderBookImbalance(book, this.config.imbalanceDepthLevels);
+    if (!info.usable) return 0.35;
+
+    const abs = Math.abs(info.imbalance);
+
+    // Maker mode prefers balanced books. Extreme imbalance often means the
+    // spread is wide because one side is thin, not because there is free edge.
+    if (signal.strategy === 'SpreadHunter' || signal.strategy === 'ComplementArb') {
+      if (abs <= this.config.imbalanceBalancedThreshold) return 0.78;
+      if (abs <= this.config.imbalanceStrongThreshold) return 0.62;
+      return 0.38;
+    }
+
+    // Directional/sniper logic only likes imbalance when aligned.
+    const alignedBuy = signal.side === 'buy' && info.imbalance > this.config.imbalanceStrongThreshold;
+    const alignedSell = signal.side === 'sell' && info.imbalance < -this.config.imbalanceStrongThreshold;
+    if (alignedBuy || alignedSell) return 0.80;
+    if (abs <= this.config.imbalanceBalancedThreshold) return 0.55;
+    return 0.35;
+  }
+
+  scoreWhale(signal, whaleEvent) {
+    if (!this.config.enableWhaleTracking) return 0.50;
+    if (!whaleEvent) return 0.50;
+
+    const whaleSide = String(whaleEvent.side || '').toLowerCase();
+    const aligned =
+      (signal.side === 'buy' && ['buy', 'upward_displacement'].includes(whaleSide)) ||
+      (signal.side === 'sell' && ['sell', 'downward_displacement'].includes(whaleSide));
+
+    // Whale tracking is a weak vote, not a command. It can support routing, but
+    // cannot bypass RiskEngine or consensus thresholds alone.
+    return aligned ? 0.70 + this.config.whaleAlignmentBoost : 0.42;
   }
 
   scoreMomentum(signal, book) {
@@ -1365,6 +2140,8 @@ class Portfolio {
     this.avgCost = new Map();
     this.tokenMarket = new Map();
     this.openOrders = new Map();
+    this.ghostOrders = [];
+    this.ghostStats = { total: 0, favorable: 0, unfavorable: 0, neutral: 0 };
     this.pnlByStrategy = new Map();
 
     this.loadState();
@@ -1382,6 +2159,7 @@ class Portfolio {
         if (data.positions) this.positions = new Map(Object.entries(data.positions).map(([k, v]) => [k, Number(v)]));
         if (data.avgCost) this.avgCost = new Map(Object.entries(data.avgCost).map(([k, v]) => [k, Number(v)]));
         if (data.tokenMarket) this.tokenMarket = new Map(Object.entries(data.tokenMarket));
+        if (data.ghostStats) this.ghostStats = data.ghostStats;
         if (data.pnlByStrategy) this.pnlByStrategy = new Map(Object.entries(data.pnlByStrategy).map(([k, v]) => [k, Number(v)]));
         info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity.toFixed(2)}`);
       }
@@ -1400,6 +2178,7 @@ class Portfolio {
         positions: Object.fromEntries(this.positions),
         avgCost: Object.fromEntries(this.avgCost),
         tokenMarket: Object.fromEntries(this.tokenMarket),
+        ghostStats: this.ghostStats,
         pnlByStrategy: Object.fromEntries(this.pnlByStrategy),
       };
       fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
@@ -1463,7 +2242,27 @@ class Portfolio {
 
     this.tokenMarket.set(order.tokenId, order.marketId);
     this.openOrders.set(order.id, order);
+    this.recordGhostOrder(order);
     info(`[ORDER] ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(order.price)} size=$${order.sizeUsd.toFixed(2)} [${order.strategy}]`);
+  }
+
+  recordGhostOrder(order) {
+    if (!this.config.enableGhostMode || !order) return;
+
+    this.ghostOrders.push({
+      id: order.id,
+      tokenId: order.tokenId,
+      side: order.side,
+      strategy: order.strategy,
+      price: order.price,
+      createdMid: order.createdMid,
+      createdAt: Date.now(),
+      horizonMs: this.config.ghostHorizonMs,
+    });
+
+    while (this.ghostOrders.length > this.config.ghostMaxRecords) {
+      this.ghostOrders.shift();
+    }
   }
 
   processBooks(cache) {
@@ -1529,6 +2328,37 @@ class Portfolio {
 
     this.applyStopLossAndTakeProfit(cache);
     this.markToMarket(cache);
+    this.evaluateGhostOrders(cache);
+  }
+
+  evaluateGhostOrders(cache) {
+    if (!this.config.enableGhostMode || this.ghostOrders.length === 0) return;
+
+    const now = Date.now();
+    const keep = [];
+
+    for (const ghost of this.ghostOrders) {
+      if (now - ghost.createdAt < ghost.horizonMs) {
+        keep.push(ghost);
+        continue;
+      }
+
+      const book = cache.getBook(ghost.tokenId);
+      if (!book || !Number.isFinite(book.midpoint) || !Number.isFinite(ghost.createdMid)) continue;
+
+      const midMove = book.midpoint - ghost.createdMid;
+      const favorable = ghost.side === 'buy' ? midMove > 0 : midMove < 0;
+      const unfavorable = ghost.side === 'buy' ? midMove < 0 : midMove > 0;
+
+      this.ghostStats.total++;
+      if (Math.abs(midMove) < 0.002) this.ghostStats.neutral++;
+      else if (favorable) this.ghostStats.favorable++;
+      else if (unfavorable) this.ghostStats.unfavorable++;
+
+      info(`[GHOST] ${ghost.strategy} ${ghost.side.toUpperCase()} ${shortId(ghost.tokenId)} midMove=${midMove.toFixed(4)} favorable=${favorable}`);
+    }
+
+    this.ghostOrders = keep;
   }
 
   computePartialFill(order, book, requireFull = false) {
@@ -1560,12 +2390,26 @@ class Portfolio {
     if (fillQty <= 0) return null;
 
     const fullQty = remainingUsd / order.price;
+    const fillPrice = notionalAtBook / fillQty;
+
+    const liquidity = estimateLiquidityConsumption(book, order.side, remainingUsd, this.config);
+    const queueScale = liquidity.penalty;
+
+    // Queue realism: if our order is a large share of the visible top book,
+    // only a scaled portion should be considered realistically fillable.
+    fillQty *= queueScale;
+
     if (requireFull && fillQty + 1e-9 < fullQty) return null;
 
-    const fillPrice = notionalAtBook / fillQty;
     const fillUsd = Math.min(remainingUsd, fillQty * fillPrice);
 
-    return { fillPrice, fillUsd, fillQty: fillUsd / fillPrice };
+    return {
+      fillPrice,
+      fillUsd,
+      fillQty: fillUsd / fillPrice,
+      liquidityConsumedPct: liquidity.consumedPct,
+      queueScale,
+    };
   }
 
   shouldCancelForAdverseMove(order, book) {
@@ -1657,6 +2501,10 @@ class Portfolio {
     info(`--- PORTFOLIO REPORT ---`);
     info(`Equity: $${this.equity.toFixed(2)} | Cash: $${this.cash.toFixed(2)} | Drawdown: ${this.getDrawdownPct().toFixed(2)}%`);
     info(`Open Orders: ${this.openOrders.size} | Exposure: $${this.totalExposureUsd().toFixed(2)}`);
+    if (this.config.enableGhostMode && this.ghostStats.total > 0) {
+      const favorableRate = this.ghostStats.favorable / Math.max(1, this.ghostStats.total);
+      info(`Ghost calibration: total=${this.ghostStats.total} favorable=${(favorableRate * 100).toFixed(1)}% neutral=${this.ghostStats.neutral}`);
+    }
     if (this.pnlByStrategy.size > 0) {
       info(`Realized P&L by strategy: ${JSON.stringify(Object.fromEntries(this.pnlByStrategy))}`);
     }
@@ -1729,12 +2577,14 @@ async function main() {
   const risk = new RiskEngine(CONFIG, portfolio);
   const research = new ResearchEngine(poly, cache, CONFIG);
   const consensus = CONFIG.enableConsensus ? new MultiConsensusEngine(CONFIG) : null;
+  const whaleTracker = CONFIG.enableWhaleTracking ? new AsyncWhaleWatcher(CONFIG) : null;
 
   const strategies = [
     new SpreadHunterStrategy(CONFIG, cache, portfolio, volGuard),
     new InventoryExitStrategy(CONFIG, cache, portfolio, volGuard),
     new ComplementArbStrategy(CONFIG, cache, portfolio, volGuard),
     new TailEndMispricingStrategy(CONFIG, cache, portfolio, volGuard),
+    new WhaleCopyStrategy(CONFIG, cache, portfolio, volGuard, whaleTracker),
   ];
 
   let wsClient = null;
@@ -1823,6 +2673,8 @@ async function main() {
 
   while (true) {
     try {
+      if (whaleTracker) whaleTracker.tick();
+
       if (cycles % CONFIG.marketRefreshEveryCycles === 0) {
         const candidates = await research.discoverCandidates();
         if (wsClient) {
@@ -1839,7 +2691,7 @@ async function main() {
           const signals = await strat.generate(asset, book);
           for (const sig of signals) {
             const consensusReviewed = consensus
-              ? consensus.evaluateSignal(sig, asset, book, cache, portfolio, volGuard)
+              ? consensus.evaluateSignal(sig, asset, book, cache, portfolio, volGuard, whaleTracker)
               : sig;
 
             if (!consensusReviewed) continue;
