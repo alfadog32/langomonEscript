@@ -1,4 +1,3 @@
-cat > moneymaker_v3.js <<'EOF'
 'use strict';
 
 /**
@@ -2789,4 +2788,3 @@ main().catch((e) => {
   errlog(`Fatal start error: ${e.stack || e.message}`);
   process.exitCode = 1;
 });
-EOF
