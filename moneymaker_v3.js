@@ -456,7 +456,9 @@ function parseMaybeJsonArray(value) {
   } catch {
     return value.split(',').map((s) => s.trim()).filter(Boolean);
   }
-}function normalizeBook(raw, fallbackAssetId = '') {
+}
+
+function normalizeBook(raw, fallbackAssetId = '') {
   const bids = normalizeLevels(raw?.bids, 'bid');
   const asks = normalizeLevels(raw?.asks, 'ask');
 
@@ -894,7 +896,8 @@ function endingSoonPenalty(endDate) {
 
 // =========================
 // STRATEGY SIGNALS
-// =========================class Signal {
+// =========================
+class Signal {
   constructor({
     strategy,
     tokenId,
@@ -1100,7 +1103,9 @@ class InventoryExitStrategy extends Strategy {
       metadata: { marketQuestion: asset.market.question, outcome: asset.outcome },
     })];
   }
-}class ComplementArbStrategy extends Strategy {
+}
+
+class ComplementArbStrategy extends Strategy {
   constructor(...args) {
     super('ComplementArb', ...args);
   }
@@ -1293,7 +1298,8 @@ function confidenceFromPrice(mid) {
 
 // =========================
 // MULTI-VIEW CONSENSUS ENGINE
-// =========================class AsyncWhaleWatcher {
+// =========================
+class AsyncWhaleWatcher {
   constructor(config) {
     this.config = config;
     this.baseUrl = config.whaleDataApiUrl;
@@ -1488,7 +1494,9 @@ function normalizeTitle(value) {
     .replace(/[^a-z0-9 ]/g, ' ');
 
   return cleaned.split(' ').filter(Boolean).join(' ');
-}class MultiConsensusEngine {
+}
+
+class MultiConsensusEngine {
   constructor(config) {
     this.config = config;
     this.midHistory = new Map();
