@@ -914,7 +914,7 @@ class Signal {
     exitPlan,
     ttlMs,
     maxHoldMs,
-    metadata: {},
+    metadata = {},
   }) {
     this.id = crypto.randomUUID();
     this.strategy = strategy;
