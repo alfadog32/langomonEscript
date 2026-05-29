@@ -456,7 +456,9 @@ function parseMaybeJsonArray(value) {
   } catch {
     return value.split(',').map((s) => s.trim()).filter(Boolean);
   }
-}function normalizeBook(raw, fallbackAssetId = '') {
+};
+
+function normalizeBook(raw, fallbackAssetId = '') {
   const bids = normalizeLevels(raw?.bids, 'bid');
   const asks = normalizeLevels(raw?.asks, 'ask');
 
@@ -647,7 +649,9 @@ class CLOBWebSocketClient {
   stopPing() {
     clearInterval(this.pingTimer);
     this.pingTimer = null;
-  }  subscribe(assetIds) {
+  }
+
+  subscribe(assetIds) {
     const ids = Array.isArray(assetIds) ? assetIds : [assetIds];
     let changed = false;
 
@@ -894,7 +898,9 @@ function endingSoonPenalty(endDate) {
 
 // =========================
 // STRATEGY SIGNALS
-// =========================class Signal {
+// =========================
+
+class Signal {
   constructor({
     strategy,
     tokenId,
@@ -1100,7 +1106,9 @@ class InventoryExitStrategy extends Strategy {
       metadata: { marketQuestion: asset.market.question, outcome: asset.outcome },
     })];
   }
-}class ComplementArbStrategy extends Strategy {
+}
+
+class ComplementArbStrategy extends Strategy {
   constructor(...args) {
     super('ComplementArb', ...args);
   }
@@ -1292,8 +1300,10 @@ function confidenceFromPrice(mid) {
 }
 
 // =========================
-// MULTI-VIEW CONSENSUS ENGINE
-// =========================class AsyncWhaleWatcher {
+// WHALE WATCHER (ASYNC)
+// =========================
+
+class AsyncWhaleWatcher {
   constructor(config) {
     this.config = config;
     this.baseUrl = config.whaleDataApiUrl;
@@ -1488,7 +1498,13 @@ function normalizeTitle(value) {
     .replace(/[^a-z0-9 ]/g, ' ');
 
   return cleaned.split(' ').filter(Boolean).join(' ');
-}class MultiConsensusEngine {
+}
+
+// =========================
+// MULTI-VIEW CONSENSUS ENGINE
+// =========================
+
+class MultiConsensusEngine {
   constructor(config) {
     this.config = config;
     this.midHistory = new Map();
@@ -1721,7 +1737,9 @@ function normalizeTitle(value) {
       directionalMove: Number(directionalMove.toFixed(4)),
       spread: Number(book.spread.toFixed(4)),
     };
-  }  applyExecutionRoute(signal, route) {
+  }
+
+  applyExecutionRoute(signal, route) {
     if (!signal || !route) return signal;
     signal.confidence = clamp(signal.confidence * (route.confidenceMultiplier ?? 1), 0, 0.99);
     signal.expectedEdge = signal.expectedEdge * (route.edgeMultiplier ?? 1);
@@ -1911,7 +1929,9 @@ function normalizeTitle(value) {
 
     while (arr.length > this.config.historyLookback) arr.shift();
     this.midHistory.set(key, arr);
-  }  scoreStructure(signal, asset, book, cache) {
+  }
+
+  scoreStructure(signal, asset, book, cache) {
     if (signal.strategy === 'ComplementArb') {
       const siblings = cache.getMarketAssets(asset.market.marketId);
       if (siblings.length < 2) return 0.25;
@@ -2118,7 +2138,8 @@ class PaperPortfolio {
   }
 
   equity(markPrices = new Map()) {
-    let value = this.cash;    for (const [tokenId, qty] of this.positions.entries()) {
+    let value = this.cash;
+    for (const [tokenId, qty] of this.positions.entries()) {
       if (qty <= 0) continue;
       const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
       value += qty * mark;
@@ -2385,7 +2406,9 @@ class RiskEngine {
 
     return signal;
   }
-}// =========================
+}
+
+// =========================
 // PAPER EXECUTION ENGINE
 // =========================
 
@@ -2682,7 +2705,9 @@ class BotEngine {
     if (!signal) return;
 
     this.execution.place(signal, book);
-  }  report() {
+  }
+
+  report() {
     const markPrices = this.cache.markPrices();
     const equity = this.portfolio.equity(markPrices);
     const drawdown = this.portfolio.drawdownPct(markPrices);
