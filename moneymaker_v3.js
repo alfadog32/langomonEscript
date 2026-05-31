@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Polymarket MoneyMaker V3 - Research + Paper Execution Engine
+ * Polymarket MoneyMaker V3.2 - Hardened Research + Paper Execution Engine
  * ------------------------------------------------------------
  * Serious paper-first EV hunting system for Polymarket public data.
  *
@@ -12,11 +12,11 @@
  * - Runs multiple strategy modules that produce normalized trading signals.
  * - Applies a centralized risk engine before paper execution.
  * - Tracks paper fills, inventory, equity, drawdown, strategy P&L, adverse selection, and state.
+ * - Uses conservative paper-fill rules so paper results are harder to fake.
  *
  * What it does NOT do:
  * - It does not place real orders.
  * - It does not use private keys.
- * - It does not guarantee profit.
  *
  * Requirements:
  * - Node.js 18+.
@@ -52,6 +52,21 @@ const crypto = require('crypto');
 
 loadDotEnvFile();
 
+
+const DEFAULT_PROFITABLE_TRADER_WALLETS = [
+  '0x327576572a9df273017d23d8438139be6587c47d',
+  '0xe661b17a0d638706037a3641320078864010371a',
+  '0x789b7054f026a27e7d70404c459990529d666666',
+  '0x66c888d22791404179373d57d59b2f63f6834b97',
+  '0x0f3408f6153093952f44c45b533668a688888888',
+  '0x1f5c6e7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e',
+  '0x2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b',
+  '0x3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d',
+  '0x4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e',
+  '0x5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f',
+  '0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d',
+];
+
 // =========================
 // CONFIG
 // =========================
@@ -73,11 +88,17 @@ const CONFIG = {
 
   initialCash: envNum('INITIAL_CASH', 250),
 
-  eventLimit: envInt('EVENT_LIMIT', 100),
-  eventPages: envInt('EVENT_PAGES', 2),
+  eventLimit: envInt('EVENT_LIMIT', 75),
+  eventPages: envInt('EVENT_PAGES', 1),
   maxMarkets: envInt('MAX_MARKETS', 20),
   maxOutcomesPerMarket: envInt('MAX_OUTCOMES_PER_MARKET', 2),
-  marketRefreshEveryCycles: envInt('REFRESH_RESEARCH_EVERY', 10),
+  // Lighter research by default: the logs showed ~5-minute refreshes, so Sophie now
+  // reuses the active universe longer and limits book scans per refresh.
+  marketRefreshEveryCycles: envInt('REFRESH_RESEARCH_EVERY', 30),
+  maxResearchBooksPerRefresh: envInt('MAX_RESEARCH_BOOKS_PER_REFRESH', 140),
+  researchBookDelayMs: envInt('RESEARCH_BOOK_DELAY_MS', 25),
+  fillHistoryBoost: envNum('FILL_HISTORY_BOOST', 55),
+  noFillPenalty: envNum('NO_FILL_PENALTY', 10),
 
   minLiquidity: envNum('MIN_LIQUIDITY', 500),
   minVolume24h: envNum('MIN_VOLUME_24H', 50),
@@ -90,14 +111,18 @@ const CONFIG = {
   hunterMinTopDepthUsd: envNum('HUNTER_MIN_TOP_DEPTH_USD', 5),
   hunterMaxTopDepthUsd: envNum('HUNTER_MAX_TOP_DEPTH_USD', 4_000),
 
-  baseOrderUsd: envNum('BASE_ORDER_USD', 25),
+  baseOrderUsd: envNum('BASE_ORDER_USD', 10),
   minOrderUsd: envNum('MIN_ORDER_USD', 3),
   maxPositionUsdPerAsset: envNum('MAX_POSITION_USD', 200),
   maxMarketExposureUsd: envNum('MAX_MARKET_EXPOSURE_USD', 350),
-  maxTotalExposureUsd: envNum('MAX_TOTAL_EXPOSURE_USD', 1_500),
-  maxTotalOpenOrderUsd: envNum('MAX_TOTAL_OPEN_ORDER_USD', 1_000),
-  maxOpenOrders: envInt('MAX_OPEN_ORDERS', 250),
+  maxTotalExposureUsd: envNum('MAX_TOTAL_EXPOSURE_USD', 350),
+  maxTotalOpenOrderUsd: envNum('MAX_TOTAL_OPEN_ORDER_USD', 150),
+  maxOpenOrders: envInt('MAX_OPEN_ORDERS', 60),
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
+  strictPaperFills: envBool('STRICT_PAPER_FILLS', true),
+  makerQueueHaircut: envNum('MAKER_QUEUE_HAIRCUT', 0.45),
+  maxBookAgeMs: envInt('MAX_BOOK_AGE_MS', 5_000),
+  maxRestingOrderAgeMs: envInt('MAX_RESTING_ORDER_AGE_MS', 90_000),
 
   // Practical revenue/risk optimization controls.
   // These keep the paper engine realistic: no instant fantasy fills, no unlimited bags.
@@ -114,7 +139,13 @@ const CONFIG = {
   // This helps calibrate quote offsets without pretending every order fills.
   enableGhostMode: envBool('ENABLE_GHOST_MODE', true),
   ghostHorizonMs: envInt('GHOST_HORIZON_MS', 60_000),
-  ghostMaxRecords: envInt('GHOST_MAX_RECORDS', 500),
+  ghostMaxRecords: envInt('GHOST_MAX_RECORDS', 750),
+  ghostThrottleMinSamples: envInt('GHOST_THROTTLE_MIN_SAMPLES', 25),
+  ghostTargetFavorableRate: envNum('GHOST_TARGET_FAVORABLE_RATE', 0.30),
+  ghostHardBlockRate: envNum('GHOST_HARD_BLOCK_RATE', 0.12),
+  ghostBadSizeMultiplier: envNum('GHOST_BAD_SIZE_MULTIPLIER', 0.35),
+  ghostColdStartMultiplier: envNum('GHOST_COLD_START_MULTIPLIER', 0.75),
+  ghostGoodBoostRate: envNum('GHOST_GOOD_BOOST_RATE', 0.45),
 
   // 1) Order-book imbalance signals.
   enableImbalanceSignals: envBool('ENABLE_IMBALANCE_SIGNALS', true),
@@ -127,6 +158,12 @@ const CONFIG = {
   adaptiveMinSizeMultiplier: envNum('ADAPTIVE_MIN_SIZE_MULTIPLIER', 0.35),
   adaptiveMaxSizeMultiplier: envNum('ADAPTIVE_MAX_SIZE_MULTIPLIER', 1.35),
   adaptiveGhostPenalty: envNum('ADAPTIVE_GHOST_PENALTY', 0.65),
+  duplicateOrderCooldownMs: envInt('DUPLICATE_ORDER_COOLDOWN_MS', 35_000),
+  tokenFillPriorityMinOrders: envInt('TOKEN_FILL_PRIORITY_MIN_ORDERS', 6),
+  tokenNoFillPenaltyRate: envNum('TOKEN_NO_FILL_PENALTY_RATE', 0.65),
+  tokenGoodFillRate: envNum('TOKEN_GOOD_FILL_RATE', 0.08),
+  exposureThrottleGhostRate: envNum('EXPOSURE_THROTTLE_GHOST_RATE', 0.25),
+  exposureThrottleMultiplier: envNum('EXPOSURE_THROTTLE_MULTIPLIER', 0.55),
 
   // 3) Whale tracking hook. This reads public/externally collected whale events
   // from a local JSON file if you wire one in. It never invents whale data.
@@ -146,6 +183,20 @@ const CONFIG = {
   whaleCopyFreshMs: envInt('WHALE_COPY_FRESH_MS', 30_000),
   whaleCopyBaseMultiplier: envNum('WHALE_COPY_BASE_MULTIPLIER', 0.4),
   whaleCopyWhaleFraction: envNum('WHALE_COPY_WHALE_FRACTION', 0.15),
+
+  // 4) Profitable-trader intelligence. Public wallet trades become a measured
+  // confirmation layer for Sophie, never a blind-copy override.
+  enableProfitableTraderIntel: envBool('ENABLE_PROFITABLE_TRADER_INTEL', true),
+  profitableTraderWallets: envList('PROFITABLE_TRADER_WALLETS', DEFAULT_PROFITABLE_TRADER_WALLETS),
+  profitableTraderMinUsd: envNum('PROFITABLE_TRADER_MIN_USD', 250),
+  profitableTraderLookbackMs: envInt('PROFITABLE_TRADER_LOOKBACK_MS', 20 * 60_000),
+  profitableTraderFreshMs: envInt('PROFITABLE_TRADER_FRESH_MS', 4 * 60_000),
+  profitableTraderPollMs: envInt('PROFITABLE_TRADER_POLL_MS', 45_000),
+  profitableTraderMinTrades: envInt('PROFITABLE_TRADER_MIN_TRADES', 3),
+  profitableTraderAlignmentBoost: envNum('PROFITABLE_TRADER_ALIGNMENT_BOOST', 0.14),
+  profitableTraderOppositionPenalty: envNum('PROFITABLE_TRADER_OPPOSITION_PENALTY', 0.22),
+  profitableTraderConsensusWeight: envNum('PROFITABLE_TRADER_CONSENSUS_WEIGHT', 0.20),
+  requireTraderOrGhostConfirmation: envBool('REQUIRE_TRADER_OR_GHOST_CONFIRMATION', false),
 
   // Multi-view consensus gate. This is the reports.js idea rebuilt with real
   // MoneyMaker data instead of random fake scouts or a second wallet engine.
@@ -187,7 +238,7 @@ const CONFIG = {
   complementArbEnabled: envBool('STRAT_COMPLEMENT_ARB', true),
   spreadHunterEnabled: envBool('STRAT_SPREAD_HUNTER', true),
   inventoryExitEnabled: envBool('STRAT_INVENTORY_EXIT', true),
-  tailEndEnabled: envBool('STRAT_TAIL_END', true),
+  tailEndEnabled: envBool('STRAT_TAIL_END', false),
 
   complementArbMinEdge: envNum('COMPLEMENT_ARB_MIN_EDGE', 0.012),
   spreadHunterMinEdge: envNum('SPREAD_HUNTER_MIN_EDGE', 0.01),
@@ -541,6 +592,15 @@ class MarketCache {
     return this.books.get(String(tokenId));
   }
 
+  markStale(tokenId) {
+    const key = String(tokenId);
+    const book = this.books.get(key);
+    if (book) {
+      book.cachedAt = 0;
+      this.books.set(key, book);
+    }
+  }
+
   async getFreshBook(tokenId, maxAgeMs = 1_500) {
     const cached = this.getBook(tokenId);
     if (cached && Date.now() - (cached.cachedAt || 0) <= maxAgeMs && cached.midpoint !== null) {
@@ -578,6 +638,7 @@ class CLOBWebSocketClient {
     this.reconnectTimer = null;
     this.pingTimer = null;
     this.reconnectDelayMs = config.wsReconnectInitialMs || 5_000;
+    this.manualReconnect = false;
   }
 
   connect() {
@@ -620,6 +681,14 @@ class CLOBWebSocketClient {
     clearTimeout(this.reconnectTimer);
 
     const cleanReason = Buffer.isBuffer(reason) ? reason.toString('utf8') : String(reason || '');
+
+    if (this.manualReconnect) {
+      this.manualReconnect = false;
+      info(`CLOB WS clean resubscribe: code=${code ?? 'unknown'} reason=${cleanReason || 'none'}`);
+      this.reconnectTimer = setTimeout(() => this.connect(), 250);
+      return;
+    }
+
     warn(`CLOB WS closed: code=${code ?? 'unknown'} reason=${cleanReason || 'none'} reconnectMs=${this.reconnectDelayMs}`);
 
     const delay = this.reconnectDelayMs;
@@ -667,6 +736,51 @@ class CLOBWebSocketClient {
     if (changed) this.resubscribe();
   }
 
+  replaceSubscriptions(assetIds) {
+    const next = new Set((Array.isArray(assetIds) ? assetIds : [assetIds])
+      .filter(Boolean)
+      .map((id) => String(id)));
+
+    if (setsEqual(this.assetIds, next)) return;
+    this.assetIds = next;
+
+    // The public market socket is easiest to keep clean by reconnecting when the
+    // tracked universe changes. That prevents stale asset ids from accumulating.
+    if (this.ws && this.ws.readyState === WebSocketImpl.OPEN) {
+      this.reconnectClean('asset universe changed');
+    } else {
+      this.resubscribe();
+    }
+  }
+
+  reconnectClean(reason = 'manual reconnect') {
+    clearTimeout(this.reconnectTimer);
+    this.stopPing();
+    this.manualReconnect = true;
+
+    if (!this.ws) {
+      this.reconnectTimer = setTimeout(() => this.connect(), 250);
+      return;
+    }
+
+    try {
+      if (typeof this.ws.close === 'function') {
+        this.ws.close(1000, String(reason).slice(0, 80));
+      }
+    } catch (e) {
+      warn(`CLOB WS clean reconnect close failed: ${e.message}`);
+      this.reconnectTimer = setTimeout(() => this.connect(), 250);
+    }
+  }
+
+  close() {
+    clearTimeout(this.reconnectTimer);
+    this.stopPing();
+    try {
+      if (this.ws && typeof this.ws.close === 'function') this.ws.close(1000, 'shutdown');
+    } catch {}
+  }
+
   resubscribe() {
     if (!this.ws || this.ws.readyState !== WebSocketImpl.OPEN) return;
     const ids = [...this.assetIds];
@@ -710,10 +824,12 @@ class CLOBWebSocketClient {
 // =========================
 
 class ResearchEngine {
-  constructor(poly, cache, config) {
+  constructor(poly, cache, config, portfolio = null, traderIntel = null) {
     this.poly = poly;
     this.cache = cache;
     this.config = config;
+    this.portfolio = portfolio;
+    this.traderIntel = traderIntel;
   }
 
   async discoverCandidates() {
@@ -721,12 +837,20 @@ class ResearchEngine {
 
     const events = await this.poly.fetchActiveEvents();
     const markets = this.poly.extractTradableMarkets(events);
+    markets.sort((a, b) => this.preBookMarketScore(b) - this.preBookMarketScore(a));
+
     const assets = [];
+    let scannedBooks = 0;
+    const maxBooks = Math.max(1, this.config.maxResearchBooksPerRefresh || Infinity);
 
     for (const market of markets) {
-      const outcomes = market.outcomes.slice(0, this.config.maxOutcomesPerMarket);
+      const outcomes = market.outcomes
+        .slice(0, this.config.maxOutcomesPerMarket)
+        .sort((a, b) => this.preBookOutcomeScore(market, b) - this.preBookOutcomeScore(market, a));
 
       for (const outcome of outcomes) {
+        if (scannedBooks >= maxBooks) break;
+        scannedBooks += 1;
         try {
           const book = await this.poly.getOrderBook(outcome.tokenId);
           this.cache.setBook(outcome.tokenId, book);
@@ -737,15 +861,17 @@ class ResearchEngine {
           warn(`Skipping book for ${shortId(outcome.tokenId)}: ${e.message}`);
         }
 
-        await sleep(60);
+        await sleep(this.config.researchBookDelayMs || 25);
       }
+
+      if (scannedBooks >= maxBooks) break;
     }
 
     assets.sort((a, b) => b.score - a.score);
     const selected = assets.slice(0, this.config.maxMarkets);
     this.cache.setCandidates(selected);
 
-    info(`Research selected ${selected.length} assets from ${assets.length} scored assets.`);
+    info(`Research selected ${selected.length} assets from ${assets.length} scored assets after scanning ${scannedBooks} books.`);
     for (const a of selected.slice(0, 10)) {
       info(
         `SELECT score=${a.score.toFixed(1)} ${a.outcome.padEnd(8)} ` +
@@ -755,6 +881,22 @@ class ResearchEngine {
     }
 
     return selected;
+  }
+
+  preBookMarketScore(market) {
+    const volume = Math.log10(1 + Number(market.volume24h || 0)) * 20;
+    const liquidity = Math.log10(1 + Number(market.liquidity || 0)) * 12;
+    const fillBoost = (market.outcomes || []).reduce((best, outcome) => {
+      return Math.max(best, this.portfolio?.scoreTokenPriority?.(outcome.tokenId) || 1);
+    }, 1);
+    const traderBoost = this.traderIntel?.scoreMarketInterest?.(market) || 0;
+    return volume + liquidity + (fillBoost - 1) * this.config.fillHistoryBoost + traderBoost * 25;
+  }
+
+  preBookOutcomeScore(market, outcome) {
+    const tokenScore = this.portfolio?.scoreTokenPriority?.(outcome.tokenId) || 1;
+    const traderScore = this.traderIntel?.scoreTokenInterest?.(outcome.tokenId, market.marketId, market.question) || 0;
+    return (tokenScore - 1) * this.config.fillHistoryBoost + traderScore * 30;
   }
 
   scoreAsset(market, outcome, book) {
@@ -798,6 +940,16 @@ class ResearchEngine {
       score = liquidityScore + volumeScore + spreadScore + balanceScore - extremePenalty - agePenalty;
     }
 
+    const learnedPriority = this.portfolio?.scoreTokenPriority?.(outcome.tokenId) || 1;
+    const ghostQuality = this.portfolio?.ghostQualityForToken?.(outcome.tokenId) || { usable: false, rate: 0.5 };
+    const traderInterest = this.traderIntel?.scoreTokenInterest?.(outcome.tokenId, market.marketId, market.question) || 0;
+
+    score += (learnedPriority - 1) * this.config.fillHistoryBoost;
+    score += traderInterest * 35;
+    if (ghostQuality.usable && ghostQuality.rate < this.config.ghostTargetFavorableRate) {
+      score -= (this.config.ghostTargetFavorableRate - ghostQuality.rate) * 80;
+    }
+
     return {
       assetKey: `${market.marketId}:${outcome.tokenId}`,
       market,
@@ -805,6 +957,9 @@ class ResearchEngine {
       tokenId: outcome.tokenId,
       book,
       score,
+      learnedPriority,
+      traderInterest,
+      ghostRate: ghostQuality.usable ? ghostQuality.rate : null,
       topBidDepthUsd: topBid3Usd,
       topAskDepthUsd: topAsk3Usd,
       topDepthTotalUsd,
@@ -1118,7 +1273,8 @@ class ComplementArbStrategy extends Strategy {
     if (!isBookComplete(book)) return [];
 
     const siblings = this.cache.getMarketAssets(asset.market.marketId);
-    if (siblings.length < 2) return [];
+    if (siblings.length !== 2) return [];
+    if (!Array.isArray(asset.market?.outcomes) || asset.market.outcomes.length !== 2) return [];
 
     const a = siblings[0];
     const b = siblings[1];
@@ -1477,6 +1633,274 @@ class AsyncWhaleWatcher {
   }
 }
 
+
+// =========================
+// PROFITABLE TRADER INTELLIGENCE
+// =========================
+
+class ProfitableTraderIntel {
+  constructor(config) {
+    this.config = config;
+    this.baseUrl = config.whaleDataApiUrl;
+    this.wallets = [...new Set((config.profitableTraderWallets || []).map(normalizeWallet).filter(isValidEvmWallet))];
+    this.events = [];
+    this.walletStats = new Map();
+    this.lastPollMs = 0;
+    this.inFlight = false;
+
+    const rejected = (config.profitableTraderWallets || []).length - this.wallets.length;
+    if (config.enableProfitableTraderIntel && rejected > 0) {
+      warn(`[TraderIntel] Ignored ${rejected} malformed wallet entries before polling.`);
+    }
+    if (config.enableProfitableTraderIntel && this.wallets.length === 0) {
+      warn('[TraderIntel] Enabled but no valid PROFITABLE_TRADER_WALLETS were configured.');
+    }
+  }
+
+  tick() {
+    if (!this.config.enableProfitableTraderIntel || this.wallets.length === 0) return;
+
+    const now = Date.now();
+    if (this.inFlight) return;
+    if (now - this.lastPollMs < this.config.profitableTraderPollMs) return;
+
+    this.lastPollMs = now;
+    this.update().catch((e) => warn(`[TraderIntel] background update failed: ${e.message}`));
+  }
+
+  async update() {
+    if (this.inFlight) return;
+    this.inFlight = true;
+
+    try {
+      const batchSize = Math.max(1, this.config.whaleBatchSize || 3);
+      for (let i = 0; i < this.wallets.length; i += batchSize) {
+        const batch = this.wallets.slice(i, i + batchSize);
+        await Promise.allSettled(batch.map((wallet) => this.fetchWalletTrades(wallet)));
+        if (i + batchSize < this.wallets.length) await sleep(this.config.whaleBatchDelayMs || 1000);
+      }
+      this.prune();
+      this.rebuildWalletStats();
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  async fetchWalletTrades(wallet) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.whaleApiTimeoutMs);
+
+    try {
+      const url = new URL('/trades', this.baseUrl);
+      url.searchParams.set('user', wallet);
+      url.searchParams.set('limit', String(this.config.whaleTradesLimit));
+
+      const response = await fetch(url.toString(), {
+        headers: { accept: 'application/json' },
+        signal: controller.signal,
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+
+      const payload = await response.json();
+      const trades = Array.isArray(payload) ? payload : payload?.trades || payload?.data || [];
+      if (!Array.isArray(trades)) return;
+
+      for (const raw of trades) {
+        const trade = this.normalizeTrade(wallet, raw);
+        if (!trade || trade.sizeUsd < this.config.profitableTraderMinUsd) continue;
+        this.storeTrade(trade);
+      }
+    } catch (e) {
+      warn(`[TraderIntel] Failed to update wallet ${shortId(wallet)}: ${e.message}`);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  normalizeTrade(wallet, trade) {
+    if (!trade) return null;
+
+    const price = toNum(trade.price ?? trade.outcomePrice ?? trade.avgPrice, NaN);
+    const size = toNum(trade.size ?? trade.shares ?? trade.amount, NaN);
+    const directUsd = toNum(trade.sizeUsd ?? trade.usd ?? trade.notionalUsd ?? trade.value, NaN);
+    const sizeUsd = Number.isFinite(directUsd)
+      ? directUsd
+      : Number.isFinite(price) && Number.isFinite(size)
+        ? price * size
+        : 0;
+
+    const rawTs = trade.timestamp ?? trade.ts ?? trade.time ?? trade.createdAt ?? trade.created_at;
+    let timestamp = Number(rawTs);
+    if (Number.isFinite(timestamp) && timestamp < 10000000000) timestamp *= 1000;
+    if (!Number.isFinite(timestamp)) timestamp = Date.parse(rawTs || '');
+    if (!Number.isFinite(timestamp)) timestamp = Date.now();
+
+    const sideRaw = String(trade.side ?? trade.action ?? trade.type ?? '').toLowerCase();
+    const side = sideRaw.includes('sell') ? 'sell' : sideRaw.includes('buy') ? 'buy' : sideRaw;
+    if (!['buy', 'sell'].includes(side)) return null;
+
+    const tokenId = String(trade.tokenId ?? trade.assetId ?? trade.asset_id ?? trade.conditionTokenId ?? '');
+    const marketId = String(trade.marketId ?? trade.conditionId ?? trade.condition_id ?? '');
+    const marketTitle = String(trade.title ?? trade.marketTitle ?? trade.question ?? trade.market ?? '');
+
+    return {
+      wallet,
+      handle: wallet,
+      tokenId,
+      marketId,
+      marketTitle,
+      normalizedTitle: normalizeTitle(marketTitle),
+      side,
+      price,
+      sizeUsd,
+      timestamp,
+      source: 'profitable_trader_public_feed',
+    };
+  }
+
+  storeTrade(trade) {
+    const key = `${trade.wallet}:${trade.tokenId || trade.marketId || trade.normalizedTitle}:${trade.timestamp}:${trade.side}:${trade.sizeUsd}`;
+    if (this.events.some((e) => e.key === key)) return;
+    this.events.unshift({ ...trade, key });
+  }
+
+  prune() {
+    const now = Date.now();
+    this.events = this.events
+      .filter((event) => now - event.timestamp <= this.config.profitableTraderLookbackMs)
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, 1200);
+  }
+
+  rebuildWalletStats() {
+    this.walletStats.clear();
+    for (const event of this.events) {
+      const stats = this.walletStats.get(event.wallet) || {
+        wallet: event.wallet,
+        trades: 0,
+        totalUsd: 0,
+        markets: new Set(),
+        tokens: new Set(),
+        buyUsd: 0,
+        sellUsd: 0,
+        lastTradeTs: 0,
+      };
+      stats.trades += 1;
+      stats.totalUsd += event.sizeUsd;
+      if (event.marketId || event.normalizedTitle) stats.markets.add(event.marketId || event.normalizedTitle);
+      if (event.tokenId) stats.tokens.add(event.tokenId);
+      if (event.side === 'buy') stats.buyUsd += event.sizeUsd;
+      if (event.side === 'sell') stats.sellUsd += event.sizeUsd;
+      stats.lastTradeTs = Math.max(stats.lastTradeTs, event.timestamp);
+      this.walletStats.set(event.wallet, stats);
+    }
+  }
+
+  walletQuality(wallet) {
+    const stats = this.walletStats.get(wallet);
+    if (!stats) return 0;
+    const tradesQuality = clamp(stats.trades / Math.max(1, this.config.profitableTraderMinTrades), 0, 1);
+    const sizeQuality = clamp(Math.log10(1 + stats.totalUsd) / 5, 0, 1);
+    const recencyQuality = clamp(1 - ((Date.now() - stats.lastTradeTs) / Math.max(1, this.config.profitableTraderLookbackMs)), 0, 1);
+    return clamp((tradesQuality * 0.45) + (sizeQuality * 0.35) + (recencyQuality * 0.20), 0, 1);
+  }
+
+  matchingEvents({ tokenId, marketId, marketQuestion }) {
+    const title = normalizeTitle(marketQuestion);
+    const now = Date.now();
+
+    return this.events.filter((event) => {
+      if (now - event.timestamp > this.config.profitableTraderLookbackMs) return false;
+      const tokenMatch = event.tokenId && tokenId && event.tokenId === String(tokenId);
+      const marketMatch = event.marketId && marketId && event.marketId === String(marketId);
+      const titleMatch = event.normalizedTitle && title && event.normalizedTitle === title;
+      return tokenMatch || marketMatch || titleMatch;
+    });
+  }
+
+  analyzeSignal(signal, asset, book) {
+    if (!this.config.enableProfitableTraderIntel || !signal) {
+      return { usable: false, score: 0.5, alignedCount: 0, opposedCount: 0, reason: 'disabled' };
+    }
+
+    this.prune();
+    const matches = this.matchingEvents({
+      tokenId: signal.tokenId,
+      marketId: signal.marketId,
+      marketQuestion: signal.metadata?.marketQuestion || asset?.market?.question,
+    });
+
+    if (matches.length === 0) {
+      return { usable: false, score: 0.5, alignedCount: 0, opposedCount: 0, reason: 'no matching profitable-wallet activity' };
+    }
+
+    let alignedUsd = 0;
+    let opposedUsd = 0;
+    let alignedCount = 0;
+    let opposedCount = 0;
+    let qualitySum = 0;
+    let freshCount = 0;
+    const now = Date.now();
+
+    for (const event of matches) {
+      const quality = this.walletQuality(event.wallet);
+      if (quality <= 0) continue;
+      const freshness = clamp(1 - ((now - event.timestamp) / Math.max(1, this.config.profitableTraderFreshMs)), 0, 1);
+      const weight = event.sizeUsd * Math.max(0.15, quality) * Math.max(0.20, freshness);
+      qualitySum += quality;
+      if (freshness > 0) freshCount += 1;
+
+      if (event.side === signal.side) {
+        alignedUsd += weight;
+        alignedCount += 1;
+      } else {
+        opposedUsd += weight;
+        opposedCount += 1;
+      }
+    }
+
+    const total = alignedUsd + opposedUsd;
+    if (total <= 0) return { usable: false, score: 0.5, alignedCount, opposedCount, reason: 'matches too stale or too low quality' };
+
+    const directional = (alignedUsd - opposedUsd) / total;
+    const participation = clamp(Math.log10(1 + total) / 5, 0, 1);
+    const freshnessBoost = clamp(freshCount / Math.max(1, matches.length), 0, 1);
+    const score = clamp(0.50 + directional * 0.35 + participation * 0.10 + freshnessBoost * 0.05, 0, 1);
+
+    return {
+      usable: true,
+      score,
+      directional,
+      alignedCount,
+      opposedCount,
+      alignedUsd,
+      opposedUsd,
+      avgWalletQuality: qualitySum / Math.max(1, matches.length),
+      freshCount,
+      reason: alignedUsd >= opposedUsd ? 'profitable wallets aligned' : 'profitable wallets opposing',
+      sample: matches.slice(0, 5).map((event) => ({
+        wallet: shortId(event.wallet),
+        side: event.side,
+        sizeUsd: Number(event.sizeUsd.toFixed(2)),
+        ageMs: now - event.timestamp,
+      })),
+    };
+  }
+
+  scoreTokenInterest(tokenId, marketId = '', marketQuestion = '') {
+    const matches = this.matchingEvents({ tokenId, marketId, marketQuestion });
+    if (matches.length === 0) return 0;
+    const usd = matches.reduce((sum, event) => sum + event.sizeUsd * Math.max(0.15, this.walletQuality(event.wallet)), 0);
+    return clamp(Math.log10(1 + usd) / 5, 0, 1);
+  }
+
+  scoreMarketInterest(market) {
+    if (!market) return 0;
+    return Math.max(0, ...((market.outcomes || []).map((outcome) => this.scoreTokenInterest(outcome.tokenId, market.marketId, market.question))));
+  }
+}
+
 function formatWsError(e) {
   if (!e) return 'unknown websocket error';
   if (typeof e === 'string') return e;
@@ -1489,6 +1913,14 @@ function formatWsError(e) {
   } catch {
     return String(e);
   }
+}
+
+function normalizeWallet(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function isValidEvmWallet(value) {
+  return /^0x[a-f0-9]{40}$/i.test(String(value || '').trim());
 }
 
 function normalizeTitle(value) {
@@ -1510,7 +1942,7 @@ class MultiConsensusEngine {
     this.midHistory = new Map();
   }
 
-  evaluateSignal(signal, asset, book, cache, portfolio, volGuard, whaleTracker = null) {
+  evaluateSignal(signal, asset, book, cache, portfolio, volGuard, whaleTracker = null, traderIntel = null) {
     if (!signal || !asset || !book) return null;
 
     const protectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
@@ -1529,6 +1961,7 @@ class MultiConsensusEngine {
     this.recordMid(signal.tokenId, book.midpoint);
 
     const whaleEvent = whaleTracker?.findRecentForSignal?.(signal) || null;
+    const traderContext = traderIntel?.analyzeSignal?.(signal, asset, book) || { usable: false, score: 0.5, reason: 'not available' };
 
     const components = {
       structure: this.scoreStructure(signal, asset, book, cache),
@@ -1537,16 +1970,19 @@ class MultiConsensusEngine {
       momentum: this.scoreMomentum(signal, book),
       volatility: this.scoreVolatility(signal, book, volGuard),
       portfolio: this.scorePortfolio(signal, book, portfolio),
+      selfLearning: this.scoreSelfLearning(signal, portfolio),
       timing: this.scoreTiming(signal, asset),
       whale: this.scoreWhale(signal, whaleEvent),
+      profitableTrader: this.scoreProfitableTrader(traderContext),
     };
 
     const weights = signal.strategy === 'ComplementArb'
-      ? { structure: 0.34, depth: 0.13, imbalance: 0.08, momentum: 0.08, volatility: 0.17, portfolio: 0.12, timing: 0.04, whale: 0.04 }
-      : { structure: 0.20, depth: 0.15, imbalance: 0.13, momentum: 0.13, volatility: 0.16, portfolio: 0.14, timing: 0.05, whale: 0.04 };
+      ? { structure: 0.30, depth: 0.12, imbalance: 0.05, momentum: 0.06, volatility: 0.14, portfolio: 0.10, selfLearning: 0.10, timing: 0.03, whale: 0.02, profitableTrader: 0.08 }
+      : { structure: 0.22, depth: 0.14, imbalance: 0.08, momentum: 0.08, volatility: 0.08, portfolio: 0.09, selfLearning: 0.14, timing: 0.03, whale: 0.02, profitableTrader: this.config.profitableTraderConsensusWeight };
 
+    const weightTotal = Math.max(0.0001, Object.values(weights).reduce((sum, weight) => sum + weight, 0));
     const score = Object.entries(weights).reduce((sum, [name, weight]) => {
-      return sum + (components[name] ?? 0) * weight;
+      return sum + (components[name] ?? 0) * (weight / weightTotal);
     }, 0);
 
     const route = this.routeExecution({
@@ -1559,9 +1995,17 @@ class MultiConsensusEngine {
       components,
       score,
       whaleEvent,
+      traderContext,
     });
 
-    const authorized = score >= this.config.consensusThreshold && route.authorized;
+    const hasTraderOrGhostConfirmation =
+      (traderContext.usable && traderContext.score >= 0.55) ||
+      components.selfLearning >= 0.58;
+
+    const authorized =
+      score >= this.config.consensusThreshold &&
+      route.authorized &&
+      (!this.config.requireTraderOrGhostConfirmation || hasTraderOrGhostConfirmation);
 
     signal.metadata = {
       ...(signal.metadata || {}),
@@ -1581,6 +2025,7 @@ class MultiConsensusEngine {
           source: whaleEvent.source,
           ageMs: Date.now() - whaleEvent.timestamp,
         } : null,
+        profitableTrader: traderContext,
       },
     };
 
@@ -1593,6 +2038,7 @@ class MultiConsensusEngine {
 
     this.applyExecutionRoute(signal, route);
     this.applyWhaleConsensusAdjustment(signal, whaleEvent);
+    this.applyProfitableTraderAdjustment(signal, traderContext);
     this.applyAdaptivePositionSizing(signal, components, route, book, portfolio);
 
     // Consensus cannot bypass RiskEngine. It can only adjust quality scores
@@ -1607,6 +2053,29 @@ class MultiConsensusEngine {
     signal.expectedEdge = signal.expectedEdge * qualityMultiplier;
 
     return signal;
+  }
+
+  scoreSelfLearning(signal, portfolio) {
+    const q = portfolio?.ghostSignalQuality?.(signal);
+    const fill = portfolio?.tokenFillStats?.(signal?.tokenId);
+    let score = 0.50;
+
+    if (q?.usable) {
+      score = clamp(0.20 + q.rate * 1.25, 0, 1);
+    }
+
+    if (fill && fill.orders >= this.config.tokenFillPriorityMinOrders) {
+      const fillRate = fill.fills / Math.max(1, fill.orders);
+      if (fillRate <= 0) score *= this.config.tokenNoFillPenaltyRate;
+      else if (fillRate >= this.config.tokenGoodFillRate) score = Math.min(1, score + 0.15);
+    }
+
+    return clamp(score, 0, 1);
+  }
+
+  scoreProfitableTrader(traderContext) {
+    if (!traderContext?.usable) return 0.50;
+    return clamp(traderContext.score, 0, 1);
   }
 
   routeExecution(marketData) {
@@ -1807,8 +2276,30 @@ class MultiConsensusEngine {
     return signal;
   }
 
+  applyProfitableTraderAdjustment(signal, traderContext) {
+    if (!this.config.enableProfitableTraderIntel || !signal || !traderContext?.usable) return signal;
+
+    signal.metadata = {
+      ...(signal.metadata || {}),
+      profitableTraderSignal: traderContext,
+    };
+
+    if (traderContext.score >= 0.62) {
+      signal.confidence = Math.min(0.96, signal.confidence * (1 + this.config.profitableTraderAlignmentBoost));
+      signal.expectedEdge *= (1 + this.config.profitableTraderAlignmentBoost * 0.75);
+      info(`[TRADER_INTEL_BOOST] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} score=${traderContext.score.toFixed(3)} aligned=${traderContext.alignedCount}`);
+    } else if (traderContext.score <= 0.42) {
+      signal.confidence *= (1 - this.config.profitableTraderOppositionPenalty);
+      signal.expectedEdge *= (1 - this.config.profitableTraderOppositionPenalty);
+      warn(`[TRADER_INTEL_FADE] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} score=${traderContext.score.toFixed(3)} opposed=${traderContext.opposedCount}`);
+    }
+
+    return signal;
+  }
+
   applyAdaptivePositionSizing(signal, components, route, book, portfolio) {
-    if (!this.config.enableAdaptiveSizing || !signal || signal.side !== 'buy') return signal;
+    if (!this.config.enableAdaptiveSizing || !signal) return signal;
+    if (!['buy', 'sell'].includes(signal.side)) return signal;
 
     const edgeQuality = clamp(signal.expectedEdge / Math.max(this.config.minSignalEdge, 0.0001), 0.35, 1.35);
     const depthQuality = clamp(components.depth || 0.5, 0.25, 1.0);
@@ -1819,10 +2310,13 @@ class MultiConsensusEngine {
     const routeQuality = route?.mode === 'MAKER' ? 1.0 : route?.mode === 'SNIPER' ? 0.75 : 0.50;
 
     let ghostQuality = 1.0;
-    if (portfolio?.ghostStats?.total >= 10) {
-      const favorableRate = portfolio.ghostStats.favorable / Math.max(1, portfolio.ghostStats.total);
-      if (favorableRate < 0.45) ghostQuality = this.config.adaptiveGhostPenalty;
-      if (favorableRate > 0.60) ghostQuality = 1.12;
+    const ghost = portfolio?.ghostSignalQuality?.(signal);
+    if (ghost?.usable) {
+      if (ghost.rate < this.config.ghostHardBlockRate) ghostQuality = Math.min(ghostQuality, this.config.ghostBadSizeMultiplier);
+      else if (ghost.rate < this.config.ghostTargetFavorableRate) ghostQuality = Math.min(ghostQuality, this.config.adaptiveGhostPenalty);
+      else if (ghost.rate > this.config.ghostGoodBoostRate) ghostQuality = 1.12;
+    } else {
+      ghostQuality = Math.min(ghostQuality, this.config.ghostColdStartMultiplier);
     }
 
     const liquidity = estimateLiquidityConsumption(book, signal.side, signal.sizeUsd, this.config);
@@ -1849,6 +2343,9 @@ class MultiConsensusEngine {
         portfolioQuality: Number(portfolioQuality.toFixed(4)),
         whaleQuality: Number(whaleQuality.toFixed(4)),
         ghostQuality: Number(ghostQuality.toFixed(4)),
+        ghostSource: ghost?.source || 'none',
+        ghostRate: Number((ghost?.rate ?? 0.5).toFixed(4)),
+        ghostSamples: ghost?.total || 0,
         liquidityQuality: Number(liquidityQuality.toFixed(4)),
       },
     };
@@ -2009,10 +2506,11 @@ class MultiConsensusEngine {
   scorePortfolio(signal, book, portfolio) {
     if (!portfolio || !isBookComplete(book)) return 0.5;
 
+    const localMarks = new Map([[String(signal.tokenId), book.midpoint]]);
     const assetExposure = Math.abs(portfolio.positionUsd(signal.tokenId, book.midpoint));
-    const marketExposure = Math.abs(portfolio.marketExposureUsd(signal.marketId, book.midpoint));
-    const totalExposure = Math.abs(portfolio.totalExposureUsd(book.midpoint));
-    const drawdown = portfolio.drawdownPct();
+    const marketExposure = Math.abs(portfolio.marketExposureUsd(signal.marketId, localMarks, book.midpoint));
+    const totalExposure = Math.abs(portfolio.totalExposureUsd(localMarks, book.midpoint));
+    const drawdown = portfolio.drawdownPct(localMarks);
 
     const assetScore = 1 - clamp(assetExposure / Math.max(1, this.config.maxPositionUsdPerAsset), 0, 1);
     const marketScore = 1 - clamp(marketExposure / Math.max(1, this.config.maxMarketExposureUsd), 0, 1);
@@ -2087,12 +2585,16 @@ class PaperPortfolio {
     this.peakEquity = config.initialCash;
     this.positions = new Map();
     this.costBasis = new Map();
+    this.positionMarkets = new Map();
     this.openOrders = new Map();
     this.closedPnl = 0;
     this.strategyPnl = new Map();
     this.fills = [];
     this.ghostOrders = [];
     this.ghostStats = { total: 0, favorable: 0, unfavorable: 0 };
+    this.ghostStatsByKey = new Map();
+    this.orderStatsByToken = new Map();
+    this.lastOrderByKey = new Map();
   }
 
   position(tokenId) {
@@ -2103,33 +2605,42 @@ class PaperPortfolio {
     return this.costBasis.get(String(tokenId)) || 0;
   }
 
+  markFor(tokenId, markPrices = new Map(), fallbackMark = 0.5) {
+    const key = String(tokenId);
+    const live = markPrices instanceof Map ? markPrices.get(key) : undefined;
+    if (Number.isFinite(live)) return live;
+    const avg = this.avgCost(key);
+    if (Number.isFinite(avg) && avg > 0) return avg;
+    return Number.isFinite(fallbackMark) ? fallbackMark : 0.5;
+  }
+
   positionUsd(tokenId, mark) {
     return this.position(tokenId) * (Number.isFinite(mark) ? mark : this.avgCost(tokenId));
   }
 
-  marketExposureUsd(marketId, fallbackMark = 0.5) {
+  marketExposureUsd(marketId, markPrices = new Map(), fallbackMark = 0.5) {
     let total = 0;
+    const target = String(marketId || '');
 
     for (const order of this.openOrders.values()) {
-      if (String(order.marketId || '') === String(marketId || '')) {
+      if (String(order.marketId || '') === target) {
         total += order.remainingUsd();
       }
     }
 
-    for (const fill of this.fills) {
-      if (String(fill.marketId || '') === String(marketId || '') && fill.side === 'buy') {
-        const qty = this.position(fill.tokenId);
-        if (qty > 0) total += qty * fallbackMark;
-      }
+    for (const [tokenId, qty] of this.positions.entries()) {
+      if (qty <= 0) continue;
+      if (String(this.positionMarkets.get(tokenId) || '') !== target) continue;
+      total += qty * this.markFor(tokenId, markPrices, fallbackMark);
     }
 
     return total;
   }
 
-  totalExposureUsd(fallbackMark = 0.5) {
+  totalExposureUsd(markPrices = new Map(), fallbackMark = 0.5) {
     let total = 0;
     for (const [tokenId, qty] of this.positions.entries()) {
-      if (qty > 0) total += qty * fallbackMark;
+      if (qty > 0) total += qty * this.markFor(tokenId, markPrices, fallbackMark);
     }
     for (const order of this.openOrders.values()) {
       total += order.remainingUsd();
@@ -2141,8 +2652,7 @@ class PaperPortfolio {
     let value = this.cash;
     for (const [tokenId, qty] of this.positions.entries()) {
       if (qty <= 0) continue;
-      const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
-      value += qty * mark;
+      value += qty * this.markFor(tokenId, markPrices, this.avgCost(tokenId));
     }
 
     this.peakEquity = Math.max(this.peakEquity, value);
@@ -2167,6 +2677,122 @@ class PaperPortfolio {
     return total;
   }
 
+  openBuyUsd() {
+    let total = 0;
+    for (const order of this.openOrders.values()) {
+      if (order.side === 'buy') total += order.remainingUsd();
+    }
+    return total;
+  }
+
+  openSellUsd(tokenId = null) {
+    let total = 0;
+    const target = tokenId === null ? null : String(tokenId);
+    for (const order of this.openOrders.values()) {
+      if (order.side !== 'sell') continue;
+      if (target !== null && String(order.tokenId) !== target) continue;
+      total += order.remainingUsd();
+    }
+    return total;
+  }
+
+  availableCashUsd() {
+    return Math.max(0, this.cash - this.openBuyUsd());
+  }
+
+  signalQualityKey(signal) {
+    if (!signal) return 'unknown';
+    return `${String(signal.tokenId)}:${String(signal.strategy || 'unknown')}:${String(signal.side || 'unknown')}`;
+  }
+
+  tokenFillStats(tokenId) {
+    return this.orderStatsByToken.get(String(tokenId)) || { orders: 0, fills: 0, orderUsd: 0, fillUsd: 0 };
+  }
+
+  scoreTokenPriority(tokenId) {
+    const stats = this.tokenFillStats(tokenId);
+    if (stats.orders < this.config.tokenFillPriorityMinOrders) return 1;
+    const fillRate = stats.fills / Math.max(1, stats.orders);
+    if (stats.fills <= 0) return this.config.tokenNoFillPenaltyRate;
+    if (fillRate >= this.config.tokenGoodFillRate) return clamp(1 + fillRate * 2.0, 1, 1.75);
+    return clamp(0.75 + fillRate * 3, 0.65, 1.10);
+  }
+
+  ghostQualityForToken(tokenId) {
+    const prefix = `${String(tokenId)}:`;
+    let total = 0;
+    let favorable = 0;
+    for (const [key, stats] of this.ghostStatsByKey.entries()) {
+      if (!key.startsWith(prefix)) continue;
+      total += stats.total || 0;
+      favorable += stats.favorable || 0;
+    }
+    if (total < this.config.ghostThrottleMinSamples) return { usable: false, rate: 0.5, total, favorable };
+    return { usable: true, rate: favorable / Math.max(1, total), total, favorable };
+  }
+
+  ghostSignalQuality(signal) {
+    const key = this.signalQualityKey(signal);
+    const stats = this.ghostStatsByKey.get(key);
+    if (!stats || stats.total < this.config.ghostThrottleMinSamples) {
+      const tokenQuality = this.ghostQualityForToken(signal?.tokenId);
+      return { ...tokenQuality, key, source: tokenQuality.usable ? 'token' : 'cold_start' };
+    }
+    return {
+      usable: true,
+      key,
+      source: 'signal_key',
+      total: stats.total,
+      favorable: stats.favorable,
+      rate: stats.favorable / Math.max(1, stats.total),
+    };
+  }
+
+  canPlaceByCooldown(signal) {
+    if (!signal) return false;
+    const priceBucket = Math.round(Number(signal.price || 0) * 100); // cent bucket blocks near-duplicate repost spam.
+    const key = `${String(signal.tokenId)}:${String(signal.side)}:${String(signal.strategy)}:${priceBucket}`;
+    const last = this.lastOrderByKey.get(key) || 0;
+    if (Date.now() - last < this.config.duplicateOrderCooldownMs) return false;
+    return true;
+  }
+
+  recordOrderPlacement(order) {
+    if (!order) return;
+    const tokenId = String(order.tokenId);
+    const stats = this.tokenFillStats(tokenId);
+    stats.orders += 1;
+    stats.orderUsd += Number(order.sizeUsd || 0);
+    this.orderStatsByToken.set(tokenId, stats);
+
+    const priceBucket = Math.round(Number(order.price || 0) * 100);
+    const key = `${tokenId}:${String(order.side)}:${String(order.strategy)}:${priceBucket}`;
+    this.lastOrderByKey.set(key, Date.now());
+  }
+
+  hasSimilarOpenOrder(signal, priceTolerance = 0.001) {
+    if (!signal) return false;
+    for (const order of this.openOrders.values()) {
+      if (order.tokenId !== String(signal.tokenId)) continue;
+      if (order.side !== signal.side) continue;
+      if (order.strategy !== signal.strategy) continue;
+      if (Math.abs(order.price - signal.price) <= priceTolerance) return true;
+    }
+    return false;
+  }
+
+  cancelOpenBuys(reason = 'risk halt') {
+    let canceled = 0;
+    for (const [orderId, order] of [...this.openOrders.entries()]) {
+      if (order.side === 'buy') {
+        this.openOrders.delete(orderId);
+        canceled += 1;
+      }
+    }
+    if (canceled > 0) warn(`[RISK] Canceled ${canceled} open buy orders: ${reason}`);
+    return canceled;
+  }
+
   addOrder(order) {
     this.openOrders.set(order.id, order);
   }
@@ -2187,6 +2813,7 @@ class PaperPortfolio {
       createdAt: Date.now(),
       horizonAt: Date.now() + this.config.ghostHorizonMs,
       strategy: signal.strategy,
+      key: this.signalQualityKey(signal),
     });
 
     while (this.ghostOrders.length > this.config.ghostMaxRecords) {
@@ -2222,6 +2849,13 @@ class PaperPortfolio {
 
       if (favorable) this.ghostStats.favorable += 1;
       else this.ghostStats.unfavorable += 1;
+
+      const key = ghost.key || `${ghost.tokenId}:${ghost.strategy}:${ghost.side}`;
+      const stats = this.ghostStatsByKey.get(key) || { total: 0, favorable: 0, unfavorable: 0 };
+      stats.total += 1;
+      if (favorable) stats.favorable += 1;
+      else stats.unfavorable += 1;
+      this.ghostStatsByKey.set(key, stats);
     }
 
     this.ghostOrders = remaining;
@@ -2235,7 +2869,6 @@ class PaperPortfolio {
     const px = Number(price);
     if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(px) || px <= 0) return;
 
-    if (!this.positionMarkets) this.positionMarkets = new Map();
     if (marketId) this.positionMarkets.set(tokenId, marketId);
 
     const value = qty * px;
@@ -2264,12 +2897,18 @@ class PaperPortfolio {
       if (newQty <= 1e-9) {
         this.positions.delete(tokenId);
         this.costBasis.delete(tokenId);
+        this.positionMarkets.delete(tokenId);
       } else {
         this.positions.set(tokenId, newQty);
       }
 
       this.strategyPnl.set(strategy, (this.strategyPnl.get(strategy) || 0) + realized);
     }
+
+    const fillStats = this.tokenFillStats(tokenId);
+    fillStats.fills += 1;
+    fillStats.fillUsd += value;
+    this.orderStatsByToken.set(tokenId, fillStats);
 
     this.fills.push({
       ts: Date.now(),
@@ -2278,7 +2917,7 @@ class PaperPortfolio {
       side,
       price: px,
       size: qty,
-      value,
+      value: qty * px,
       strategy,
     });
   }
@@ -2293,9 +2932,12 @@ class PaperPortfolio {
         peakEquity: this.peakEquity,
         positions: Object.fromEntries(this.positions),
         costBasis: Object.fromEntries(this.costBasis),
+        positionMarkets: Object.fromEntries(this.positionMarkets),
         closedPnl: this.closedPnl,
         strategyPnl: Object.fromEntries(this.strategyPnl),
         ghostStats: this.ghostStats,
+        ghostStatsByKey: Object.fromEntries(this.ghostStatsByKey),
+        orderStatsByToken: Object.fromEntries(this.orderStatsByToken),
         fills: this.fills.slice(-500),
       };
 
@@ -2320,9 +2962,25 @@ class PaperPortfolio {
 
       this.positions = new Map(Object.entries(data.positions || {}).map(([k, v]) => [k, Number(v)]));
       this.costBasis = new Map(Object.entries(data.costBasis || {}).map(([k, v]) => [k, Number(v)]));
+      this.positionMarkets = new Map(Object.entries(data.positionMarkets || {}).map(([k, v]) => [k, String(v)]));
       this.strategyPnl = new Map(Object.entries(data.strategyPnl || {}).map(([k, v]) => [k, Number(v)]));
       this.ghostStats = data.ghostStats || this.ghostStats;
+      this.ghostStatsByKey = new Map(Object.entries(data.ghostStatsByKey || {}));
+      this.orderStatsByToken = new Map(Object.entries(data.orderStatsByToken || {}).map(([k, v]) => [k, {
+        orders: Number(v?.orders || 0),
+        fills: Number(v?.fills || 0),
+        orderUsd: Number(v?.orderUsd || 0),
+        fillUsd: Number(v?.fillUsd || 0),
+      }]));
       this.fills = Array.isArray(data.fills) ? data.fills : [];
+
+      // Backfill token -> market mapping from saved fills if the state file was
+      // created by an older version that did not persist positionMarkets.
+      if (this.positionMarkets.size === 0) {
+        for (const fill of this.fills) {
+          if (fill?.tokenId && fill?.marketId) this.positionMarkets.set(String(fill.tokenId), String(fill.marketId));
+        }
+      }
 
       info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity().toFixed(2)}`);
     } catch (e) {
@@ -2366,43 +3024,60 @@ class RiskEngine {
     this.portfolio = portfolio;
   }
 
-  evaluate(signal) {
+  evaluate(signal, markPrices = new Map()) {
     if (!signal) return null;
     if (!['buy', 'sell'].includes(signal.side)) return null;
     if (!Number.isFinite(signal.price) || signal.price <= 0) return null;
     if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) return null;
 
     if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return null;
+    if (this.portfolio.hasSimilarOpenOrder(signal, Math.max(0.001, signal.price * 0.002))) return null;
 
     const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
+    if (!isProtectiveExit && !this.portfolio.canPlaceByCooldown(signal)) return null;
     if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return null;
     if (!isProtectiveExit && signal.confidence < this.config.minConfidence) return null;
+
+    const ghost = this.portfolio.ghostSignalQuality(signal);
+    if (!isProtectiveExit && ghost.usable && ghost.rate < this.config.ghostHardBlockRate) return null;
 
     const openUsd = this.portfolio.totalOpenOrderUsd();
     if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return null;
 
-    const totalEx = this.portfolio.totalExposureUsd();
-    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return null;
+    const fallbackMark = Number.isFinite(signal.price) ? signal.price : 0.5;
+    const totalEx = this.portfolio.totalExposureUsd(markPrices, fallbackMark);
+    let maxTotalExposure = this.config.maxTotalExposureUsd;
+    const globalGhostRate = this.portfolio.ghostStats.total > 0
+      ? this.portfolio.ghostStats.favorable / Math.max(1, this.portfolio.ghostStats.total)
+      : 0.5;
+    if (this.portfolio.ghostStats.total >= this.config.ghostThrottleMinSamples && globalGhostRate < this.config.exposureThrottleGhostRate) {
+      maxTotalExposure *= this.config.exposureThrottleMultiplier;
+    }
+    if (signal.side === 'buy' && totalEx + signal.sizeUsd > maxTotalExposure) return null;
 
-    const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
+    const mktEx = this.portfolio.marketExposureUsd(signal.marketId, markPrices, fallbackMark);
     if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return null;
 
     const currentPosQty = this.portfolio.position(signal.tokenId);
-    const currentPosUsd = currentPosQty * signal.price;
+    const mark = this.portfolio.markFor(signal.tokenId, markPrices, signal.price);
+    const currentPosUsd = currentPosQty * mark;
+    const drawdown = this.portfolio.getDrawdownPct(markPrices);
+
+    // Circuit breaker blocks new risk, never protective exits.
+    if (drawdown > this.config.maxDrawdownPct && signal.side === 'buy') return null;
 
     if (signal.side === 'buy') {
-      if (this.portfolio.cash < signal.sizeUsd) return null;
+      if (this.portfolio.availableCashUsd() < signal.sizeUsd) return null;
       if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return null;
     }
 
     if (signal.side === 'sell') {
       if (currentPosQty <= 0) return null;
-      const maxSellUsd = currentPosQty * signal.price;
+      const reservedSellUsd = this.portfolio.openSellUsd(signal.tokenId);
+      const maxSellUsd = Math.max(0, currentPosUsd - reservedSellUsd);
       signal.sizeUsd = Math.min(signal.sizeUsd, maxSellUsd);
       if (signal.sizeUsd < this.config.minOrderUsd) return null;
     }
-
-    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return null;
 
     return signal;
   }
@@ -2420,54 +3095,121 @@ class PaperExecutionEngine {
   }
 
   place(signal, book) {
+    const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal?.strategy);
+    if (this.portfolio.hasSimilarOpenOrder(signal, Math.max(0.001, signal.price * 0.002))) return;
+    if (!isProtectiveExit && !this.portfolio.canPlaceByCooldown(signal)) return;
+
     const order = new PaperOrder(signal);
     this.portfolio.addOrder(order);
+    this.portfolio.recordOrderPlacement(order);
     this.portfolio.recordGhostOrder(signal, book);
     info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
   }
 
   processOpenOrders() {
     const now = Date.now();
+    const processed = new Set();
+
+    this.processAtomicPairs(processed);
 
     for (const [orderId, order] of [...this.portfolio.openOrders.entries()]) {
-      if (order.isExpired()) {
+      if (processed.has(orderId)) continue;
+
+      if (order.isExpired() || now - order.createdAt > this.config.maxRestingOrderAgeMs) {
         this.portfolio.cancelOrder(orderId);
         continue;
       }
 
       const book = this.cache.getBook(order.tokenId);
-      if (!isBookComplete(book)) continue;
+      if (!isBookComplete(book) || !isBookFresh(book, this.config.maxBookAgeMs)) continue;
 
       const fill = this.computeFill(order, book);
       if (!fill || fill.fillUsd < this.config.minFillUsd) continue;
 
-      const fillSize = fill.fillUsd / fill.price;
-
-      this.portfolio.recordFill({
-        tokenId: order.tokenId,
-        marketId: order.marketId,
-        side: order.side,
-        price: fill.price,
-        size: fillSize,
-        strategy: order.strategy,
-      });
-
-      order.filledUsd += fill.fillUsd;
-
-      info(`[FILL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(fill.price)} usd=$${fill.fillUsd.toFixed(2)} [${order.strategy}]`);
+      this.applyFill(order, fill);
 
       if (order.remainingUsd() < this.config.minFillUsd) {
-        this.portfolio.cancelOrder(orderId);
-      }
-
-      if (now - order.createdAt > order.signal.maxHoldMs) {
         this.portfolio.cancelOrder(orderId);
       }
     }
   }
 
+  processAtomicPairs(processed) {
+    const groups = new Map();
+
+    for (const [orderId, order] of this.portfolio.openOrders.entries()) {
+      const pairId = order.metadata?.pairId;
+      if (!pairId || order.strategy !== 'ComplementArb') continue;
+      if (!groups.has(pairId)) groups.set(pairId, []);
+      groups.get(pairId).push([orderId, order]);
+    }
+
+    for (const [pairId, entries] of groups.entries()) {
+      const expired = entries.some(([, order]) => order.isExpired());
+      if (expired || entries.length !== 2) {
+        for (const [orderId] of entries) {
+          this.portfolio.cancelOrder(orderId);
+          processed.add(orderId);
+        }
+        warn(`[PAIR_CANCEL] ComplementArb pair ${shortId(pairId)} canceled: ${expired ? 'expired' : 'missing leg'}`);
+        continue;
+      }
+
+      const fills = [];
+      let valid = true;
+
+      for (const [, order] of entries) {
+        const book = this.cache.getBook(order.tokenId);
+        if (!isBookComplete(book) || !isBookFresh(book, this.config.maxBookAgeMs)) {
+          valid = false;
+          break;
+        }
+
+        const fill = this.computeFill(order, book);
+        if (!fill || fill.fillUsd < this.config.minFillUsd) {
+          valid = false;
+          break;
+        }
+
+        fills.push([order, fill]);
+      }
+
+      if (!valid || fills.length !== 2) continue;
+
+      const atomicUsd = Math.min(...fills.map(([, fill]) => fill.fillUsd));
+      if (atomicUsd < this.config.minFillUsd) continue;
+
+      for (const [order, fill] of fills) {
+        this.applyFill(order, { ...fill, fillUsd: atomicUsd });
+        processed.add(order.id);
+      }
+
+      const shouldCancel = entries.some(([, order]) => order.remainingUsd() < this.config.minFillUsd);
+      if (shouldCancel) {
+        for (const [orderId] of entries) this.portfolio.cancelOrder(orderId);
+      }
+    }
+  }
+
+  applyFill(order, fill) {
+    const fillSize = fill.fillUsd / fill.price;
+
+    this.portfolio.recordFill({
+      tokenId: order.tokenId,
+      marketId: order.marketId,
+      side: order.side,
+      price: fill.price,
+      size: fillSize,
+      strategy: order.strategy,
+    });
+
+    order.filledUsd += fill.fillUsd;
+
+    info(`[FILL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(fill.price)} usd=$${fill.fillUsd.toFixed(2)} [${order.strategy}]`);
+  }
+
   computeFill(order, book) {
-    if (!isBookComplete(book)) return null;
+    if (!isBookComplete(book) || !isBookFresh(book, this.config.maxBookAgeMs)) return null;
 
     const remainingUsd = order.remainingUsd();
     if (remainingUsd <= 0) return null;
@@ -2477,22 +3219,25 @@ class PaperExecutionEngine {
     let sideDepthUsd = 0;
 
     if (order.side === 'buy') {
-      // Buy fills only if the limit crosses the ask or the market moves down into it.
-      executable = order.price >= book.bestAsk || book.bestBid <= order.price;
-      price = Math.min(order.price, book.bestAsk);
-      sideDepthUsd = topDepthUsd(book.asks, 3);
+      // Strict paper fill: a buy limit fills only when executable ask liquidity is
+      // at or below the limit. We no longer credit fills merely because bestBid is lower.
+      executable = book.bestAsk <= order.price;
+      price = this.config.strictPaperFills ? order.price : Math.min(order.price, book.bestAsk);
+      sideDepthUsd = executableDepthUsd(book, 'buy', order.price, 3);
     }
 
     if (order.side === 'sell') {
-      // Sell fills only if the limit crosses the bid or the market moves up into it.
-      executable = order.price <= book.bestBid || book.bestAsk >= order.price;
-      price = Math.max(order.price, book.bestBid);
-      sideDepthUsd = topDepthUsd(book.bids, 3);
+      // Strict paper fill: a sell limit fills only when executable bid liquidity is
+      // at or above the limit. We no longer credit fills merely because bestAsk is higher.
+      executable = book.bestBid >= order.price;
+      price = this.config.strictPaperFills ? order.price : Math.max(order.price, book.bestBid);
+      sideDepthUsd = executableDepthUsd(book, 'sell', order.price, 3);
     }
 
     if (!executable) return null;
 
-    const maxDepthFill = Math.max(0, sideDepthUsd * this.config.partialFillDepthFraction);
+    const queueHaircut = clamp(this.config.makerQueueHaircut ?? 0.45, 0.05, 1);
+    const maxDepthFill = Math.max(0, sideDepthUsd * this.config.partialFillDepthFraction * queueHaircut);
     const fillUsd = Math.min(remainingUsd, maxDepthFill);
 
     if (fillUsd <= 0) return null;
@@ -2515,6 +3260,7 @@ class PaperExecutionEngine {
     const mark = book.midpoint;
     const pnlPct = ((mark - avgCost) / avgCost) * 100;
     const tick = book.tickSize || 0.01;
+    const marketableSell = clamp(roundToTick(book.bestBid, tick), 0.01, 0.99);
 
     const signals = [];
 
@@ -2524,14 +3270,14 @@ class PaperExecutionEngine {
         tokenId: asset.tokenId,
         marketId: asset.market.marketId,
         side: 'sell',
-        price: clamp(roundToTick(Math.max(book.bestBid, book.bestAsk - tick), tick), 0.01, 0.99),
+        price: marketableSell,
         sizeUsd: qty * mark,
         expectedEdge: 0,
         confidence: 1,
         reason: `Stop loss triggered: pnl=${pnlPct.toFixed(2)}%`,
-        exitPlan: 'Emergency risk reduction',
-        ttlMs: 15_000,
-        maxHoldMs: 60_000,
+        exitPlan: 'Emergency risk reduction at executable bid',
+        ttlMs: 10_000,
+        maxHoldMs: 30_000,
         metadata: { marketQuestion: asset.market.question, outcome: asset.outcome, pnlPct },
       }));
     }
@@ -2542,14 +3288,14 @@ class PaperExecutionEngine {
         tokenId: asset.tokenId,
         marketId: asset.market.marketId,
         side: 'sell',
-        price: clamp(roundToTick(Math.max(book.bestBid, book.bestAsk - tick), tick), 0.01, 0.99),
+        price: marketableSell,
         sizeUsd: qty * mark,
         expectedEdge: 0,
         confidence: 1,
         reason: `Take profit triggered: pnl=${pnlPct.toFixed(2)}%`,
-        exitPlan: 'Lock realized gains',
-        ttlMs: 20_000,
-        maxHoldMs: 60_000,
+        exitPlan: 'Lock realized gains at executable bid',
+        ttlMs: 15_000,
+        maxHoldMs: 30_000,
         metadata: { marketQuestion: asset.market.question, outcome: asset.outcome, pnlPct },
       }));
     }
@@ -2575,11 +3321,15 @@ class BotEngine {
     this.execution = new PaperExecutionEngine(config, this.portfolio, this.cache);
     this.consensus = new MultiConsensusEngine(config);
     this.whaleTracker = config.enableWhaleTracking ? new AsyncWhaleWatcher(config) : null;
+    this.traderIntel = config.enableProfitableTraderIntel ? new ProfitableTraderIntel(config) : null;
 
-    this.research = new ResearchEngine(this.poly, this.cache, config);
+    this.research = new ResearchEngine(this.poly, this.cache, config, this.portfolio, this.traderIntel);
     this.assets = [];
     this.cycle = 0;
     this.wsClient = null;
+    this.lastWsRefreshAt = new Map();
+    this.shutdownRequested = false;
+    this.drawdownHaltActive = false;
 
     this.strategies = [
       new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
@@ -2592,7 +3342,8 @@ class BotEngine {
 
   async start() {
     banner();
-    info('Starting Polymarket MoneyMaker V3 (Paper)...');
+    info('Starting Polymarket MoneyMaker V3.3 Sophie Trader-Intel Paper Engine...');
+    this.installShutdownHandlers();
 
     await this.refreshResearch();
 
@@ -2600,7 +3351,7 @@ class BotEngine {
       this.startWebSocket();
     }
 
-    while (true) {
+    while (!this.shutdownRequested) {
       try {
         await this.tick();
         await sleep(this.config.loopDelayMs);
@@ -2614,8 +3365,8 @@ class BotEngine {
   async refreshResearch() {
     this.assets = await this.research.discoverCandidates();
 
-    if (this.wsClient && this.assets.length > 0) {
-      this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
+    if (this.wsClient) {
+      this.wsClient.replaceSubscriptions(this.assets.map((a) => a.tokenId));
     }
   }
 
@@ -2634,7 +3385,13 @@ class BotEngine {
           // They only mark the cached book stale; REST will refresh it.
           const asset = this.cache.getAsset(assetId);
           if (asset) {
-            this.cache.getFreshBook(assetId, 0).catch(() => {});
+            const now = Date.now();
+            const last = this.lastWsRefreshAt.get(assetId) || 0;
+            this.cache.markStale(assetId);
+            if (now - last >= this.config.wsDebounceMs) {
+              this.lastWsRefreshAt.set(assetId, now);
+              this.cache.getFreshBook(assetId, 0).catch((e) => warn(`WS-triggered book refresh failed for ${shortId(assetId)}: ${e.message}`));
+            }
           }
         }
       },
@@ -2642,13 +3399,14 @@ class BotEngine {
 
     this.wsClient.connect();
     if (this.assets.length > 0) {
-      this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
+      this.wsClient.replaceSubscriptions(this.assets.map((a) => a.tokenId));
     }
   }
 
   async tick() {
     this.cycle += 1;
     this.whaleTracker?.tick?.();
+    this.traderIntel?.tick?.();
 
     if (this.cycle === 1 || this.cycle % this.config.marketRefreshEveryCycles === 0) {
       await this.refreshResearch();
@@ -2656,6 +3414,7 @@ class BotEngine {
 
     const markPrices = this.cache.markPrices();
     this.portfolio.updateGhostOrders(markPrices);
+    this.enforceCircuitBreaker(markPrices);
 
     for (const asset of this.assets) {
       const book = await this.cache.getFreshBook(asset.tokenId, 3_000);
@@ -2686,6 +3445,36 @@ class BotEngine {
     }
   }
 
+  installShutdownHandlers() {
+    const request = (sig) => {
+      if (this.shutdownRequested) return;
+      this.shutdownRequested = true;
+      warn(`Shutdown requested by ${sig}; saving state and closing sockets.`);
+      this.portfolio.saveState();
+      this.wsClient?.close?.();
+    };
+
+    process.once('SIGINT', () => request('SIGINT'));
+    process.once('SIGTERM', () => request('SIGTERM'));
+  }
+
+  enforceCircuitBreaker(markPrices) {
+    const drawdown = this.portfolio.getDrawdownPct(markPrices);
+    if (drawdown > this.config.maxDrawdownPct) {
+      if (!this.drawdownHaltActive) {
+        warn(`[RISK HALT] Drawdown ${drawdown.toFixed(2)}% exceeded ${this.config.maxDrawdownPct}%. New buys halted; exits still allowed.`);
+        this.drawdownHaltActive = true;
+      }
+      this.portfolio.cancelOpenBuys('drawdown circuit breaker');
+      return;
+    }
+
+    if (this.drawdownHaltActive && drawdown <= this.config.maxDrawdownPct * 0.75) {
+      info(`[RISK RESET] Drawdown cooled to ${drawdown.toFixed(2)}%; buys may resume.`);
+      this.drawdownHaltActive = false;
+    }
+  }
+
   trySignal(rawSignal, asset, book) {
     let signal = rawSignal;
 
@@ -2697,11 +3486,12 @@ class BotEngine {
         this.cache,
         this.portfolio,
         this.volGuard,
-        this.whaleTracker
+        this.whaleTracker,
+        this.traderIntel
       );
     }
 
-    signal = this.risk.evaluate(signal);
+    signal = this.risk.evaluate(signal, this.cache.markPrices());
     if (!signal) return;
 
     this.execution.place(signal, book);
@@ -2714,11 +3504,15 @@ class BotEngine {
 
     info('--- PORTFOLIO REPORT ---');
     info(`Equity: $${equity.toFixed(2)} | Cash: $${this.portfolio.cash.toFixed(2)} | Drawdown: ${drawdown.toFixed(2)}%`);
-    info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd().toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
+    info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd(markPrices).toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
 
     if (this.portfolio.ghostStats.total > 0) {
       const favorableRate = (this.portfolio.ghostStats.favorable / this.portfolio.ghostStats.total) * 100;
       info(`Ghost calibration: total=${this.portfolio.ghostStats.total} favorable=${favorableRate.toFixed(1)}%`);
+    }
+
+    if (this.traderIntel?.events?.length) {
+      info(`Trader intel: events=${this.traderIntel.events.length} wallets=${this.traderIntel.walletStats.size}`);
     }
 
     const positions = [...this.portfolio.positions.entries()].filter(([, qty]) => qty > 0);
@@ -2777,6 +3571,29 @@ function chunks(arr, size) {
   return out;
 }
 
+function setsEqual(a, b) {
+  if (!(a instanceof Set) || !(b instanceof Set)) return false;
+  if (a.size !== b.size) return false;
+  for (const value of a) {
+    if (!b.has(value)) return false;
+  }
+  return true;
+}
+
+function isBookFresh(book, maxAgeMs = CONFIG.maxBookAgeMs) {
+  if (!book || !Number.isFinite(book.cachedAt)) return false;
+  return Date.now() - book.cachedAt <= maxAgeMs;
+}
+
+function executableDepthUsd(book, side, limitPrice, maxLevels = 3) {
+  if (!book || !Number.isFinite(limitPrice)) return 0;
+  const levels = side === 'buy' ? book.asks : book.bids;
+  const executable = (levels || []).filter((level) => {
+    return side === 'buy' ? level.price <= limitPrice : level.price >= limitPrice;
+  });
+  return topDepthUsd(executable, maxLevels);
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2796,7 +3613,7 @@ function hoursUntil(dateLike) {
 
 function banner() {
   console.log('====================================================');
-  console.log('  POLYMARKET MONEYMAKER V3.1.1 PAPER ENGINE');
+  console.log('  POLYMARKET MONEYMAKER V3.3 SOPHIE TRADER-INTEL ENGINE');
   console.log('====================================================');
 }
 
