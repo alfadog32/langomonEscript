@@ -456,7 +456,7 @@ function parseMaybeJsonArray(value) {
   } catch {
     return value.split(',').map((s) => s.trim()).filter(Boolean);
   }
-}
+};
 
 function normalizeBook(raw, fallbackAssetId = '') {
   const bids = normalizeLevels(raw?.bids, 'bid');
@@ -1300,7 +1300,7 @@ function confidenceFromPrice(mid) {
 }
 
 // =========================
-// MULTI-VIEW CONSENSUS ENGINE
+// WHALE WATCHER (ASYNC)
 // =========================
 
 class AsyncWhaleWatcher {
@@ -1499,6 +1499,10 @@ function normalizeTitle(value) {
 
   return cleaned.split(' ').filter(Boolean).join(' ');
 }
+
+// =========================
+// MULTI-VIEW CONSENSUS ENGINE
+// =========================
 
 class MultiConsensusEngine {
   constructor(config) {
