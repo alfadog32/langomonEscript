@@ -95,8 +95,13 @@ const CONFIG = {
   // Lighter research by default: the logs showed ~5-minute refreshes, so Sophie now
   // reuses the active universe longer and limits book scans per refresh.
   marketRefreshEveryCycles: envInt('REFRESH_RESEARCH_EVERY', 30),
-  maxResearchBooksPerRefresh: envInt('MAX_RESEARCH_BOOKS_PER_REFRESH', 140),
-  researchBookDelayMs: envInt('RESEARCH_BOOK_DELAY_MS', 25),
+  // Scan enough books to find actual SpreadHunter opportunities, but do not scan the entire universe every cycle.
+  maxResearchBooksPerRefresh: envInt('MAX_RESEARCH_BOOKS_PER_REFRESH', 260),
+  researchBookDelayMs: envInt('RESEARCH_BOOK_DELAY_MS', 15),
+  // Research must not select ultra-tight books that SpreadHunter will never trade.
+  researchMinTradableSpread: envNum('RESEARCH_MIN_TRADABLE_SPREAD', 0.012),
+  researchTargetSpread: envNum('RESEARCH_TARGET_SPREAD', 0.06),
+  preBookHighLiquidityPenaltyUsd: envNum('PREBOOK_HIGH_LIQUIDITY_PENALTY_USD', 250_000),
   fillHistoryBoost: envNum('FILL_HISTORY_BOOST', 55),
   noFillPenalty: envNum('NO_FILL_PENALTY', 10),
 
@@ -884,13 +889,20 @@ class ResearchEngine {
   }
 
   preBookMarketScore(market) {
-    const volume = Math.log10(1 + Number(market.volume24h || 0)) * 20;
-    const liquidity = Math.log10(1 + Number(market.liquidity || 0)) * 12;
+    const volume24h = Number(market.volume24h || 0);
+    const liquidityUsd = Number(market.liquidity || 0);
+    const volume = Math.min(95, Math.log10(1 + volume24h) * 18);
+    const liquidity = Math.min(55, Math.log10(1 + liquidityUsd) * 10);
+    // Ultra-deep books are often one-tick wide; they waste SpreadHunter scans.
+    // Keep them eligible, but stop them from crowding out moderate-liquidity wide-spread markets.
+    const highLiquidityPenalty = liquidityUsd > this.config.preBookHighLiquidityPenaltyUsd
+      ? Math.min(45, Math.log10(liquidityUsd / this.config.preBookHighLiquidityPenaltyUsd) * 28)
+      : 0;
     const fillBoost = (market.outcomes || []).reduce((best, outcome) => {
       return Math.max(best, this.portfolio?.scoreTokenPriority?.(outcome.tokenId) || 1);
     }, 1);
     const traderBoost = this.traderIntel?.scoreMarketInterest?.(market) || 0;
-    return volume + liquidity + (fillBoost - 1) * this.config.fillHistoryBoost + traderBoost * 25;
+    return volume + liquidity - highLiquidityPenalty + (fillBoost - 1) * this.config.fillHistoryBoost + traderBoost * 25;
   }
 
   preBookOutcomeScore(market, outcome) {
@@ -905,7 +917,15 @@ class ResearchEngine {
     if (book.bestAsk > this.config.maxBestAsk) return null;
 
     const maxSpread = this.config.hunterMode ? this.config.hunterMaxSpread : this.config.maxSpread;
+    const minTradableSpread = Math.max(
+      this.config.researchMinTradableSpread || 0,
+      this.config.spreadHunterMinEdge || 0
+    );
+
     if (book.spread <= 0 || book.spread > maxSpread) return null;
+    // Do not let tiny one-tick books enter the active universe. The logs showed
+    // these produce SELECT lines but zero SpreadHunter orders.
+    if (book.spread < minTradableSpread) return null;
 
     const topBid1Usd = topDepthUsd(book.bids, 1);
     const topAsk1Usd = topDepthUsd(book.asks, 1);
@@ -923,7 +943,9 @@ class ResearchEngine {
 
     let score;
     if (this.config.hunterMode) {
-      const spreadScore = book.spread * 1000;
+      const spreadAboveMinimum = Math.max(0, book.spread - minTradableSpread);
+      const targetSpread = Math.max(minTradableSpread, this.config.researchTargetSpread || 0.06);
+      const spreadScore = Math.min(95, spreadAboveMinimum * 1100 + Math.min(book.spread / targetSpread, 1.4) * 35);
       const shallowBookBonus = Math.max(0, 140 - topDepthTotalUsd / 10);
       const volumeSanity = Math.min(70, Math.log10(1 + market.volume24h) * 17);
       const liquiditySanity = Math.min(50, Math.log10(1 + market.liquidity) * 11);
@@ -934,7 +956,8 @@ class ResearchEngine {
     } else {
       const liquidityScore = Math.log10(1 + market.liquidity) * 18;
       const volumeScore = Math.log10(1 + market.volume24h) * 14;
-      const spreadScore = Math.min(45, book.spread * 500);
+      const spreadAboveMinimum = Math.max(0, book.spread - minTradableSpread);
+      const spreadScore = Math.min(55, spreadAboveMinimum * 700);
       const balanceScore = balance * 20;
 
       score = liquidityScore + volumeScore + spreadScore + balanceScore - extremePenalty - agePenalty;
