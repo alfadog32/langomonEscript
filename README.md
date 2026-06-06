@@ -1,5 +1,7 @@
 # Polymarket MoneyMaker V3 — Paper EV Engine
 
+A standalone live adapter has been added, but it is not integrated into MoneyMaker and remains disabled/refusal-first by default.
+
 This is a serious paper-first Polymarket research and execution engine. It uses public Gamma + CLOB market data, generates strategy signals, applies risk controls, and simulates paper orders/fills.
 
 It does not place real orders, does not require private keys, and does not guarantee profit.
