@@ -1,0 +1,7 @@
+.env
+.env.save
+.env.bak.*
+.env.live.secrets
+live_order_intents.ndjson
+live_adapter_events.ndjson
+LIVE_PREP_BASELINE.sha256
