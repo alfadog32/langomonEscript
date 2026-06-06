@@ -1,0 +1,30 @@
+{
+  "timestamp": "2026-06-06T00:00:00.000Z",
+  "source": "SpreadHunter",
+  "route": "MAKER:STABLE",
+  "tokenId": "1234567890",
+  "marketId": "0xconditionid",
+  "side": "BUY",
+  "price": 0.55,
+  "sizeUsd": 1,
+  "reason": "Example dry-run intent only",
+  "confidence": 0.72,
+  "sophieApproved": true,
+  "consensusScore": 0.72,
+  "whaleCopy": false,
+  "oracleSignal": false,
+  "bookFresh": true,
+  "bookAgeMs": 500,
+  "currentLiveExposureUsd": 0,
+  "currentDailyLivePnlUsd": 0,
+  "tickSize": "0.01",
+  "negRisk": false,
+  "minOrderSize": 0,
+  "paperBurnIn": {
+    "ok": true,
+    "reports": 3,
+    "closedPnlUsd": 1,
+    "drawdownPct": 0.5,
+    "ghostFavorablePct": 20
+  }
+}
