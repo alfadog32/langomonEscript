@@ -1,6 +1,6 @@
 # Polymarket MoneyMaker V3 — Paper EV Engine
 
-A standalone live adapter has been added, but it is not integrated into MoneyMaker and remains disabled/refusal-first by default.
+A standalone live adapter exists, but it is not integrated into MoneyMaker and remains disabled/refusal-first by default. MoneyMaker itself is still paper-only unless a separate live adapter integration is explicitly added, audited, and enabled.
 
 This is a serious paper-first Polymarket research and execution engine. It uses public Gamma + CLOB market data, generates strategy signals, applies risk controls, and simulates paper orders/fills.
 
@@ -41,7 +41,9 @@ INITIAL_CASH=10000 BASE_ORDER_USD=10 MAX_POSITION_USD=100 MAX_DRAWDOWN_PCT=5 npm
 
 ## Review notes for other agents
 
-The live-order layer is intentionally not implemented. Before adding live trading, require:
+A standalone live adapter exists, but it is not integrated into MoneyMaker and remains disabled/refusal-first by default. MoneyMaker itself is still paper-only unless a separate live adapter integration is explicitly added, audited, and enabled.
+
+Before adding live trading, require:
 
 1. API authentication module.
 2. Real order signing and cancel/replace logic.
