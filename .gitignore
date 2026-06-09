@@ -2,9 +2,15 @@
 .env.save
 .env.bak.*
 .env.live.secrets
+telegram/.env.telegram
+*.ndjson
 moneymaker_v3_state.json
 live_order_intents.ndjson
 live_execution_events.ndjson
 live_adapter_events.ndjson
+live_intent_router_events.ndjson
+live_reconcile_snapshot.json
+approval_decisions.ndjson
+telegram_approval_events.ndjson
 LIVE_PREP_BASELINE.sha256
 node_modules/
