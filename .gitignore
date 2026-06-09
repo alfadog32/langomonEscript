@@ -46,3 +46,12 @@ telegram/.env.telegram
 
 # Backups
 *.bak*
+
+# Live adapter / execution runtime artifacts
+
+# Live/router runtime state
+live_intent_router_events.ndjson
+
+# Telegram/runtime secrets
+telegram_approval_events.ndjson
+approval_decisions.ndjson

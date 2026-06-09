@@ -116,6 +116,111 @@ function createIntentId(intent) {
   return `intent_${crypto.createHash('sha256').update(seed).digest('hex').slice(0, 16)}`;
 }
 
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+function firstString(...values) {
+  const value = firstDefined(...values);
+  return value === undefined ? '' : String(value).trim();
+}
+
+function firstNumber(...values) {
+  for (const value of values) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return NaN;
+}
+
+function safeError(err) {
+  return err && err.message ? err.message : String(err);
+}
+
+function redactWallet(value) {
+  return value ? shortId(value, 6, 4) : null;
+}
+
+function missingEnv(names) {
+  return names.filter((name) => !process.env[name]);
+}
+
+function secretFileExists(config) {
+  return fs.existsSync(path.resolve(config.baseDir, config.liveSecretsPath));
+}
+
+function parseCliArgs(args) {
+  const out = { _: [] };
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (!arg.startsWith('--')) {
+      out._.push(arg);
+      continue;
+    }
+    const eq = arg.indexOf('=');
+    if (eq > 2) {
+      out[arg.slice(2, eq)] = arg.slice(eq + 1);
+      continue;
+    }
+    const key = arg.slice(2);
+    const next = args[i + 1];
+    if (next && !next.startsWith('--')) {
+      out[key] = next;
+      i += 1;
+    } else {
+      out[key] = true;
+    }
+  }
+  return out;
+}
+
+function readIntentFromArgs(baseDir, args, fallback = null) {
+  const opts = parseCliArgs(args);
+  const candidatePath = opts.intent || opts.candidate || opts.file || opts._[0];
+  if (candidatePath) {
+    const intent = safeReadJson(path.resolve(baseDir, candidatePath));
+    if (!intent) throw new Error(`Could not read candidate JSON: ${path.resolve(baseDir, candidatePath)}`);
+    return intent;
+  }
+
+  return {
+    timestamp: nowIso(),
+    source: 'READINESS_TEST',
+    strategy: 'SpreadHunter',
+    route: 'READINESS',
+    tokenId: opts['token-id'] || opts.tokenId || fallback?.tokenId || '1234567890',
+    marketId: opts['market-id'] || opts.marketId || fallback?.marketId || 'readiness-test-market',
+    side: String(opts.side || fallback?.side || 'BUY').toUpperCase(),
+    price: Number(opts.price || fallback?.price || 0.55),
+    sizeUsd: Number(opts['size-usd'] || opts.sizeUsd || fallback?.sizeUsd || 1),
+    reason: 'Synthetic readiness test intent; never submit by default',
+    confidence: 0.8,
+    sophieApproved: true,
+    consensusScore: 0.8,
+    bookFresh: true,
+    bookAgeMs: 250,
+    currentLiveExposureUsd: 0,
+    currentDailyLivePnlUsd: 0,
+    tickSize: opts['tick-size'] || fallback?.tickSize || '0.01',
+    minOrderSize: opts['min-order-size'] !== undefined ? Number(opts['min-order-size']) : fallback?.minOrderSize ?? 0,
+    negRisk: false,
+    paperBurnIn: {
+      ok: true,
+      reports: 3,
+      closedPnlUsd: 0,
+      drawdownPct: 0,
+      ghostFavorablePct: 1,
+    },
+  };
+}
+
+function printStructured(obj) {
+  console.log(JSON.stringify(obj, null, 2));
+}
+
 // -----------------------------
 // Config and flags
 // -----------------------------
@@ -129,14 +234,23 @@ function readConfig(baseDir = process.cwd()) {
     liveSecretsPath: process.env.LIVE_SECRETS_PATH || './.env.live.secrets',
     liveIntentLogPath: process.env.LIVE_INTENT_LOG_PATH || './live_order_intents.ndjson',
     liveExecutionLogPath: process.env.LIVE_EXECUTION_LOG_PATH || './live_execution_events.ndjson',
+    liveAdapterEventsPath: process.env.LIVE_ADAPTER_EVENTS_PATH || './live_adapter_events.ndjson',
+    liveReconcileSnapshotPath: process.env.LIVE_RECONCILE_SNAPSHOT_PATH || './live_reconcile_snapshot.json',
 
     enableLiveTrading: toBool(process.env.ENABLE_LIVE_TRADING, false),
     liveAutoExecute: toBool(process.env.LIVE_AUTO_EXECUTE, false),
     liveKillSwitch: toBool(process.env.LIVE_KILL_SWITCH, true),
     liveDryRunOnly: toBool(process.env.LIVE_DRY_RUN_ONLY, true),
+    liveSubmitConfirm: toBool(process.env.LIVE_SUBMIT_CONFIRM, false),
+    liveAuthCheckAllow: toBool(process.env.LIVE_AUTH_CHECK_ALLOW, false),
+    liveSigningTestAllow: toBool(process.env.LIVE_SIGNING_TEST_ALLOW, false),
+    liveReconcileAllow: toBool(process.env.LIVE_RECONCILE_ALLOW, false),
     liveRequireSophieApproval: toBool(process.env.LIVE_REQUIRE_SOPHIE_APPROVAL, true),
     liveRequireFreshBook: toBool(process.env.LIVE_REQUIRE_FRESH_BOOK, true),
+    liveRequireBurnIn: toBool(process.env.LIVE_REQUIRE_BURN_IN, true),
+    liveCancelReplaceEnabled: toBool(process.env.LIVE_CANCEL_REPLACE_ENABLED, false),
     liveCancelStaleOrders: toBool(process.env.LIVE_CANCEL_STALE_ORDERS, true),
+    liveCancelTestAllow: toBool(process.env.LIVE_CANCEL_TEST_ALLOW, false),
     liveWhaleCopyTrading: toBool(process.env.LIVE_WHALE_COPY_TRADING, false),
     liveAllowOracleSniper: toBool(process.env.LIVE_ALLOW_ORACLE_SNIPER, false),
     livePostOnlyDefault: toBool(process.env.LIVE_POST_ONLY_DEFAULT, true),
@@ -145,10 +259,12 @@ function readConfig(baseDir = process.cwd()) {
     maxLiveTotalExposureUsd: toNum(process.env.MAX_LIVE_TOTAL_EXPOSURE_USD, 10),
     liveDailyMaxLossUsd: toNum(process.env.LIVE_DAILY_MAX_LOSS_USD, 3),
     liveStaleOrderMs: toNum(process.env.LIVE_STALE_ORDER_MS, 45000),
+    liveReplaceMinPriceDeltaTicks: toNum(process.env.LIVE_REPLACE_MIN_PRICE_DELTA_TICKS, 1),
     liveMaxBookAgeMs: toNum(process.env.LIVE_MAX_BOOK_AGE_MS, 1500),
+    liveMaxSpread: toNum(process.env.LIVE_MAX_SPREAD, toNum(process.env.MAX_SPREAD, 0.12)),
     liveMinBurnInReports: toNum(process.env.LIVE_BURN_IN_MIN_REPORTS, 3),
     liveMinBurnInClosedPnlUsd: toNum(process.env.LIVE_BURN_IN_MIN_CLOSED_PNL_USD, 0),
-    liveMaxBurnInDrawdownPct: toNum(process.env.LIVE_BURN_IN_MAX_DRAWDOWN_PCT, 2),
+    liveMaxBurnInDrawdownPct: toNum(process.env.LIVE_BURN_IN_MAX_DRAWDOWN_PCT, 3),
     liveMinGhostFavorablePct: toNum(process.env.LIVE_BURN_IN_MIN_GHOST_FAVORABLE_PCT, 0),
     liveBurnInOkOverride: toBool(process.env.LIVE_BURN_IN_OK, false),
     liveSophieMinScore: toNum(process.env.LIVE_SOPHIE_MIN_SCORE, toNum(process.env.CONSENSUS_THRESHOLD, 0.55)),
@@ -165,31 +281,34 @@ function normalizeIntent(rawIntent) {
 
   const intent = {
     id: rawIntent.id || createIntentId(rawIntent),
-    timestamp: rawIntent.timestamp || nowIso(),
+    timestamp: firstString(rawIntent.timestamp, rawIntent.ts, nowIso()),
     source: rawIntent.source || rawIntent.strategy || 'UNKNOWN',
     route: rawIntent.route || rawIntent.routeMode || 'UNKNOWN',
-    tokenId: String(rawIntent.tokenId || rawIntent.tokenID || rawIntent.asset_id || ''),
-    marketId: rawIntent.marketId || rawIntent.conditionId || rawIntent.market || null,
+    strategy: rawIntent.strategy || rawIntent.source || 'UNKNOWN',
+    tokenId: firstString(rawIntent.tokenId, rawIntent.token_id, rawIntent.tokenID, rawIntent.assetId, rawIntent.asset_id, rawIntent.clobTokenId, rawIntent.clob_token_id),
+    marketId: firstString(rawIntent.marketId, rawIntent.market_id, rawIntent.conditionId, rawIntent.condition_id, rawIntent.market) || null,
     side: String(rawIntent.side || '').toUpperCase(),
     price: Number(rawIntent.price),
-    sizeUsd: Number(rawIntent.sizeUsd || rawIntent.usd || rawIntent.amountUsd || 0),
-    sizeShares: rawIntent.sizeShares !== undefined ? Number(rawIntent.sizeShares) : null,
+    sizeUsd: firstNumber(rawIntent.sizeUsd, rawIntent.size_usd, rawIntent.usd, rawIntent.amountUsd, rawIntent.amount_usd, 0),
+    sizeShares: firstDefined(rawIntent.sizeShares, rawIntent.size_shares) !== undefined ? Number(firstDefined(rawIntent.sizeShares, rawIntent.size_shares)) : null,
     orderType: rawIntent.orderType || 'GTC',
     postOnly: rawIntent.postOnly,
     reason: rawIntent.reason || '',
     confidence: rawIntent.confidence !== undefined ? Number(rawIntent.confidence) : null,
-    sophieApproved: Boolean(rawIntent.sophieApproved || rawIntent.sophie?.approved),
-    consensusScore: rawIntent.consensusScore !== undefined ? Number(rawIntent.consensusScore) : Number(rawIntent.sophie?.score ?? NaN),
-    whaleCopy: Boolean(rawIntent.whaleCopy || rawIntent.source === 'WhaleCopy'),
-    oracleSignal: Boolean(rawIntent.oracleSignal || rawIntent.source === 'BTCOracle'),
-    bookFresh: rawIntent.bookFresh !== undefined ? Boolean(rawIntent.bookFresh) : null,
-    bookAgeMs: rawIntent.bookAgeMs !== undefined ? Number(rawIntent.bookAgeMs) : null,
-    currentLiveExposureUsd: Number(rawIntent.currentLiveExposureUsd || 0),
-    currentDailyLivePnlUsd: Number(rawIntent.currentDailyLivePnlUsd || 0),
-    paperBurnIn: rawIntent.paperBurnIn || rawIntent.burnIn || null,
-    tickSize: rawIntent.tickSize || null,
-    negRisk: rawIntent.negRisk !== undefined ? Boolean(rawIntent.negRisk) : null,
-    minOrderSize: rawIntent.minOrderSize !== undefined ? Number(rawIntent.minOrderSize) : null,
+    sophieApproved: Boolean(rawIntent.sophieApproved || rawIntent.sophie_approved || rawIntent.sophie?.approved),
+    consensusScore: firstNumber(rawIntent.consensusScore, rawIntent.consensus_score, rawIntent.sophie?.score),
+    whaleCopy: Boolean(rawIntent.whaleCopy || rawIntent.whale_copy || rawIntent.source === 'WhaleCopy'),
+    oracleSignal: Boolean(rawIntent.oracleSignal || rawIntent.oracle_signal || rawIntent.source === 'BTCOracle'),
+    bookFresh: firstDefined(rawIntent.bookFresh, rawIntent.book_fresh) !== undefined ? Boolean(firstDefined(rawIntent.bookFresh, rawIntent.book_fresh)) : null,
+    bookAgeMs: firstNumber(rawIntent.bookAgeMs, rawIntent.book_age_ms),
+    bestBid: firstNumber(rawIntent.bestBid, rawIntent.best_bid, rawIntent.book?.bestBid, rawIntent.book?.best_bid),
+    bestAsk: firstNumber(rawIntent.bestAsk, rawIntent.best_ask, rawIntent.book?.bestAsk, rawIntent.book?.best_ask),
+    currentLiveExposureUsd: firstNumber(rawIntent.currentLiveExposureUsd, rawIntent.current_live_exposure_usd, 0),
+    currentDailyLivePnlUsd: firstNumber(rawIntent.currentDailyLivePnlUsd, rawIntent.current_daily_live_pnl_usd, 0),
+    paperBurnIn: rawIntent.paperBurnIn || rawIntent.paper_burn_in || rawIntent.burnIn || rawIntent.burn_in || null,
+    tickSize: rawIntent.tickSize || rawIntent.tick_size || null,
+    negRisk: firstDefined(rawIntent.negRisk, rawIntent.neg_risk) !== undefined ? Boolean(firstDefined(rawIntent.negRisk, rawIntent.neg_risk)) : null,
+    minOrderSize: firstDefined(rawIntent.minOrderSize, rawIntent.min_order_size) !== undefined ? Number(firstDefined(rawIntent.minOrderSize, rawIntent.min_order_size)) : null,
     raw: rawIntent,
   };
 
@@ -204,24 +323,30 @@ function normalizeIntent(rawIntent) {
 // Safety gates
 // -----------------------------
 function evaluateBurnIn(config, intent) {
-  if (config.liveBurnInOkOverride) return { ok: true, reasons: [], source: 'LIVE_BURN_IN_OK' };
+  if (!config.liveRequireBurnIn) return { ok: true, reasons: [], source: 'LIVE_REQUIRE_BURN_IN=false' };
+  if (config.liveBurnInOkOverride && process.env.LIVE_REQUIRE_BURN_IN === 'false') {
+    return { ok: true, reasons: [], source: 'LIVE_BURN_IN_OK' };
+  }
 
   const burn = intent.paperBurnIn;
   if (!burn || typeof burn !== 'object') {
-    return { ok: false, reasons: ['BURN_IN_MISSING'], source: 'intent.paperBurnIn' };
+    return { ok: false, reasons: ['BURN_IN_REQUIRED'], source: 'intent.paperBurnIn' };
   }
 
   const reasons = [];
   const reports = Number(burn.reports || burn.reportCount || 0);
   const closedPnl = Number(burn.closedPnlUsd || burn.closedPnl || 0);
   const drawdown = Number(burn.drawdownPct || burn.drawdown || 0);
-  const ghostFav = Number(burn.ghostFavorablePct || burn.ghostFavorable || 0);
+  const ghostRaw = firstDefined(burn.ghostFavorablePct, burn.ghostFavorable, burn.ghost_favorable_pct);
+  const ghostFav = Number(ghostRaw);
 
   if (burn.ok !== true) reasons.push('BURN_IN_NOT_MARKED_OK');
   if (reports < config.liveMinBurnInReports) reasons.push('BURN_IN_REPORTS_TOO_LOW');
   if (closedPnl < config.liveMinBurnInClosedPnlUsd) reasons.push('BURN_IN_CLOSED_PNL_TOO_LOW');
   if (drawdown > config.liveMaxBurnInDrawdownPct) reasons.push('BURN_IN_DRAWDOWN_TOO_HIGH');
-  if (ghostFav < config.liveMinGhostFavorablePct) reasons.push('BURN_IN_GHOST_FAVORABLE_TOO_LOW');
+  if (!Number.isFinite(ghostFav)) reasons.push('BURN_IN_GHOST_FAVORABLE_UNAVAILABLE');
+  if (Number.isFinite(ghostFav) && ghostFav < config.liveMinGhostFavorablePct) reasons.push('BURN_IN_GHOST_FAVORABLE_TOO_LOW');
+  if (Number(burn.recentFatalErrors || 0) > 0) reasons.push('BURN_IN_RECENT_FATAL_ERRORS');
 
   return { ok: reasons.length === 0, reasons, source: 'intent.paperBurnIn' };
 }
@@ -233,13 +358,14 @@ function evaluateStaticSafety(config, intent) {
   if (!config.liveAutoExecute) reasons.push('AUTO_EXECUTE_DISABLED');
   if (config.liveKillSwitch) reasons.push('KILL_SWITCH_ACTIVE');
   if (config.liveDryRunOnly) reasons.push('DRY_RUN_ONLY');
+  if (!config.liveSubmitConfirm) reasons.push('LIVE_SUBMIT_CONFIRM_REQUIRED');
 
   if (!intent.tokenId) reasons.push('TOKEN_ID_MISSING');
   if (!['BUY', 'SELL'].includes(intent.side)) reasons.push('INVALID_SIDE');
   if (!Number.isFinite(intent.price) || intent.price <= 0 || intent.price >= 1) reasons.push('INVALID_PRICE');
   if (!Number.isFinite(intent.sizeUsd) || intent.sizeUsd <= 0) reasons.push('INVALID_SIZE_USD');
-  if (intent.sizeUsd > config.maxLiveOrderUsd) reasons.push('MAX_ORDER_USD_EXCEEDED');
-  if (intent.currentLiveExposureUsd + intent.sizeUsd > config.maxLiveTotalExposureUsd) reasons.push('MAX_TOTAL_EXPOSURE_EXCEEDED');
+  if (intent.sizeUsd > config.maxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
+  if (intent.currentLiveExposureUsd + intent.sizeUsd > config.maxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
   if (intent.currentDailyLivePnlUsd <= -Math.abs(config.liveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
 
   if (config.liveRequireSophieApproval && intent.sophieApproved !== true) reasons.push('SOPHIE_NOT_APPROVED');
@@ -259,56 +385,149 @@ function evaluateStaticSafety(config, intent) {
   };
 }
 
-async function evaluateMetadataSafety(client, intent) {
+function evaluateLossExposureGuards(config, intent) {
+  const reasons = [];
+  if (intent.currentDailyLivePnlUsd <= -Math.abs(config.liveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
+  if (intent.currentLiveExposureUsd + intent.sizeUsd > config.maxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
+  if (intent.sizeUsd > config.maxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
+  return { ok: reasons.length === 0, reasons };
+}
+
+function extractBookLevels(levels) {
+  if (!Array.isArray(levels)) return [];
+  return levels
+    .map((level) => ({
+      price: Number(level.price ?? level.p ?? level[0]),
+      size: Number(level.size ?? level.s ?? level[1]),
+    }))
+    .filter((level) => Number.isFinite(level.price) && Number.isFinite(level.size));
+}
+
+function normalizeOrderBook(book, intent = {}) {
+  if (!book || typeof book !== 'object') return null;
+  const bids = extractBookLevels(book.bids || book.buy || book.buys || book.BIDS);
+  const asks = extractBookLevels(book.asks || book.sell || book.sells || book.ASKS);
+  const bestBid = Number.isFinite(intent.bestBid) ? intent.bestBid : bids.length ? Math.max(...bids.map((b) => b.price)) : NaN;
+  const bestAsk = Number.isFinite(intent.bestAsk) ? intent.bestAsk : asks.length ? Math.min(...asks.map((a) => a.price)) : NaN;
+  const tickSize = book.tick_size || book.tickSize || book.minimum_tick_size || intent.tickSize || null;
+  const minOrderSize = Number(book.min_order_size || book.minOrderSize || book.minimum_order_size || intent.minOrderSize || 0);
+  const tsRaw = book.timestamp || book.ts || book.server_time || book.serverTime || book.updated_at || book.updatedAt || null;
+  const parsedTs = tsRaw ? Number(tsRaw) || Date.parse(tsRaw) : NaN;
+  const bookAgeMs = Number.isFinite(intent.bookAgeMs)
+    ? intent.bookAgeMs
+    : Number.isFinite(parsedTs)
+      ? Math.max(0, Date.now() - (parsedTs > 10_000_000_000 ? parsedTs : parsedTs * 1000))
+      : NaN;
+
+  return {
+    tickSize,
+    negRisk: book.neg_risk ?? book.negRisk ?? intent.negRisk ?? null,
+    minOrderSize,
+    bestBid,
+    bestAsk,
+    spread: Number.isFinite(bestBid) && Number.isFinite(bestAsk) ? Math.max(0, bestAsk - bestBid) : NaN,
+    bookAgeMs,
+    rawAvailable: true,
+  };
+}
+
+async function fetchPublicOrderBook(config, tokenId) {
+  if (!tokenId || typeof fetch !== 'function') return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  const url = `${String(config.clobHost).replace(/\/$/, '')}/book?token_id=${encodeURIComponent(tokenId)}`;
+  try {
+    const res = await fetch(url, { signal: controller.signal, headers: { accept: 'application/json' } });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function evaluateMetadataSafety(client, intent, config = readConfig()) {
   const reasons = [];
   const meta = {
     tickSize: intent.tickSize || null,
     negRisk: intent.negRisk,
     minOrderSize: intent.minOrderSize,
+    bestBid: Number.isFinite(intent.bestBid) ? intent.bestBid : null,
+    bestAsk: Number.isFinite(intent.bestAsk) ? intent.bestAsk : null,
+    spread: null,
+    bookAgeMs: Number.isFinite(intent.bookAgeMs) ? intent.bookAgeMs : null,
+    source: 'intent',
   };
+  let orderBook = null;
 
   if (client) {
     try {
-      const book = await client.getOrderBook(intent.tokenId);
-      if (book) {
-        meta.tickSize = meta.tickSize || book.tick_size || book.tickSize || book.minimum_tick_size || null;
-        meta.negRisk = meta.negRisk !== null && meta.negRisk !== undefined ? meta.negRisk : Boolean(book.neg_risk ?? book.negRisk ?? false);
-        meta.minOrderSize = Number(meta.minOrderSize || book.min_order_size || book.minOrderSize || book.minimum_order_size || 0);
-      }
+      orderBook = await client.getOrderBook(intent.tokenId);
+      meta.source = 'authenticated_clob';
     } catch (e) {
       reasons.push(`ORDERBOOK_METADATA_FAILED:${e.message}`);
     }
+  } else if (intent.tokenId && intent.tokenId !== '1234567890') {
+    orderBook = await fetchPublicOrderBook(config, intent.tokenId);
+    if (orderBook) meta.source = 'public_clob';
+  }
 
-    if (!meta.tickSize) {
-      try {
-        meta.tickSize = await client.getTickSize(intent.tokenId);
-      } catch (e) {
-        reasons.push(`TICK_SIZE_LOOKUP_FAILED:${e.message}`);
-      }
+  const normalizedBook = normalizeOrderBook(orderBook, intent);
+  if (normalizedBook) {
+    meta.tickSize = meta.tickSize || normalizedBook.tickSize;
+    meta.negRisk = meta.negRisk !== null && meta.negRisk !== undefined ? meta.negRisk : normalizedBook.negRisk;
+    meta.minOrderSize = Number(meta.minOrderSize || normalizedBook.minOrderSize || 0);
+    meta.bestBid = Number.isFinite(normalizedBook.bestBid) ? normalizedBook.bestBid : meta.bestBid;
+    meta.bestAsk = Number.isFinite(normalizedBook.bestAsk) ? normalizedBook.bestAsk : meta.bestAsk;
+    meta.spread = Number.isFinite(normalizedBook.spread) ? normalizedBook.spread : meta.spread;
+    meta.bookAgeMs = Number.isFinite(normalizedBook.bookAgeMs) ? normalizedBook.bookAgeMs : meta.bookAgeMs;
+  }
+
+  if (client && !meta.tickSize) {
+    try {
+      meta.tickSize = await client.getTickSize(intent.tokenId);
+    } catch (e) {
+      reasons.push(`TICK_SIZE_LOOKUP_FAILED:${e.message}`);
     }
+  }
 
-    if (meta.negRisk === null || meta.negRisk === undefined) {
-      try {
-        meta.negRisk = await client.getNegRisk(intent.tokenId);
-      } catch (e) {
-        reasons.push(`NEG_RISK_LOOKUP_FAILED:${e.message}`);
-      }
+  if (client && (meta.negRisk === null || meta.negRisk === undefined)) {
+    try {
+      meta.negRisk = await client.getNegRisk(intent.tokenId);
+    } catch (e) {
+      reasons.push(`NEG_RISK_LOOKUP_FAILED:${e.message}`);
     }
   }
 
   meta.tickSize = meta.tickSize || '0.01';
   meta.negRisk = Boolean(meta.negRisk);
   meta.minOrderSize = Number(meta.minOrderSize || 0);
+  if (meta.spread === null && Number.isFinite(meta.bestBid) && Number.isFinite(meta.bestAsk)) {
+    meta.spread = Math.max(0, meta.bestAsk - meta.bestBid);
+  }
 
+  if (!normalizedBook && (!Number.isFinite(meta.bestBid) || !Number.isFinite(meta.bestAsk))) {
+    reasons.push('TOKEN_METADATA_UNAVAILABLE');
+  }
+  if (!Number.isFinite(intent.price) || intent.price < 0.01 || intent.price > 0.99) {
+    reasons.push('PRICE_OUT_OF_RANGE');
+  }
   if (!priceConformsToTick(intent.price, meta.tickSize)) {
-    reasons.push('PRICE_TICK_SIZE_INVALID');
+    reasons.push('PRICE_NOT_TICK_ALIGNED');
   }
 
   if (meta.minOrderSize > 0 && intent.sizeShares < meta.minOrderSize) {
-    reasons.push('MIN_ORDER_SIZE_NOT_MET');
+    reasons.push('SIZE_BELOW_MIN_ORDER');
+  }
+  if (!Number.isFinite(meta.bookAgeMs) || meta.bookAgeMs > config.liveMaxBookAgeMs) {
+    reasons.push('BOOK_NOT_FRESH');
+  }
+  if (Number.isFinite(meta.spread) && meta.spread > config.liveMaxSpread) {
+    reasons.push('SPREAD_TOO_WIDE');
   }
 
-  return { ok: reasons.length === 0, reasons, meta };
+  return { ok: [...new Set(reasons)].length === 0, reasons: [...new Set(reasons)], meta };
 }
 
 // -----------------------------
@@ -319,23 +538,69 @@ class PolymarketLiveClient {
     this.config = config;
     this.client = null;
     this.sdk = null;
+    this.walletAddress = null;
+    this.privateKeyAccessed = false;
+    this.clientPurpose = null;
+  }
+
+  canSubmitLive() {
+    return this.config.enableLiveTrading
+      && this.config.liveAutoExecute
+      && !this.config.liveKillSwitch
+      && !this.config.liveDryRunOnly
+      && this.config.liveSubmitConfirm;
   }
 
   shouldLoadSecrets() {
-    return this.config.enableLiveTrading && this.config.liveAutoExecute && !this.config.liveKillSwitch && !this.config.liveDryRunOnly;
+    return this.canSubmitLive();
   }
 
-  async init() {
-    if (this.client) return this.client;
-    if (!this.shouldLoadSecrets()) {
-      throw new Error('Refusing to initialize live client while live flags are not fully enabled');
+  secretAccessDecision(purpose) {
+    const reasons = [];
+    if (!secretFileExists(this.config)) reasons.push('LIVE_SECRETS_FILE_MISSING');
+
+    if (purpose === 'submit') {
+      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      if (!this.config.liveAutoExecute) reasons.push('LIVE_AUTO_EXECUTE_FALSE');
+      if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
+      if (this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_TRUE');
+      if (!this.config.liveSubmitConfirm) reasons.push('LIVE_SUBMIT_CONFIRM_REQUIRED');
+    } else if (purpose === 'cancel') {
+      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      if (!this.config.liveAutoExecute) reasons.push('LIVE_AUTO_EXECUTE_FALSE');
+      if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
+      if (this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_TRUE');
+      if (!this.config.liveCancelTestAllow) reasons.push('LIVE_CANCEL_TEST_ALLOW_FALSE');
+    } else if (purpose === 'auth-check') {
+      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_AUTH_CHECK');
+      if (!this.config.liveAuthCheckAllow) reasons.push('LIVE_AUTH_CHECK_ALLOW_FALSE');
+    } else if (purpose === 'signing-test') {
+      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_SIGNING_TEST');
+      if (!this.config.liveSigningTestAllow) reasons.push('LIVE_SIGNING_TEST_ALLOW_FALSE');
+    } else if (purpose === 'reconcile') {
+      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_RECONCILE');
+      if (!this.config.liveReconcileAllow) reasons.push('LIVE_RECONCILE_ALLOW_FALSE');
     }
+
+    return { ok: reasons.length === 0, reasons };
+  }
+
+  async init(purpose = 'submit') {
+    const allowed = this.secretAccessDecision(purpose);
+    if (!allowed.ok) {
+      throw new Error(`Refusing to load live secrets for ${purpose}: ${allowed.reasons.join(',')}`);
+    }
+    if (this.client) return this.client;
 
     const secretPath = path.resolve(this.config.baseDir, this.config.liveSecretsPath);
     loadEnvFile(secretPath, { override: false, required: true });
 
     const privateKey = normalizePrivateKey(process.env.POLYMARKET_PRIVATE_KEY || process.env.PRIVATE_KEY);
     if (!privateKey) throw new Error('POLYMARKET_PRIVATE_KEY missing in live secrets');
+    this.privateKeyAccessed = true;
 
     const funderAddress = process.env.POLYMARKET_PROXY_WALLET_ADDRESS || process.env.POLYMARKET_FUNDER_ADDRESS || process.env.DEPOSIT_WALLET_ADDRESS;
     const signatureType = Number(process.env.POLYMARKET_SIGNATURE_TYPE || 3);
@@ -346,6 +611,7 @@ class PolymarketLiveClient {
 
     const account = privateKeyToAccount(privateKey);
     const signer = createWalletClient({ account, transport: http() });
+    this.walletAddress = funderAddress || account.address;
 
     const l1Client = new sdk.ClobClient({
       host: this.config.clobHost,
@@ -376,61 +642,317 @@ class PolymarketLiveClient {
       throwOnError: true,
     });
     this.sdk = sdk;
+    this.clientPurpose = purpose;
     return this.client;
   }
 
-  async reconcile(params = {}) {
-    const client = await this.init();
-    const sdk = this.sdk;
-    const assetType = sdk.AssetType || { COLLATERAL: 'COLLATERAL', CONDITIONAL: 'CONDITIONAL' };
-    const openOrders = await client.getOpenOrders(params.openOrderParams || undefined);
-    const collateral = await client.getBalanceAllowance({ asset_type: assetType.COLLATERAL });
-    return {
+  async authCheck() {
+    const event = {
       timestamp: nowIso(),
-      openOrders,
-      collateral,
+      type: 'LIVE_AUTH_CHECK',
+      secretsPresent: secretFileExists(this.config),
+      privateKeyAccessed: false,
+      clientInitialized: false,
+      apiCredentialsReady: false,
+      submitted: false,
+      signed: false,
+      errors: [],
     };
+
+    try {
+      await this.init('auth-check');
+      event.privateKeyAccessed = this.privateKeyAccessed;
+      event.clientInitialized = Boolean(this.client);
+      event.apiCredentialsReady = Boolean(process.env.POLYMARKET_API_KEY && process.env.POLYMARKET_API_SECRET && process.env.POLYMARKET_API_PASSPHRASE) || Boolean(this.client);
+      event.walletAddress = redactWallet(this.walletAddress);
+    } catch (e) {
+      event.errors.push(safeError(e));
+      event.missingEnv = missingEnv(['POLYMARKET_PRIVATE_KEY']);
+    }
+
+    return event;
   }
 
-  async cancelOrder(orderId) {
-    if (!orderId) throw new Error('orderId required');
-    const client = await this.init();
-    return client.cancelOrder(orderId);
-  }
-
-  async cancelMarketOrders({ marketId, tokenId } = {}) {
-    const client = await this.init();
-    return client.cancelMarketOrders({ market: marketId, asset_id: tokenId });
-  }
-
-  async signAndSubmit(intent, meta) {
-    const client = await this.init();
+  async signOrderOnly(intent, meta, purpose = 'signing-test') {
+    const client = await this.init(purpose);
     const sdk = this.sdk;
     const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
-    const orderType = sdk.OrderType[intent.orderType] || sdk.OrderType.GTC;
-    const postOnly = intent.postOnly !== undefined ? Boolean(intent.postOnly) : this.config.livePostOnlyDefault;
-
     const userOrder = {
       tokenID: intent.tokenId,
       price: Number(intent.price),
       size: Number(intent.sizeShares),
       side,
     };
-
-    const signedOrder = await client.createOrder(userOrder, {
+    return client.createOrder(userOrder, {
       tickSize: String(meta.tickSize),
       negRisk: Boolean(meta.negRisk),
     });
+  }
 
+  async signingTest(intent, meta) {
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_SIGNING_TEST',
+      signed: false,
+      submitted: false,
+      privateKeyAccessed: false,
+      dryRunOnly: true,
+      errors: [],
+      intent: redactIntent(intent),
+    };
+
+    try {
+      await this.signOrderOnly(intent, meta, 'signing-test');
+      event.signed = true;
+      event.privateKeyAccessed = this.privateKeyAccessed;
+      event.walletAddress = redactWallet(this.walletAddress);
+    } catch (e) {
+      event.errors.push(safeError(e));
+    }
+
+    return event;
+  }
+
+  async getOpenOrders(params = {}, purpose = 'submit') {
+    const client = await this.init(purpose);
+    return client.getOpenOrders(params.openOrderParams || undefined);
+  }
+
+  async reconcile(params = {}) {
+    const client = await this.init('reconcile');
+    const sdk = this.sdk;
+    const assetType = sdk.AssetType || { COLLATERAL: 'COLLATERAL', CONDITIONAL: 'CONDITIONAL' };
+    let openOrders = [];
+    let collateral = null;
+    let positions = [];
+    let fills = [];
+    const errors = [];
+
+    try {
+      openOrders = await client.getOpenOrders(params.openOrderParams || undefined);
+    } catch (e) {
+      errors.push(`OPEN_ORDERS_FAILED:${safeError(e)}`);
+    }
+
+    try {
+      collateral = await client.getBalanceAllowance({ asset_type: assetType.COLLATERAL });
+    } catch (e) {
+      errors.push(`USDC_BALANCE_FAILED:${safeError(e)}`);
+    }
+
+    try {
+      if (typeof client.getPositions === 'function') positions = await client.getPositions();
+    } catch (e) {
+      errors.push(`POSITIONS_FAILED:${safeError(e)}`);
+    }
+
+    try {
+      if (typeof client.getTrades === 'function') fills = await client.getTrades();
+    } catch (e) {
+      errors.push(`TRADES_FAILED:${safeError(e)}`);
+    }
+
+    return {
+      timestamp: nowIso(),
+      walletAddress: redactWallet(this.walletAddress),
+      usdcBalance: extractBalance(collateral),
+      gasBalance: null,
+      openOrdersCount: Array.isArray(openOrders) ? openOrders.length : 0,
+      openOrdersUsd: sumOrdersUsd(openOrders),
+      positionsCount: Array.isArray(positions) ? positions.length : 0,
+      positionsUsd: sumPositionsUsd(positions),
+      recentFillsCount: Array.isArray(fills) ? fills.length : 0,
+      lastReconciledAt: nowIso(),
+      errors,
+    };
+  }
+
+  async cancelOrder(orderId, purpose = 'cancel') {
+    if (!orderId) throw new Error('orderId required');
+    const client = await this.init(purpose);
+    return client.cancelOrder(orderId);
+  }
+
+  async cancelMarketOrders({ marketId, tokenId } = {}) {
+    const client = await this.init('cancel');
+    return client.cancelMarketOrders({ market: marketId, asset_id: tokenId });
+  }
+
+  async signAndSubmit(intent, meta) {
+    const client = await this.init('submit');
+    const sdk = this.sdk;
+    const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
+    const orderType = sdk.OrderType[intent.orderType] || sdk.OrderType.GTC;
+    const postOnly = intent.postOnly !== undefined ? Boolean(intent.postOnly) : this.config.livePostOnlyDefault;
+
+    const signedOrder = await this.signOrderOnly(intent, meta, 'submit');
     const response = await client.postOrder(signedOrder, orderType, postOnly);
     return { signedOrder, response };
   }
 
   async replaceOrder({ orderId, replacementIntent, meta }) {
-    const cancelResponse = await this.cancelOrder(orderId);
+    const cancelResponse = await this.cancelOrder(orderId, 'submit');
     const submitResponse = await this.signAndSubmit(replacementIntent, meta);
     return { cancelResponse, submitResponse };
   }
+}
+
+function extractBalance(collateral) {
+  if (!collateral || typeof collateral !== 'object') return null;
+  return firstNumber(collateral.balance, collateral.collateral, collateral.available, collateral.allowance);
+}
+
+function orderUsd(order) {
+  if (!order || typeof order !== 'object') return 0;
+  const price = firstNumber(order.price, order.order_price, order.limitPrice);
+  const size = firstNumber(order.size, order.original_size, order.remaining_size, order.sizeShares);
+  const sizeUsd = firstNumber(order.sizeUsd, order.size_usd, order.amount);
+  if (Number.isFinite(sizeUsd)) return Math.max(0, sizeUsd);
+  if (Number.isFinite(price) && Number.isFinite(size)) return Math.max(0, price * size);
+  return 0;
+}
+
+function sumOrdersUsd(orders) {
+  return Array.isArray(orders) ? Number(orders.reduce((sum, order) => sum + orderUsd(order), 0).toFixed(4)) : 0;
+}
+
+function sumPositionsUsd(positions) {
+  if (!Array.isArray(positions)) return 0;
+  return Number(positions.reduce((sum, pos) => sum + Math.max(0, firstNumber(pos.value, pos.valueUsd, pos.currentValue, 0)), 0).toFixed(4));
+}
+
+function orderId(order) {
+  return firstString(order.id, order.orderId, order.order_id, order.hash);
+}
+
+function orderTokenId(order) {
+  return firstString(order.tokenId, order.token_id, order.tokenID, order.asset_id, order.assetId);
+}
+
+function orderSide(order) {
+  return firstString(order.side, order.orderSide).toUpperCase();
+}
+
+function orderStrategy(order) {
+  return firstString(order.strategy, order.source, order.metadata?.strategy);
+}
+
+function orderPrice(order) {
+  return firstNumber(order.price, order.order_price, order.limitPrice);
+}
+
+function orderCreatedMs(order) {
+  const raw = firstDefined(order.createdAt, order.created_at, order.timestamp, order.created);
+  if (raw === undefined) return NaN;
+  const n = Number(raw);
+  if (Number.isFinite(n)) return n > 10_000_000_000 ? n : n * 1000;
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function findMatchingOpenOrder(openOrders, intent) {
+  if (!Array.isArray(openOrders)) return null;
+  return openOrders.find((order) => {
+    const tokenMatches = orderTokenId(order) === intent.tokenId;
+    const sideMatches = orderSide(order) === intent.side;
+    const existingStrategy = orderStrategy(order);
+    const strategyMatches = !existingStrategy || existingStrategy === intent.strategy || existingStrategy === intent.source;
+    return tokenMatches && sideMatches && strategyMatches;
+  }) || null;
+}
+
+function buildCancelReplacePlan(config, intent, existingOrder, meta = {}) {
+  const currentPrice = Number(intent.price);
+  const existingPrice = existingOrder ? orderPrice(existingOrder) : NaN;
+  const tick = Number(meta.tickSize || intent.tickSize || 0.01);
+  const createdMs = existingOrder ? orderCreatedMs(existingOrder) : NaN;
+  const ageMs = Number.isFinite(createdMs) ? Math.max(0, Date.now() - createdMs) : NaN;
+  const priceDeltaTicks = Number.isFinite(existingPrice) && Number.isFinite(currentPrice) && tick > 0
+    ? Math.abs(currentPrice - existingPrice) / tick
+    : NaN;
+
+  let reason = 'NO_MATCHING_ORDER';
+  let wouldCancel = false;
+  let wouldPlaceReplacement = false;
+  let skipDuplicate = false;
+
+  if (existingOrder) {
+    const stale = config.liveCancelStaleOrders && Number.isFinite(ageMs) && ageMs >= config.liveStaleOrderMs;
+    const moved = Number.isFinite(priceDeltaTicks) && priceDeltaTicks >= config.liveReplaceMinPriceDeltaTicks;
+
+    if (!stale && !moved) {
+      reason = 'DUPLICATE_LIVE_ORDER';
+      skipDuplicate = true;
+    } else if (!config.liveCancelReplaceEnabled) {
+      reason = 'CANCEL_REPLACE_DISABLED';
+    } else if (stale) {
+      reason = 'STALE_ORDER';
+      wouldCancel = true;
+      wouldPlaceReplacement = true;
+    } else if (moved) {
+      reason = 'PRICE_MOVED';
+      wouldCancel = true;
+      wouldPlaceReplacement = true;
+    }
+  }
+
+  return {
+    candidateOrder: {
+      tokenId: intent.tokenId,
+      side: intent.side,
+      strategy: intent.strategy || intent.source,
+      price: intent.price,
+      sizeUsd: intent.sizeUsd,
+    },
+    matchingExistingOrder: existingOrder ? {
+      orderId: orderId(existingOrder),
+      tokenId: orderTokenId(existingOrder),
+      side: orderSide(existingOrder),
+      strategy: orderStrategy(existingOrder) || null,
+      price: Number.isFinite(existingPrice) ? existingPrice : null,
+      ageMs: Number.isFinite(ageMs) ? ageMs : null,
+    } : null,
+    reason,
+    priceDeltaTicks: Number.isFinite(priceDeltaTicks) ? Number(priceDeltaTicks.toFixed(4)) : null,
+    wouldCancel,
+    wouldPlaceReplacement,
+    skipDuplicate,
+    submitted: false,
+  };
+}
+
+function syntheticExistingOrder(intent, config) {
+  return {
+    id: 'dry-run-existing-order',
+    tokenId: intent.tokenId,
+    side: intent.side,
+    strategy: intent.strategy || intent.source,
+    price: roundToTick(Number(intent.price) - 0.02, intent.tickSize || 0.01),
+    size: intent.sizeShares,
+    createdAt: Date.now() - config.liveStaleOrderMs - 1000,
+  };
+}
+
+function writeJsonAtomic(filePath, obj) {
+  const abs = path.resolve(filePath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  const tmp = `${abs}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+  fs.renameSync(tmp, abs);
+}
+
+function burnInFromState(baseDir) {
+  const statePath = path.resolve(baseDir, 'moneymaker_v3_state.json');
+  const state = safeReadJson(statePath, null);
+  if (!state || typeof state !== 'object') return null;
+  const reports = firstNumber(state.reportsCount, state.reportCount, state.reports?.length, state.telemetry?.reportsCount, 0);
+  const closedPnlUsd = firstNumber(state.closedPnlUsd, state.closedPnLUsd, state.pnl?.closedUsd, state.paper?.closedPnlUsd, 0);
+  const drawdownPct = firstNumber(state.drawdownPct, state.maxDrawdownPct, state.risk?.drawdownPct, 0);
+  const ghostFavorablePct = firstNumber(state.ghostFavorablePct, state.ghost?.favorablePct, state.ghostCalibration?.favorablePct);
+  const recentFatalErrors = Array.isArray(state.errors)
+    ? state.errors.filter((e) => /fatal|uncaught|syntax|crash/i.test(JSON.stringify(e))).length
+    : 0;
+  return { ok: true, reports, closedPnlUsd, drawdownPct, ghostFavorablePct, recentFatalErrors, source: statePath };
 }
 
 // -----------------------------
@@ -444,7 +966,7 @@ class LiveAdapter {
   }
 
   logEvent(event) {
-    const file = path.resolve(this.baseDir, this.config.liveIntentLogPath);
+    const file = path.resolve(this.baseDir, this.config.liveAdapterEventsPath);
     appendNdjson(file, event);
   }
 
@@ -453,21 +975,23 @@ class LiveAdapter {
     appendNdjson(file, event);
   }
 
+  saveReconcileSnapshot(event) {
+    writeJsonAtomic(path.resolve(this.baseDir, this.config.liveReconcileSnapshotPath), event);
+  }
+
   async evaluate(rawIntent, options = {}) {
     const intent = normalizeIntent(rawIntent);
     const staticSafety = evaluateStaticSafety(this.config, intent);
     let metadataSafety = { ok: true, reasons: [], meta: { tickSize: intent.tickSize || '0.01', negRisk: Boolean(intent.negRisk), minOrderSize: Number(intent.minOrderSize || 0) } };
 
-    // Only ask CLOB for metadata when explicitly requested or live path is fully armed.
-    const shouldFetchMetadata = options.fetchMetadata === true || this.live.shouldLoadSecrets();
-    if (shouldFetchMetadata) {
-      const client = this.live.shouldLoadSecrets() ? await this.live.init() : null;
-      metadataSafety = await evaluateMetadataSafety(client, intent);
+    if (options.fetchMetadata === true && this.live.canSubmitLive()) {
+      const client = await this.live.init('submit');
+      metadataSafety = await evaluateMetadataSafety(client, intent, this.config);
     } else {
-      metadataSafety = await evaluateMetadataSafety(null, intent);
+      metadataSafety = await evaluateMetadataSafety(null, intent, this.config);
     }
 
-    const reasons = [...staticSafety.reasons, ...metadataSafety.reasons];
+    const reasons = [...new Set([...staticSafety.reasons, ...metadataSafety.reasons])];
     const decision = reasons.length === 0 ? 'ALLOW_LIVE_SUBMISSION' : 'REFUSED';
 
     return {
@@ -480,7 +1004,7 @@ class LiveAdapter {
       safety: {
         submitted: false,
         signed: false,
-        secretsRead: this.live.shouldLoadSecrets(),
+        secretsRead: this.live.canSubmitLive(),
         privateKeyAccessed: false,
         staticSafety,
         metadataSafety,
@@ -489,7 +1013,8 @@ class LiveAdapter {
   }
 
   async handleIntent(rawIntent, options = {}) {
-    const evaluation = await this.evaluate(rawIntent, options);
+    const submitMode = options.mode === 'submit';
+    const evaluation = await this.evaluate(rawIntent, { ...options, fetchMetadata: submitMode || options.fetchMetadata === true });
 
     if (evaluation.decision !== 'ALLOW_LIVE_SUBMISSION') {
       this.logEvent(evaluation);
@@ -507,12 +1032,81 @@ class LiveAdapter {
     }
 
     const intent = normalizeIntent(rawIntent);
+    let openOrders = [];
+    try {
+      openOrders = await this.live.getOpenOrders({ openOrderParams: { asset_id: intent.tokenId } }, 'submit');
+    } catch (e) {
+      const event = {
+        timestamp: nowIso(),
+        type: 'LIVE_SUBMISSION_REFUSED',
+        decision: 'REFUSED',
+        reasons: ['OPEN_ORDERS_UNAVAILABLE'],
+        errors: [safeError(e)],
+        intent: redactIntent(intent),
+        safety: { submitted: false, signed: false, privateKeyAccessed: this.live.privateKeyAccessed },
+      };
+      this.logEvent(event);
+      return event;
+    }
+
+    const matchingOrder = findMatchingOpenOrder(openOrders, intent);
+    const cancelReplacePlan = buildCancelReplacePlan(this.config, intent, matchingOrder, evaluation.metadata);
+    if (cancelReplacePlan.skipDuplicate) {
+      const event = {
+        timestamp: nowIso(),
+        type: 'LIVE_ORDER_DUPLICATE_SKIPPED',
+        decision: 'SKIPPED_DUPLICATE',
+        reasons: ['DUPLICATE_LIVE_ORDER'],
+        intent: redactIntent(intent),
+        cancelReplacePlan,
+        safety: { submitted: false, signed: false, privateKeyAccessed: this.live.privateKeyAccessed },
+      };
+      this.logEvent(event);
+      return event;
+    }
+
+    if (matchingOrder && !cancelReplacePlan.wouldCancel) {
+      const event = {
+        timestamp: nowIso(),
+        type: 'LIVE_REPLACE_REFUSED',
+        decision: 'REFUSED',
+        reasons: [cancelReplacePlan.reason],
+        intent: redactIntent(intent),
+        cancelReplacePlan,
+        safety: { submitted: false, signed: false, privateKeyAccessed: this.live.privateKeyAccessed },
+      };
+      this.logEvent(event);
+      return event;
+    }
+
+    let cancelResponse = null;
+    if (cancelReplacePlan.wouldCancel) {
+      try {
+        cancelResponse = await this.live.cancelOrder(cancelReplacePlan.matchingExistingOrder.orderId, 'submit');
+      } catch (e) {
+        const event = {
+          timestamp: nowIso(),
+          type: 'LIVE_REPLACE_REFUSED',
+          decision: 'REFUSED',
+          reasons: ['CANCEL_FAILED'],
+          errors: [safeError(e)],
+          intent: redactIntent(intent),
+          cancelReplacePlan,
+          safety: { submitted: false, signed: false, privateKeyAccessed: this.live.privateKeyAccessed },
+        };
+        this.logEvent(event);
+        return event;
+      }
+    }
+
     const result = await this.live.signAndSubmit(intent, evaluation.metadata);
     const event = {
       timestamp: nowIso(),
       type: 'LIVE_ORDER_SUBMITTED',
       decision: 'SUBMITTED',
       intent: redactIntent(intent),
+      cancelReplacePlan,
+      cancelResponse,
       response: result.response,
       safety: {
         submitted: true,
@@ -527,19 +1121,21 @@ class LiveAdapter {
   }
 
   async cancel(orderId) {
-    if (!this.live.shouldLoadSecrets()) {
+    const allowed = this.live.secretAccessDecision('cancel');
+    if (!allowed.ok) {
       const event = {
         timestamp: nowIso(),
         type: 'LIVE_CANCEL_REFUSED',
         decision: 'REFUSED',
-        reasons: ['LIVE_NOT_FULLY_ENABLED'],
+        reasons: allowed.reasons,
         orderId,
+        submitted: false,
       };
       this.logEvent(event);
       return event;
     }
-    const response = await this.live.cancelOrder(orderId);
-    const event = { timestamp: nowIso(), type: 'LIVE_ORDER_CANCELLED', orderId, response };
+    const response = await this.live.cancelOrder(orderId, 'cancel');
+    const event = { timestamp: nowIso(), type: 'LIVE_ORDER_CANCELLED', orderId, response, submitted: true };
     this.logExecution(event);
     return event;
   }
@@ -558,18 +1154,183 @@ class LiveAdapter {
   }
 
   async reconcile() {
-    if (!this.live.shouldLoadSecrets()) {
-      return {
+    const allowed = this.live.secretAccessDecision('reconcile');
+    if (!allowed.ok) {
+      const event = {
         timestamp: nowIso(),
         type: 'LIVE_RECONCILE_REFUSED',
         decision: 'REFUSED',
-        reasons: ['LIVE_NOT_FULLY_ENABLED'],
-        note: 'Reconciliation requires authenticated CLOB access; live flags are not fully enabled.',
+        reasons: allowed.reasons,
+        walletAddress: redactWallet(process.env.POLYMARKET_PROXY_WALLET_ADDRESS || process.env.POLYMARKET_FUNDER_ADDRESS || process.env.DEPOSIT_WALLET_ADDRESS),
+        usdcBalance: null,
+        gasBalance: null,
+        openOrdersCount: 0,
+        openOrdersUsd: 0,
+        positionsCount: 0,
+        positionsUsd: 0,
+        lastReconciledAt: nowIso(),
+        submitted: false,
+        signed: false,
+      };
+      this.saveReconcileSnapshot(event);
+      this.logExecution(event);
+      return event;
+    }
+
+    let state;
+    try {
+      state = await this.live.reconcile();
+    } catch (e) {
+      state = {
+        timestamp: nowIso(),
+        walletAddress: null,
+        usdcBalance: null,
+        gasBalance: null,
+        openOrdersCount: 0,
+        openOrdersUsd: 0,
+        positionsCount: 0,
+        positionsUsd: 0,
+        lastReconciledAt: nowIso(),
+        errors: [safeError(e)],
       };
     }
-    const state = await this.live.reconcile();
-    const event = { timestamp: nowIso(), type: 'LIVE_RECONCILE', state };
+    const event = { ...state, type: state.errors?.length ? 'LIVE_RECONCILE_REFUSED' : 'LIVE_RECONCILE', decision: state.errors?.length ? 'REFUSED' : 'OK', submitted: false, signed: false };
+    this.saveReconcileSnapshot(event);
     this.logExecution(event);
+    return event;
+  }
+
+  async authCheck() {
+    const event = await this.live.authCheck();
+    this.logEvent(event);
+    return event;
+  }
+
+  async signingTest(rawIntent) {
+    const intent = normalizeIntent(rawIntent);
+    const metadataSafety = await evaluateMetadataSafety(null, intent, this.config);
+    const event = await this.live.signingTest(intent, metadataSafety.meta);
+    event.metadata = metadataSafety.meta;
+    event.metadataReasons = metadataSafety.reasons;
+    this.logEvent(event);
+    return event;
+  }
+
+  async metadataTest(rawIntent) {
+    const intent = normalizeIntent(rawIntent);
+    const metadataSafety = await evaluateMetadataSafety(null, intent, this.config);
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_METADATA_TEST',
+      decision: metadataSafety.ok ? 'OK' : 'REFUSED',
+      reasons: metadataSafety.reasons,
+      intent: redactIntent(intent),
+      metadata: metadataSafety.meta,
+      submitted: false,
+      signed: false,
+    };
+    this.logEvent(event);
+    return event;
+  }
+
+  lossGuardTest() {
+    const sample = normalizeIntent(readIntentFromArgs(this.baseDir, []));
+    const cases = [
+      { name: 'daily loss under limit', intent: { ...sample, currentDailyLivePnlUsd: -Math.abs(this.config.liveDailyMaxLossUsd) + 0.01 } },
+      { name: 'daily loss over limit', intent: { ...sample, currentDailyLivePnlUsd: -Math.abs(this.config.liveDailyMaxLossUsd) - 0.01 } },
+      { name: 'exposure under cap', intent: { ...sample, currentLiveExposureUsd: Math.max(0, this.config.maxLiveTotalExposureUsd - sample.sizeUsd - 0.01) } },
+      { name: 'exposure over cap', intent: { ...sample, currentLiveExposureUsd: this.config.maxLiveTotalExposureUsd } },
+      { name: 'order over cap', intent: { ...sample, sizeUsd: this.config.maxLiveOrderUsd + 0.01 } },
+    ].map((testCase) => {
+      const result = evaluateLossExposureGuards(this.config, testCase.intent);
+      return { name: testCase.name, allowedPastGuard: result.ok, reasons: result.reasons };
+    });
+
+    const event = { timestamp: nowIso(), type: 'LIVE_LOSS_GUARD_TEST', cases, submitted: false, signed: false };
+    this.logEvent(event);
+    return event;
+  }
+
+  burnInCheck(rawIntent = null) {
+    const stateBurnIn = burnInFromState(this.baseDir);
+    const intent = normalizeIntent(rawIntent || { ...readIntentFromArgs(this.baseDir, []), paperBurnIn: stateBurnIn });
+    const result = evaluateBurnIn(this.config, intent);
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_BURN_IN_CHECK',
+      decision: result.ok ? 'OK' : 'REFUSED',
+      reasons: result.reasons,
+      burnIn: intent.paperBurnIn,
+      source: result.source,
+      submitted: false,
+      signed: false,
+    };
+    this.logEvent(event);
+    return event;
+  }
+
+  async cancelReplaceTest(rawIntent, { dryRun = true } = {}) {
+    const intent = normalizeIntent(rawIntent);
+    const metadataSafety = await evaluateMetadataSafety(null, intent, this.config);
+    const existing = syntheticExistingOrder(intent, this.config);
+    const plan = buildCancelReplacePlan(this.config, intent, existing, metadataSafety.meta);
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_CANCEL_REPLACE_TEST',
+      decision: dryRun ? 'DRY_RUN_PLAN' : 'REFUSED',
+      reasons: dryRun ? [] : ['REAL_CANCEL_REPLACE_TEST_REQUIRES_MANUAL_REVIEW'],
+      dryRun,
+      plan,
+      submitted: false,
+      signed: false,
+    };
+    this.logEvent(event);
+    return event;
+  }
+
+  doctor() {
+    const cfg = this.config;
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_ADAPTER_DOCTOR',
+      baseDir: this.baseDir,
+      commands: [
+        'doctor',
+        'auth-check',
+        'signing-test',
+        'metadata-test',
+        'reconcile',
+        'loss-guard-test',
+        'cancel-replace-test --dry-run',
+        'burn-in-check',
+        'evaluate-sample',
+      ],
+      flags: {
+        enableLiveTrading: cfg.enableLiveTrading,
+        liveAutoExecute: cfg.liveAutoExecute,
+        liveKillSwitch: cfg.liveKillSwitch,
+        liveDryRunOnly: cfg.liveDryRunOnly,
+        liveSubmitConfirm: cfg.liveSubmitConfirm,
+        liveAuthCheckAllow: cfg.liveAuthCheckAllow,
+        liveSigningTestAllow: cfg.liveSigningTestAllow,
+        liveReconcileAllow: cfg.liveReconcileAllow,
+        liveCancelReplaceEnabled: cfg.liveCancelReplaceEnabled,
+        liveCancelStaleOrders: cfg.liveCancelStaleOrders,
+        liveCancelTestAllow: cfg.liveCancelTestAllow,
+        liveRequireBurnIn: cfg.liveRequireBurnIn,
+        liveWhaleCopyTrading: cfg.liveWhaleCopyTrading,
+        liveAllowOracleSniper: cfg.liveAllowOracleSniper,
+        maxLiveOrderUsd: cfg.maxLiveOrderUsd,
+        maxLiveTotalExposureUsd: cfg.maxLiveTotalExposureUsd,
+        liveDailyMaxLossUsd: cfg.liveDailyMaxLossUsd,
+        liveSecretsPath: cfg.liveSecretsPath,
+      },
+      canSubmitLive: this.live.canSubmitLive(),
+      secretsFilePresent: secretFileExists(cfg),
+      submitted: false,
+      signed: false,
+    };
+    this.logEvent(event);
     return event;
   }
 }
@@ -579,8 +1340,9 @@ function redactIntent(intent) {
     id: intent.id,
     timestamp: intent.timestamp,
     source: intent.source,
+    strategy: intent.strategy,
     route: intent.route,
-    tokenId: intent.tokenId,
+    tokenId: shortId(intent.tokenId, 10, 6),
     marketId: intent.marketId,
     side: intent.side,
     price: intent.price,
@@ -596,6 +1358,8 @@ function redactIntent(intent) {
     oracleSignal: intent.oracleSignal,
     bookFresh: intent.bookFresh,
     bookAgeMs: intent.bookAgeMs,
+    bestBid: Number.isFinite(intent.bestBid) ? intent.bestBid : null,
+    bestAsk: Number.isFinite(intent.bestAsk) ? intent.bestAsk : null,
     currentLiveExposureUsd: intent.currentLiveExposureUsd,
     currentDailyLivePnlUsd: intent.currentDailyLivePnlUsd,
     paperBurnIn: intent.paperBurnIn,
@@ -606,42 +1370,74 @@ function redactIntent(intent) {
 // CLI
 // -----------------------------
 async function main() {
-  const [, , command, arg1, arg2] = process.argv;
+  const [, , command, ...args] = process.argv;
+  const [arg1, arg2] = args;
   const baseDir = process.cwd();
   const adapter = new LiveAdapter({ baseDir });
 
   if (!command || ['help', '--help', '-h'].includes(command)) {
     console.log(`Usage:
   node live_adapter_polymarket.js doctor
+  node live_adapter_polymarket.js auth-check
+  node live_adapter_polymarket.js signing-test [--intent intent.json]
+  node live_adapter_polymarket.js metadata-test [--intent intent.json|--token-id TOKEN]
+  node live_adapter_polymarket.js reconcile
+  node live_adapter_polymarket.js loss-guard-test
+  node live_adapter_polymarket.js cancel-replace-test --dry-run [--intent intent.json]
+  node live_adapter_polymarket.js burn-in-check [--intent intent.json]
+  node live_adapter_polymarket.js evaluate-sample
   node live_adapter_polymarket.js dry-run <intent.json>
   node live_adapter_polymarket.js submit <intent.json>
   node live_adapter_polymarket.js cancel <orderId>
   node live_adapter_polymarket.js replace <orderId> <intent.json>
-  node live_adapter_polymarket.js reconcile
 `);
     return;
   }
 
   if (command === 'doctor') {
-    const cfg = adapter.config;
-    console.log(JSON.stringify({
-      timestamp: nowIso(),
-      type: 'LIVE_ADAPTER_DOCTOR',
-      baseDir,
-      flags: {
-        enableLiveTrading: cfg.enableLiveTrading,
-        liveAutoExecute: cfg.liveAutoExecute,
-        liveKillSwitch: cfg.liveKillSwitch,
-        liveDryRunOnly: cfg.liveDryRunOnly,
-        liveWhaleCopyTrading: cfg.liveWhaleCopyTrading,
-        liveAllowOracleSniper: cfg.liveAllowOracleSniper,
-        maxLiveOrderUsd: cfg.maxLiveOrderUsd,
-        maxLiveTotalExposureUsd: cfg.maxLiveTotalExposureUsd,
-        liveDailyMaxLossUsd: cfg.liveDailyMaxLossUsd,
-        liveSecretsPath: cfg.liveSecretsPath,
-      },
-      canInitializeLiveClient: adapter.live.shouldLoadSecrets(),
-    }, null, 2));
+    printStructured(adapter.doctor());
+    return;
+  }
+
+  if (command === 'auth-check') {
+    printStructured(await adapter.authCheck());
+    return;
+  }
+
+  if (command === 'signing-test') {
+    const intent = readIntentFromArgs(baseDir, args);
+    printStructured(await adapter.signingTest(intent));
+    return;
+  }
+
+  if (command === 'metadata-test') {
+    const intent = readIntentFromArgs(baseDir, args);
+    printStructured(await adapter.metadataTest(intent));
+    return;
+  }
+
+  if (command === 'loss-guard-test') {
+    printStructured(adapter.lossGuardTest());
+    return;
+  }
+
+  if (command === 'cancel-replace-test') {
+    const dryRun = args.includes('--dry-run');
+    const intent = readIntentFromArgs(baseDir, args);
+    printStructured(await adapter.cancelReplaceTest(intent, { dryRun }));
+    return;
+  }
+
+  if (command === 'burn-in-check') {
+    const opts = parseCliArgs(args);
+    const intent = opts.intent || opts.candidate || opts.file || opts._[0] ? readIntentFromArgs(baseDir, args) : null;
+    printStructured(adapter.burnInCheck(intent));
+    return;
+  }
+
+  if (command === 'evaluate-sample') {
+    const result = await adapter.handleIntent(readIntentFromArgs(baseDir, []), { mode: 'dry-run', fetchMetadata: false });
+    printStructured(result);
     return;
   }
 
@@ -674,7 +1470,7 @@ async function main() {
 
   if (command === 'reconcile') {
     const result = await adapter.reconcile();
-    console.log(JSON.stringify(result, null, 2));
+    printStructured(result);
     return;
   }
 
@@ -695,4 +1491,6 @@ module.exports = {
   normalizeIntent,
   evaluateStaticSafety,
   evaluateMetadataSafety,
+  evaluateBurnIn,
+  evaluateLossExposureGuards,
 };
