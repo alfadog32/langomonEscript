@@ -10,6 +10,7 @@
  * - Calls live_adapter_polymarket.js, which remains the final live safety gate.
  * - Defaults to dry-run mode unless LIVE_ROUTER_MODE=submit and live adapter flags are armed.
  * - Refuses blank-token, rejected, test/manual, blocked-strategy, oversized, stale, or duplicate candidates.
+ * - Logs duplicate candidates but does not Telegram-spam duplicate notices by default.
  *
  * Input file default:
  *   ./auto_live_candidates.ndjson
@@ -24,7 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const VERSION = '1.0.0';
+const VERSION = '1.2.0';
 
 function nowIso() { return new Date().toISOString(); }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
@@ -358,11 +359,12 @@ function evaluateRouterSafety(candidate, config) {
 }
 
 function loadState(config) {
-  const fallback = { version: VERSION, processed: {}, startedAt: nowIso() };
+  const fallback = { version: VERSION, processed: {}, duplicateNotified: {}, startedAt: nowIso() };
   const parsed = safeReadJson(config.statePath, fallback);
   return {
     version: parsed.version || VERSION,
     processed: parsed.processed || {},
+    duplicateNotified: parsed.duplicateNotified || {},
     startedAt: parsed.startedAt || nowIso(),
   };
 }
@@ -373,6 +375,13 @@ function saveState(config, state) {
     entries.sort((a, b) => String(b[1]?.timestamp || '').localeCompare(String(a[1]?.timestamp || '')));
     state.processed = Object.fromEntries(entries.slice(0, config.maxStateEntries));
   }
+
+  const duplicateEntries = Object.entries(state.duplicateNotified || {});
+  if (duplicateEntries.length > config.maxStateEntries) {
+    duplicateEntries.sort((a, b) => String(b[1]?.timestamp || '').localeCompare(String(a[1]?.timestamp || '')));
+    state.duplicateNotified = Object.fromEntries(duplicateEntries.slice(0, config.maxStateEntries));
+  }
+
   safeWriteJson(config.statePath, state);
 }
 
@@ -423,6 +432,7 @@ function readConfig(baseDir = process.cwd()) {
     allowedStrategies,
     blockedStrategies,
     telegramNotify: envBool('LIVE_ROUTER_TELEGRAM_NOTIFY', true),
+    notifyDuplicates: envBool('LIVE_ROUTER_NOTIFY_DUPLICATES', false),
     telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
     telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
   };
@@ -462,27 +472,50 @@ async function notifyTelegram(config, text) {
   }
 }
 
-function notificationHeadline(decision, reasons = []) {
-  const joined = reasons.join('|');
-  if (/KILL_SWITCH_ACTIVE/.test(joined)) return 'AUTO-LIVE REFUSED - KILL SWITCH ACTIVE';
-  if (/DAILY_MAX_LOSS_EXCEEDED/.test(joined)) return 'AUTO-LIVE REFUSED - DAILY LOSS HIT';
-  if (/BOOK_TOO_OLD|BOOK_NOT_FRESH/.test(joined)) return 'AUTO-LIVE REFUSED - BOOK TOO OLD';
-  if (/SOPHIE_SCORE_TOO_LOW|SOPHIE_APPROVAL_MISSING|SOPHIE_NOT_APPROVED/.test(joined)) return 'AUTO-LIVE REFUSED - SOPHIE SCORE TOO LOW';
-  if (decision === 'ROUTER_SKIPPED' || decision === 'REFUSED' || /REFUSED|DISABLED|MISSING|INVALID|TOO_LOW|TOO_OLD|EXCEEDED/.test(joined)) {
-    return 'AUTO-LIVE REFUSED';
+function decisionClass(decision, reasons = []) {
+  const d = String(decision || '').toUpperCase();
+  const r = (Array.isArray(reasons) ? reasons : []).map((x) => String(x || '').toUpperCase());
+
+  if (d === 'SUBMITTED' || d === 'LIVE_ORDER_SUBMITTED') {
+    return { title: 'AUTO-LIVE SUBMITTED', icon: '🟢', severity: 'submitted' };
   }
-  return 'AUTO-LIVE STATUS';
+
+  if (d === 'DRY_RUN_ALLOWED_BUT_NOT_SUBMITTED' || d === 'ALLOW_LIVE_SUBMISSION') {
+    return { title: 'AUTO-LIVE DRY RUN', icon: '🟢', severity: 'dry_run' };
+  }
+
+  if (d === 'DUPLICATE_BLOCKED' || r.some((x) => x.includes('DUPLICATE'))) {
+    return { title: 'DUPLICATE BLOCKED', icon: '🟦', severity: 'blocked' };
+  }
+
+  if (r.some((x) => x.includes('DAILY_MAX_LOSS'))) {
+    return { title: 'DAILY LOSS HIT', icon: '🔴', severity: 'danger' };
+  }
+
+  if (r.some((x) => x.includes('KILL_SWITCH'))) {
+    return { title: 'KILL SWITCH ACTIVE', icon: '🛑', severity: 'danger' };
+  }
+
+  if (r.some((x) => x.includes('BOOK_TOO_OLD') || x.includes('BOOK_NOT_FRESH'))) {
+    return { title: 'BOOK TOO OLD', icon: '🟠', severity: 'blocked' };
+  }
+
+  if (r.some((x) => x.includes('SOPHIE_SCORE') || x.includes('SOPHIE_APPROVAL') || x.includes('CONFIDENCE_TOO_LOW'))) {
+    return { title: 'SOPHIE SCORE TOO LOW', icon: '🟠', severity: 'blocked' };
+  }
+
+  if (d === 'REFUSED' || d === 'ROUTER_SKIPPED' || d.includes('REFUSED')) {
+    return { title: 'AUTO-LIVE REFUSED', icon: '🟡', severity: 'refused' };
+  }
+
+  return { title: 'LIVE ROUTER NOTICE', icon: '🔵', severity: 'info' };
 }
 
 function resultMessage(candidate, decision, reasons) {
-  const status = decision === 'SUBMITTED' || decision === 'ALLOW_LIVE_SUBMISSION' || decision === 'DRY_RUN_ALLOWED_BUT_NOT_SUBMITTED'
-    ? '🟢'
-    : decision === 'ROUTER_SKIPPED' || decision === 'REFUSED'
-      ? '🟡'
-      : '🔵';
+  const cls = decisionClass(decision, reasons);
 
   return [
-    `<b>${escapeHtml(notificationHeadline(decision, reasons || []))}</b>`,
+    `${cls.icon} <b>${escapeHtml(cls.title)}</b>`,
     `<b>Decision:</b> ${escapeHtml(decision)}`,
     `<b>Source:</b> ${escapeHtml(candidate.source)}`,
     `<b>Strategy:</b> ${escapeHtml(candidate.strategy)}`,
@@ -490,7 +523,9 @@ function resultMessage(candidate, decision, reasons) {
     `<b>Token:</b> <code>${escapeHtml(shortId(candidate.tokenId, 8, 6))}</code>`,
     Number.isFinite(candidate.price) ? `<b>Price:</b> $${candidate.price.toFixed(3)}` : null,
     Number.isFinite(candidate.sizeUsd) ? `<b>Size:</b> $${candidate.sizeUsd.toFixed(2)}` : null,
-    reasons && reasons.length ? `<b>Reasons:</b> ${escapeHtml(reasons.slice(0, 6).join(', '))}` : null,
+    Number.isFinite(candidate.confidence) ? `<b>Sophie/Confidence:</b> ${candidate.confidence.toFixed(3)}` : null,
+    candidate.route ? `<b>Route:</b> ${escapeHtml(candidate.route)}` : null,
+    reasons && reasons.length ? `<b>Reasons:</b> ${escapeHtml(reasons.slice(0, 8).join(', '))}` : null,
     `<code>${escapeHtml(candidate.candidateId)}</code>`,
   ].filter(Boolean).join('\n');
 }
@@ -507,7 +542,35 @@ async function processCandidate(config, state, adapter, item) {
 
   const candidate = normalizeCandidate(item.raw, item.filePath);
   const uniqueKey = `${candidate.candidateId}:${candidate.rawHash}`;
-  if (state.processed[uniqueKey]) return { processed: false, skipped: true, duplicate: true };
+  if (state.processed[uniqueKey]) {
+    state.duplicateNotified = state.duplicateNotified || {};
+    if (!state.duplicateNotified[uniqueKey]) {
+      const reasons = ['DUPLICATE_CANDIDATE_ALREADY_PROCESSED'];
+      const event = {
+        timestamp: nowIso(),
+        type: 'LIVE_ROUTER_DUPLICATE_BLOCKED',
+        decision: 'DUPLICATE_BLOCKED',
+        candidate_id: candidate.candidateId,
+        raw_hash: candidate.rawHash,
+        source: candidate.source,
+        strategy: candidate.strategy,
+        token_id: candidate.tokenId,
+        side: candidate.side,
+        price: candidate.price,
+        size_usd: candidate.sizeUsd,
+        reasons,
+      };
+      appendNdjson(config.eventsPath, event);
+      state.duplicateNotified[uniqueKey] = { timestamp: nowIso(), decision: event.decision, reasons };
+      saveState(config, state);
+      if (config.notifyDuplicates) {
+        await notifyTelegram(config, resultMessage(candidate, event.decision, reasons)).catch((e) => {
+          appendNdjson(config.eventsPath, { timestamp: nowIso(), type: 'LIVE_ROUTER_TELEGRAM_NOTIFY_FAILED', error: e.message, candidate_id: candidate.candidateId });
+        });
+      }
+    }
+    return { processed: false, skipped: true, duplicate: true };
+  }
 
   const routerSafety = evaluateRouterSafety(candidate, config);
   if (!routerSafety.ok) {
@@ -604,6 +667,7 @@ async function doctor(config) {
   console.log(`[live-router] blockedStrategies=${[...config.blockedStrategies].join(',')}`);
   console.log(`[live-router] allowOracleSignals=${config.allowOracleSignals}`);
   console.log(`[live-router] telegramNotify=${config.telegramNotify && Boolean(config.telegramBotToken) && Boolean(config.telegramChatId)}`);
+  console.log(`[live-router] notifyDuplicates=${config.notifyDuplicates}`);
 
   const errors = validateConfig(config);
   if (errors.length) {
@@ -696,4 +760,5 @@ module.exports = {
   normalizeCandidate,
   evaluateRouterSafety,
   toLiveAdapterIntent,
+  decisionClass,
 };

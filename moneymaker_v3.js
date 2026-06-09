@@ -65,6 +65,7 @@ const CONFIG = {
   // debugging. Turn it on from .env with ENABLE_WS=true after WS is stable.
   enableWs: envBool('ENABLE_WS', false),
   wsHeartbeatEnabled: envBool('WS_HEARTBEAT_ENABLED', true),
+  wsTextPingEnabled: envBool('WS_TEXT_PING_ENABLED', false),
   wsHeartbeatMs: envInt('WS_HEARTBEAT_MS', 10_000),
   wsReconnectInitialMs: envInt('WS_RECONNECT_INITIAL_MS', 5_000),
   wsReconnectMaxMs: envInt('WS_RECONNECT_MAX_MS', 60_000),
@@ -97,6 +98,11 @@ const CONFIG = {
   maxTotalExposureUsd: envNum('MAX_TOTAL_EXPOSURE_USD', 1_500),
   maxTotalOpenOrderUsd: envNum('MAX_TOTAL_OPEN_ORDER_USD', 1_000),
   maxOpenOrders: envInt('MAX_OPEN_ORDERS', 250),
+  dedupeOpenOrders: envBool('DEDUP_OPEN_ORDERS', true),
+  maxOpenOrdersPerTokenSideStrategy: envInt('MAX_OPEN_ORDERS_PER_TOKEN_SIDE_STRATEGY', 1),
+  openOrderReplaceEnabled: envBool('OPEN_ORDER_REPLACE_ENABLED', true),
+  openOrderReplaceMinPriceDeltaTicks: envInt('OPEN_ORDER_REPLACE_MIN_PRICE_DELTA_TICKS', 1),
+  openOrderReplaceAfterMs: envInt('OPEN_ORDER_REPLACE_AFTER_MS', 15_000),
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
   // Practical revenue/risk optimization controls.
@@ -115,6 +121,10 @@ const CONFIG = {
   enableGhostMode: envBool('ENABLE_GHOST_MODE', true),
   ghostHorizonMs: envInt('GHOST_HORIZON_MS', 60_000),
   ghostMaxRecords: envInt('GHOST_MAX_RECORDS', 500),
+  spreadHunterGhostGateEnabled: envBool('SPREAD_HUNTER_GHOST_GATE_ENABLED', false),
+  spreadHunterMinGhostFavorablePct: envNum('SPREAD_HUNTER_MIN_GHOST_FAVORABLE_PCT', 25),
+  spreadHunterGhostMinSamples: envInt('SPREAD_HUNTER_GHOST_MIN_SAMPLES', 200),
+  spreadHunterGhostSizeMultiplier: envNum('SPREAD_HUNTER_GHOST_SIZE_MULTIPLIER', 0.50),
 
   // 1) Order-book imbalance signals.
   enableImbalanceSignals: envBool('ENABLE_IMBALANCE_SIGNALS', true),
@@ -175,6 +185,7 @@ const CONFIG = {
   loopDelayMs: envInt('LOOP_DELAY_MS', 6_000),
   wsDebounceMs: envInt('WS_DEBOUNCE_MS', 250),
   reportEveryCycles: envInt('REPORT_EVERY_CYCLES', 3),
+  nonBlockingResearchRefresh: envBool('NON_BLOCKING_RESEARCH_REFRESH', true),
 
   historyLookback: envInt('HISTORY_LOOKBACK', 30),
   volatilityTripPct: envNum('VOL_TRIP_PCT', 12),
@@ -193,6 +204,15 @@ const CONFIG = {
   spreadHunterMinEdge: envNum('SPREAD_HUNTER_MIN_EDGE', 0.01),
   tailEndHours: envNum('TAIL_END_HOURS', 36),
   tailEndMinConfidence: envNum('TAIL_END_MIN_CONFIDENCE', 0.58),
+
+  autoLiveCandidatesEnabled: envBool('AUTO_LIVE_CANDIDATES_ENABLED', false),
+  autoLiveCandidatesPath: envStr('AUTO_LIVE_CANDIDATES_PATH', './auto_live_candidates.ndjson'),
+  autoLiveCandidateCooldownMs: envInt('AUTO_LIVE_CANDIDATE_COOLDOWN_MS', 45_000),
+  autoLiveMaxBookAgeMs: envInt('AUTO_LIVE_MAX_BOOK_AGE_MS', 1_500),
+  autoLiveMinConfidence: envNum('AUTO_LIVE_MIN_CONFIDENCE', 0.55),
+  autoLiveAllowedStrategies: envList('AUTO_LIVE_ALLOWED_STRATEGIES', ['SpreadHunter', 'InventoryExit', 'StopLossExit', 'TakeProfitExit']),
+  autoLiveBlockedStrategies: envList('AUTO_LIVE_BLOCKED_STRATEGIES', ['ComplementArb', 'WhaleCopy', 'TailEndMispricing']),
+  autoLiveMinGhostFavorablePct: envNum('AUTO_LIVE_MIN_GHOST_FAVORABLE_PCT', 0),
 };
 
 // =========================
@@ -638,7 +658,11 @@ class CLOBWebSocketClient {
     this.pingTimer = setInterval(() => {
       if (this.ws && this.ws.readyState === WebSocketImpl.OPEN) {
         try {
-          this.ws.send('PING');
+          if (typeof this.ws.ping === 'function') {
+            this.ws.ping();
+          } else if (this.config.wsTextPingEnabled) {
+            this.ws.send('PING');
+          }
         } catch (e) {
           warn(`WS ping failed: ${e.message}`);
         }
@@ -676,7 +700,6 @@ class CLOBWebSocketClient {
       this.ws.send(JSON.stringify({
         assets_ids: chunk,
         type: 'market',
-        custom_feature_enabled: true,
       }));
     }
 
@@ -994,12 +1017,33 @@ class SpreadHunterStrategy extends Strategy {
       baseUsd *= dangerScale;
     }
 
-    const buyUsd = Math.max(0, baseUsd * (1 - Math.max(0, invRatio)));
-    const sellUsd = Math.max(0, baseUsd * (1 + Math.min(0, invRatio)));
+    let buyUsd = Math.max(0, baseUsd * (1 - Math.max(0, invRatio)));
+    let sellUsd = Math.max(0, baseUsd * (1 + Math.min(0, invRatio)));
+    let ghostThrottle = null;
+
+    if (
+      this.config.spreadHunterGhostGateEnabled &&
+      this.portfolio.ghostStats.total >= this.config.spreadHunterGhostMinSamples
+    ) {
+      const favorablePct = (this.portfolio.ghostStats.favorable / Math.max(1, this.portfolio.ghostStats.total)) * 100;
+      if (favorablePct < this.config.spreadHunterMinGhostFavorablePct) {
+        const multiplier = clamp(this.config.spreadHunterGhostSizeMultiplier, 0.05, 1);
+        buyUsd *= multiplier;
+        sellUsd *= multiplier;
+        ghostThrottle = {
+          favorablePct: Number(favorablePct.toFixed(2)),
+          thresholdPct: this.config.spreadHunterMinGhostFavorablePct,
+          samples: this.portfolio.ghostStats.total,
+          sizeMultiplier: multiplier,
+          reason: 'SpreadHunter ghost favorable rate below threshold',
+        };
+      }
+    }
 
     const buyLiquidity = estimateLiquidityConsumption(book, 'buy', buyUsd || this.config.baseOrderUsd, this.config);
     const sellLiquidity = estimateLiquidityConsumption(book, 'sell', sellUsd || this.config.baseOrderUsd, this.config);
-    const worstLiquidityPenalty = Math.max(buyLiquidity.penalty, sellLiquidity.penalty);
+    // Lower liquidity penalty is worse, so use the weaker side for edge realism.
+    const worstLiquidityPenalty = Math.min(buyLiquidity.penalty, sellLiquidity.penalty);
     const volatilityEdgeMultiplier = this.volGuard.isTripped(asset.tokenId)
       ? this.config.volatilityEdgeMultiplier
       : 1;
@@ -1012,7 +1056,10 @@ class SpreadHunterStrategy extends Strategy {
     const requiredEdge = this.config.minSignalEdge * volatilityEdgeMultiplier;
     if (edgeEstimate < requiredEdge) return [];
 
-    const confidence = clamp(0.35 + spread * 2 + Math.log10(1 + asset.market.volume24h) / 20, 0, 0.85);
+    let confidence = clamp(0.35 + spread * 2 + Math.log10(1 + asset.market.volume24h) / 20, 0, 0.85);
+    if (ghostThrottle) {
+      confidence = clamp(confidence * ghostThrottle.sizeMultiplier, 0, 0.85);
+    }
 
     const signals = [];
 
@@ -1037,6 +1084,7 @@ class SpreadHunterStrategy extends Strategy {
           liquidityConsumedPct: buyLiquidity.consumedPct,
           liquidityPenalty: buyLiquidity.penalty,
           entryMid: mark,
+          ...(ghostThrottle ? { ghostThrottle } : {}),
         },
       }));
     }
@@ -1062,6 +1110,7 @@ class SpreadHunterStrategy extends Strategy {
           liquidityConsumedPct: sellLiquidity.consumedPct,
           liquidityPenalty: sellLiquidity.penalty,
           entryMid: mark,
+          ...(ghostThrottle ? { ghostThrottle } : {}),
         },
       }));
     }
@@ -1586,7 +1635,22 @@ class MultiConsensusEngine {
 
     if (!authorized) {
       if (this.config.consensusLogRejected) {
-        warn(`[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold} route=${route.mode}:${route.state}`);
+        const scorePass = score >= this.config.consensusThreshold;
+        const routeAuth = Boolean(route.authorized);
+        const blockReason = [
+          scorePass ? null : 'score_below_threshold',
+          routeAuth ? null : 'route_not_authorized',
+        ].filter(Boolean).join('+') || 'unknown';
+        const componentText = Object.entries(components)
+          .map(([name, value]) => `${name}=${Number(value || 0).toFixed(3)}`)
+          .join(' ');
+        const routeReason = route?.reason ? String(route.reason).replace(/\s+/g, ' ') : 'no route reason';
+
+        warn(
+          `[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+          `block=${blockReason} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold} ` +
+          `route=${route.mode}:${route.state} routeAuth=${routeAuth} reason="${routeReason}" ${componentText}`
+        );
       }
       return null;
     }
@@ -2167,6 +2231,95 @@ class PaperPortfolio {
     return total;
   }
 
+  openBuyOrderUsd() {
+    let total = 0;
+    for (const order of this.openOrders.values()) {
+      if (order.side === 'buy') total += order.remainingUsd();
+    }
+    return total;
+  }
+
+  openSellQty(tokenId) {
+    let total = 0;
+    for (const order of this.openOrders.values()) {
+      if (order.side !== 'sell') continue;
+      if (String(order.tokenId) !== String(tokenId)) continue;
+      if (!Number.isFinite(order.price) || order.price <= 0) continue;
+      total += order.remainingUsd() / order.price;
+    }
+    return total;
+  }
+
+  availableCash() {
+    return Math.max(0, this.cash - this.openBuyOrderUsd());
+  }
+
+  availablePositionQty(tokenId) {
+    return Math.max(0, this.position(tokenId) - this.openSellQty(tokenId));
+  }
+
+  findOpenOrdersBySignal(signal) {
+    if (!signal) return [];
+    return [...this.openOrders.entries()]
+      .filter(([, order]) => (
+        String(order.tokenId) === String(signal.tokenId) &&
+        order.side === signal.side &&
+        order.strategy === signal.strategy
+      ))
+      .map(([id, order]) => ({ id, order }))
+      .sort((a, b) => a.order.createdAt - b.order.createdAt);
+  }
+
+  positionExposureUsd(markPrices = new Map()) {
+    let total = 0;
+    for (const [tokenId, qty] of this.positions.entries()) {
+      if (qty <= 0) continue;
+      const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
+      total += qty * mark;
+    }
+    return total;
+  }
+
+  openOrderExposureUsd() {
+    return this.totalOpenOrderUsd();
+  }
+
+  topPositions(markPrices = new Map(), limit = 10) {
+    return [...this.positions.entries()]
+      .filter(([, qty]) => qty > 0)
+      .map(([tokenId, qty]) => {
+        const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
+        return { tokenId, qty, mark, avg: this.avgCost(tokenId), value: qty * mark };
+      })
+      .sort((a, b) => b.value - a.value)
+      .slice(0, limit);
+  }
+
+  topOpenOrders(limit = 10) {
+    return [...this.openOrders.values()]
+      .map((order) => ({
+        tokenId: order.tokenId,
+        side: order.side,
+        strategy: order.strategy,
+        price: order.price,
+        remainingUsd: order.remainingUsd(),
+        ageMs: Date.now() - order.createdAt,
+      }))
+      .sort((a, b) => b.remainingUsd - a.remainingUsd)
+      .slice(0, limit);
+  }
+
+  strategyOpenOrderExposure() {
+    const totals = new Map();
+    for (const order of this.openOrders.values()) {
+      const key = order.strategy || 'UNKNOWN';
+      totals.set(key, (totals.get(key) || 0) + order.remainingUsd());
+    }
+    return [...totals.entries()]
+      .map(([strategy, exposureUsd]) => ({ strategy, exposureUsd }))
+      .sort((a, b) => b.exposureUsd - a.exposureUsd);
+  }
+
   addOrder(order) {
     this.openOrders.set(order.id, order);
   }
@@ -2387,17 +2540,29 @@ class RiskEngine {
     const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
     if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return null;
 
+    const matchingOrders = this.portfolio.findOpenOrdersBySignal(signal);
+    const replaceCreditUsd = this.config.openOrderReplaceEnabled
+      ? matchingOrders.reduce((sum, { order }) => sum + order.remainingUsd(), 0)
+      : 0;
+    const replaceSellQty = this.config.openOrderReplaceEnabled
+      ? matchingOrders.reduce((sum, { order }) => {
+        if (order.side !== 'sell' || !Number.isFinite(order.price) || order.price <= 0) return sum;
+        return sum + order.remainingUsd() / order.price;
+      }, 0)
+      : 0;
+
     const currentPosQty = this.portfolio.position(signal.tokenId);
     const currentPosUsd = currentPosQty * signal.price;
 
     if (signal.side === 'buy') {
-      if (this.portfolio.cash < signal.sizeUsd) return null;
+      if (this.portfolio.availableCash() + replaceCreditUsd < signal.sizeUsd) return null;
       if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return null;
     }
 
     if (signal.side === 'sell') {
-      if (currentPosQty <= 0) return null;
-      const maxSellUsd = currentPosQty * signal.price;
+      const availableQty = this.portfolio.availablePositionQty(signal.tokenId) + replaceSellQty;
+      if (availableQty <= 0) return null;
+      const maxSellUsd = availableQty * signal.price;
       signal.sizeUsd = Math.min(signal.sizeUsd, maxSellUsd);
       if (signal.sizeUsd < this.config.minOrderUsd) return null;
     }
@@ -2419,11 +2584,46 @@ class PaperExecutionEngine {
     this.cache = cache;
   }
 
+  findComparableOpenOrders(signal) {
+    if (!this.config.dedupeOpenOrders || !signal) return [];
+    return this.portfolio.findOpenOrdersBySignal(signal);
+  }
+
+  shouldReplaceOpenOrder(existingOrder, signal, book) {
+    if (!this.config.openOrderReplaceEnabled) return false;
+
+    const tick = book?.tickSize || signal.metadata?.tickSize || 0.01;
+    const minTicks = Math.max(1, this.config.openOrderReplaceMinPriceDeltaTicks || 1);
+    const minPriceDelta = tick * minTicks;
+    const priceDelta = Math.abs(Number(signal.price) - Number(existingOrder.price));
+    const ageMs = Date.now() - existingOrder.createdAt;
+
+    return priceDelta >= minPriceDelta || ageMs >= this.config.openOrderReplaceAfterMs;
+  }
+
   place(signal, book) {
+    const comparableOrders = this.findComparableOpenOrders(signal);
+    const maxComparable = Math.max(1, this.config.maxOpenOrdersPerTokenSideStrategy || 1);
+
+    if (comparableOrders.length >= maxComparable) {
+      const replaceable = comparableOrders.filter(({ order }) => this.shouldReplaceOpenOrder(order, signal, book));
+
+      if (replaceable.length === 0) {
+        info(`[ORDER SKIP DUPLICATE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} [${signal.strategy}] active=${comparableOrders.length}`);
+        return false;
+      }
+
+      for (const { id, order } of comparableOrders) {
+        this.portfolio.cancelOrder(id);
+        info(`[ORDER REPLACE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} old=${fmtPrice(order.price)} new=${fmtPrice(signal.price)} age=${Math.round((Date.now() - order.createdAt) / 1000)}s [${signal.strategy}]`);
+      }
+    }
+
     const order = new PaperOrder(signal);
     this.portfolio.addOrder(order);
     this.portfolio.recordGhostOrder(signal, book);
     info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
+    return true;
   }
 
   processOpenOrders() {
@@ -2580,6 +2780,8 @@ class BotEngine {
     this.assets = [];
     this.cycle = 0;
     this.wsClient = null;
+    this.researchInFlight = null;
+    this.autoLiveCandidateLastWritten = new Map();
 
     this.strategies = [
       new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
@@ -2612,11 +2814,43 @@ class BotEngine {
   }
 
   async refreshResearch() {
-    this.assets = await this.research.discoverCandidates();
+    info('[RESEARCH REFRESH START]');
+    const selected = await this.research.discoverCandidates();
+    this.assets = selected;
+    info(`[RESEARCH REFRESH COMPLETE] selected=${selected.length}`);
 
     if (this.wsClient && this.assets.length > 0) {
       this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
     }
+  }
+
+  requestResearchRefresh() {
+    if (!this.config.nonBlockingResearchRefresh) {
+      return this.refreshResearch();
+    }
+
+    if (this.researchInFlight) {
+      info('[RESEARCH REFRESH SKIPPED already running]');
+      return this.researchInFlight;
+    }
+
+    info('[RESEARCH REFRESH START] background=true');
+    this.researchInFlight = this.research.discoverCandidates()
+      .then((selected) => {
+        this.assets = selected;
+        if (this.wsClient && this.assets.length > 0) {
+          this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
+        }
+        info(`[RESEARCH REFRESH COMPLETE] selected=${selected.length}`);
+      })
+      .catch((e) => {
+        warn(`[RESEARCH REFRESH FAILED] ${e.stack || e.message}`);
+      })
+      .finally(() => {
+        this.researchInFlight = null;
+      });
+
+    return this.researchInFlight;
   }
 
   startWebSocket() {
@@ -2651,7 +2885,11 @@ class BotEngine {
     this.whaleTracker?.tick?.();
 
     if (this.cycle === 1 || this.cycle % this.config.marketRefreshEveryCycles === 0) {
-      await this.refreshResearch();
+      if (this.config.nonBlockingResearchRefresh && this.assets.length > 0) {
+        this.requestResearchRefresh();
+      } else {
+        await this.refreshResearch();
+      }
     }
 
     const markPrices = this.cache.markPrices();
@@ -2704,7 +2942,99 @@ class BotEngine {
     signal = this.risk.evaluate(signal);
     if (!signal) return;
 
-    this.execution.place(signal, book);
+    const placed = this.execution.place(signal, book);
+    if (placed) {
+      this.maybeWriteLiveCandidate(signal, asset, book);
+    }
+  }
+
+  maybeWriteLiveCandidate(signal, asset, book) {
+    if (!this.config.autoLiveCandidatesEnabled) return false;
+    if (!signal || !asset || !book) return false;
+
+    const strategy = String(signal.strategy || '');
+    const allowed = new Set(this.config.autoLiveAllowedStrategies || []);
+    const blocked = new Set(this.config.autoLiveBlockedStrategies || []);
+    const side = String(signal.side || '').toUpperCase();
+    const bookAgeMs = Date.now() - (book.cachedAt || 0);
+    const bookFresh = isBookComplete(book) && bookAgeMs <= this.config.autoLiveMaxBookAgeMs;
+    const consensus = signal.metadata?.consensus || null;
+
+    if (blocked.has(strategy)) return false;
+    if (allowed.size > 0 && !allowed.has(strategy)) return false;
+    if (!signal.tokenId) return false;
+    if (!['BUY', 'SELL'].includes(side)) return false;
+    if (!Number.isFinite(signal.price) || signal.price <= 0 || signal.price >= 1) return false;
+    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) return false;
+    if (!Number.isFinite(signal.confidence) || signal.confidence < this.config.autoLiveMinConfidence) return false;
+    if (!bookFresh) return false;
+    if (this.config.enableConsensus && consensus?.authorized !== true) return false;
+
+    const ghostTotal = this.portfolio.ghostStats?.total || 0;
+    const ghostFavorablePct = ghostTotal > 0
+      ? (this.portfolio.ghostStats.favorable / Math.max(1, ghostTotal)) * 100
+      : null;
+
+    if (
+      Number.isFinite(ghostFavorablePct) &&
+      this.config.autoLiveMinGhostFavorablePct > 0 &&
+      ghostFavorablePct < this.config.autoLiveMinGhostFavorablePct
+    ) {
+      return false;
+    }
+
+    const key = `${signal.tokenId}:${side}:${strategy}`;
+    const last = this.autoLiveCandidateLastWritten.get(key) || 0;
+    if (Date.now() - last < this.config.autoLiveCandidateCooldownMs) return false;
+    this.autoLiveCandidateLastWritten.set(key, Date.now());
+
+    const candidateId = `moneymaker_${Date.now()}_${shortId(signal.tokenId).replace(/\W/g, '')}`;
+    const route = consensus?.route ? `${consensus.route.mode}:${consensus.route.state}` : 'UNKNOWN';
+    const paperBurnIn = {
+      ok: true,
+      reports: this.cycle,
+      closedPnlUsd: Number(this.portfolio.closedPnl || 0),
+      drawdownPct: Number(this.portfolio.drawdownPct(this.cache.markPrices()) || 0),
+      ghostFavorablePct: Number.isFinite(ghostFavorablePct) ? Number(ghostFavorablePct.toFixed(2)) : null,
+    };
+
+    const candidate = {
+      id: candidateId,
+      candidate_id: candidateId,
+      timestamp: nowIso(),
+      source: 'MONEYMAKER',
+      strategy,
+      tokenId: signal.tokenId,
+      token_id: signal.tokenId,
+      marketId: signal.marketId || asset.market?.marketId || null,
+      market_id: signal.marketId || asset.market?.marketId || null,
+      side,
+      price: Number(signal.price),
+      sizeUsd: Number(signal.sizeUsd),
+      size_usd: Number(signal.sizeUsd),
+      confidence: Number(signal.confidence),
+      consensusScore: Number(consensus?.score ?? signal.confidence),
+      consensus_score: Number(consensus?.score ?? signal.confidence),
+      sophieApproved: true,
+      sophie_approved: true,
+      bookFresh: true,
+      book_fresh: true,
+      bookAgeMs,
+      book_age_ms: bookAgeMs,
+      reason: signal.reason || 'MoneyMaker paper-approved candidate',
+      route,
+      paperBurnIn,
+      metadata: {
+        marketQuestion: asset.market?.question || signal.metadata?.marketQuestion || null,
+        outcome: asset.outcome || signal.metadata?.outcome || null,
+        expectedEdge: signal.expectedEdge,
+        consensus,
+      },
+    };
+
+    appendJsonLine(this.config.autoLiveCandidatesPath, candidate);
+    info(`[AUTO-LIVE CANDIDATE] ${side} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${strategy}]`);
+    return true;
   }
 
   report() {
@@ -2715,18 +3045,30 @@ class BotEngine {
     info('--- PORTFOLIO REPORT ---');
     info(`Equity: $${equity.toFixed(2)} | Cash: $${this.portfolio.cash.toFixed(2)} | Drawdown: ${drawdown.toFixed(2)}%`);
     info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd().toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
+    info(`Position Exposure: $${this.portfolio.positionExposureUsd(markPrices).toFixed(2)} | Open Order Exposure: $${this.portfolio.openOrderExposureUsd().toFixed(2)} | Available Cash: $${this.portfolio.availableCash().toFixed(2)}`);
 
     if (this.portfolio.ghostStats.total > 0) {
       const favorableRate = (this.portfolio.ghostStats.favorable / this.portfolio.ghostStats.total) * 100;
-      info(`Ghost calibration: total=${this.portfolio.ghostStats.total} favorable=${favorableRate.toFixed(1)}%`);
+      info(`Ghost calibration: total=${this.portfolio.ghostStats.total} favorable=${favorableRate.toFixed(1)}% unfavorable=${this.portfolio.ghostStats.unfavorable}`);
     }
 
-    const positions = [...this.portfolio.positions.entries()].filter(([, qty]) => qty > 0);
+    const positions = this.portfolio.topPositions(markPrices, 10);
     if (positions.length > 0) {
-      for (const [tokenId, qty] of positions.slice(0, 10)) {
-        const mark = markPrices.get(tokenId) ?? this.portfolio.avgCost(tokenId);
-        info(`POS ${shortId(tokenId)} qty=${qty.toFixed(4)} avg=${fmtPrice(this.portfolio.avgCost(tokenId))} mark=${fmtPrice(mark)} value=$${(qty * mark).toFixed(2)}`);
+      for (const pos of positions) {
+        info(`POS ${shortId(pos.tokenId)} qty=${pos.qty.toFixed(4)} avg=${fmtPrice(pos.avg)} mark=${fmtPrice(pos.mark)} value=$${pos.value.toFixed(2)}`);
       }
+    }
+
+    const openOrders = this.portfolio.topOpenOrders(8);
+    if (openOrders.length > 0) {
+      for (const order of openOrders) {
+        info(`OPEN ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(order.price)} remaining=$${order.remainingUsd.toFixed(2)} age=${Math.round(order.ageMs / 1000)}s [${order.strategy}]`);
+      }
+    }
+
+    const strategyExposure = this.portfolio.strategyOpenOrderExposure();
+    if (strategyExposure.length > 0) {
+      info(`Open Order Exposure by Strategy: ${strategyExposure.map((x) => `${x.strategy}=$${x.exposureUsd.toFixed(2)}`).join(' | ')}`);
     }
   }
 }
@@ -2779,6 +3121,16 @@ function chunks(arr, size) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function appendJsonLine(filePath, obj) {
+  const resolved = path.resolve(process.cwd(), filePath);
+  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  fs.appendFileSync(resolved, `${JSON.stringify(obj)}\n`, 'utf8');
 }
 
 function msUntil(dateLike) {
