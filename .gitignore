@@ -1,32 +1,10 @@
 .env
-.env.save
-.env.bak.*
-.env.live.secrets
-moneymaker_v3_state.json
-live_order_intents.ndjson
-live_execution_events.ndjson
-live_adapter_events.ndjson
-auto_live_candidates.ndjson
-LIVE_PREP_BASELINE.sha256
-node_modules/
-
-# Runtime/local trading state
-.env
 .env.*
+!.env.example
+!.env.live.secrets.example
 .env.live.secrets
-*.ndjson
-*_state.json
-moneymaker_v3_state.json
-btc_oracle_market_target.json
-external_signals.json
-archived_nested_langomonEscript_*/
-*.bak-*
+telegram/.env.telegram
 
-# Nested/archived duplicate project folders
-/langomonEscript/
-/archived_nested_langomonEscript_*/
-
-# Runtime files
 *.ndjson
 *_state.json
 moneymaker_v3_state.json
@@ -37,12 +15,7 @@ live_adapter_events.ndjson
 live_execution_events.ndjson
 live_order_intents.ndjson
 
-# Secrets
-.env
-.env.*
-!.env.example
-!.env.live.secrets.example
-telegram/.env.telegram
-
-# Backups
+/langomonEscript/
+/archived_nested_langomonEscript_*/
 *.bak*
+node_modules/
