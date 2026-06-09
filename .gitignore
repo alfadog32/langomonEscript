@@ -6,5 +6,6 @@ moneymaker_v3_state.json
 live_order_intents.ndjson
 live_execution_events.ndjson
 live_adapter_events.ndjson
+auto_live_candidates.ndjson
 LIVE_PREP_BASELINE.sha256
 node_modules/
