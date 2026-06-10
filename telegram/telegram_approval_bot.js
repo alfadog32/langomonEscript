@@ -346,8 +346,10 @@ function scanIntentFiles(config, state) {
 }
 
 function readConfig(baseDir) {
+  loadEnvFile(path.join(baseDir, '.env'));
   loadEnvFile(path.join(baseDir, '.env.telegram'));
-  const watchPaths = (process.env.TELEGRAM_APPROVAL_WATCH_PATHS || [process.env.TRADE_INTENTS_PATH || './trade_intents.ndjson', './external_signal_events.ndjson', './sniper_route_requests.ndjson'].join(','))
+  loadEnvFile(path.join(baseDir, 'telegram', '.env.telegram'));
+  const watchPaths = (process.env.TELEGRAM_APPROVAL_WATCH_PATHS || [process.env.TRADE_INTENTS_PATH || './trade_intents.ndjson', './sniper_route_requests.ndjson', './auto_live_candidates.ndjson'].join(','))
     .split(',').map(s => s.trim()).filter(Boolean);
   return {
     baseDir,
@@ -361,7 +363,8 @@ function readConfig(baseDir) {
     pollMs: num(process.env.TELEGRAM_APPROVAL_FILE_POLL_MS, 3000),
     requireTokenId: boolish(process.env.TELEGRAM_APPROVAL_REQUIRE_TOKEN_ID, false),
     alertAll: boolish(process.env.TELEGRAM_APPROVAL_ALERT_ALL, false),
-    maxBurst: Math.max(1, num(process.env.TELEGRAM_APPROVAL_MAX_BURST, 5))
+    maxBurst: Math.max(1, num(process.env.TELEGRAM_APPROVAL_MAX_BURST, 5)),
+    testMessageAllowed: boolish(process.env.TELEGRAM_TEST_ALLOW, false)
   };
 }
 
@@ -374,20 +377,84 @@ function validateConfig(config) {
   return errors;
 }
 
+function redactPresence(value) {
+  return value ? '[REDACTED]' : '';
+}
+
+function fileStatus(baseDir, filePath) {
+  const abs = path.resolve(baseDir, filePath);
+  let sizeBytes = null;
+  let modifiedAt = null;
+  try {
+    if (fs.existsSync(abs)) {
+      const stat = fs.statSync(abs);
+      sizeBytes = stat.size;
+      modifiedAt = stat.mtime.toISOString();
+    }
+  } catch {
+    // Keep doctor output PM2-friendly even when a path is inaccessible.
+  }
+  return {
+    path: filePath,
+    absolutePath: abs,
+    exists: fs.existsSync(abs),
+    sizeBytes,
+    modifiedAt
+  };
+}
+
+function stateSummary(config) {
+  if (!fs.existsSync(config.statePath)) {
+    return {
+      exists: false,
+      lastUpdateId: null,
+      sentCount: 0,
+      pendingCallbacks: 0
+    };
+  }
+  const state = loadState(config);
+  return {
+    exists: true,
+    lastUpdateId: Number(state.last_update_id || 0),
+    sentCount: Object.keys(state.sent || {}).length,
+    pendingCallbacks: Object.keys(state.callbacks || {}).length
+  };
+}
+
 async function doctor(config) {
   console.log(`[telegram-approval] version=${VERSION}`);
   console.log(`[telegram-approval] baseDir=${config.baseDir}`);
   console.log(`[telegram-approval] enabled=${config.enabled}`);
   console.log(`[telegram-approval] watchPaths=${config.watchPaths.join(',')}`);
+  for (const item of config.watchPaths.map((p) => fileStatus(config.baseDir, p))) {
+    console.log(`[telegram-approval] watchFile path=${item.path} exists=${item.exists} sizeBytes=${item.sizeBytes ?? 'n/a'} modifiedAt=${item.modifiedAt || 'n/a'}`);
+  }
   console.log(`[telegram-approval] decisionsPath=${config.decisionsPath}`);
   console.log(`[telegram-approval] eventsPath=${config.eventsPath}`);
   console.log(`[telegram-approval] statePath=${config.statePath}`);
-  console.log(`[telegram-approval] tokenSet=${Boolean(config.telegramBotToken)}`);
-  console.log(`[telegram-approval] chatIdSet=${Boolean(config.telegramChatId)}`);
+  const summary = stateSummary(config);
+  console.log(`[telegram-approval] stateExists=${summary.exists} lastUpdateId=${summary.lastUpdateId ?? 'n/a'} sentCount=${summary.sentCount} pendingCallbacks=${summary.pendingCallbacks}`);
+  console.log(`[telegram-approval] telegramBotTokenPresent=${Boolean(config.telegramBotToken)} telegramBotToken=${redactPresence(config.telegramBotToken)}`);
+  console.log(`[telegram-approval] telegramChatIdPresent=${Boolean(config.telegramChatId)} telegramChatId=${redactPresence(config.telegramChatId)}`);
+  console.log(`[telegram-approval] testMessageAllowed=${config.testMessageAllowed}`);
   const errors = validateConfig(config);
-  if (errors.length) { console.error(`[telegram-approval] CONFIG_ERRORS=${errors.join('; ')}`); process.exitCode = 1; return; }
-  const me = await telegramApi(config, 'getMe', {});
-  console.log(`[telegram-approval] telegram_ok=true username=${me.result?.username || 'unknown'}`);
+  console.log(`[telegram-approval] configReady=${errors.length === 0}`);
+  if (errors.length) console.log(`[telegram-approval] CONFIG_WARNINGS=${errors.join('; ')}`);
+}
+
+async function testMessage(config) {
+  if (!config.testMessageAllowed) {
+    console.error('[telegram-approval] REFUSED test-message requires TELEGRAM_TEST_ALLOW=true');
+    process.exitCode = 1;
+    return;
+  }
+  const errors = validateConfig(config);
+  if (errors.length) throw new Error(errors.join('; '));
+  await telegramApi(config, 'sendMessage', {
+    chat_id: config.telegramChatId,
+    text: 'MoneyMaker Telegram test: bot is connected.'
+  });
+  console.log('[telegram-approval] test-message sent');
 }
 
 async function once(config) {
@@ -434,10 +501,11 @@ async function main() {
   const baseDir = process.cwd();
   const config = readConfig(baseDir);
   if (['help', '--help', '-h'].includes(command)) {
-    console.log(`Usage:\n  node telegram_approval_bot.js doctor\n  node telegram_approval_bot.js once\n  node telegram_approval_bot.js run`);
+    console.log(`Usage:\n  node telegram_approval_bot.js doctor\n  node telegram_approval_bot.js test-message\n  node telegram_approval_bot.js once\n  node telegram_approval_bot.js run`);
     return;
   }
   if (command === 'doctor') return doctor(config);
+  if (command === 'test-message') return testMessage(config);
   if (command === 'once') return once(config);
   if (command === 'run') return run(config);
   throw new Error(`Unknown command: ${command}`);

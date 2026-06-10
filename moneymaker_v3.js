@@ -179,6 +179,8 @@ const CONFIG = {
   makerSpreadMultiplier: envNum('MAKER_SPREAD_MULTIPLIER', 1.2),
 
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
+  paperConfidenceProfile: envStr('PAPER_CONFIDENCE_PROFILE', 'conservative'),
+  spreadHunterMinConfidencePaper: envNum('SPREADHUNTER_MIN_CONFIDENCE_PAPER', 0.35),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
   slippageBuffer: envNum('SLIPPAGE_BUFFER', 0.004),
   adverseSelectionBuffer: envNum('ADVERSE_SELECTION_BUFFER', 0.006),
@@ -2687,6 +2689,29 @@ class RiskEngine {
     this.lastBlockDetails = null;
   }
 
+  paperConfidenceProfile() {
+    const profile = String(this.config.paperConfidenceProfile || 'conservative').trim().toLowerCase();
+    return ['conservative', 'balanced', 'capital_velocity'].includes(profile) ? profile : 'conservative';
+  }
+
+  isPaperSpreadHunterOverrideEligible(signal) {
+    if (!signal || signal.strategy !== 'SpreadHunter') return false;
+    const profile = this.paperConfidenceProfile();
+    if (!['balanced', 'capital_velocity'].includes(profile)) return false;
+
+    const route = signal.metadata?.consensus?.route || {};
+    return route.authorized === true && route.mode === 'MAKER' && route.state === 'STABLE';
+  }
+
+  effectiveMinConfidence(signal) {
+    const base = this.config.minConfidence;
+    if (!this.isPaperSpreadHunterOverrideEligible(signal)) return base;
+
+    const paperMin = Number(this.config.spreadHunterMinConfidencePaper);
+    if (!Number.isFinite(paperMin) || paperMin <= 0) return base;
+    return Math.min(base, paperMin);
+  }
+
   riskDetails(signal) {
     if (!signal) return { signalPresent: false };
 
@@ -2715,6 +2740,9 @@ class RiskEngine {
       minSignalEdge: this.config.minSignalEdge,
       confidence: Number(signal.confidence),
       minConfidence: this.config.minConfidence,
+      effectiveMinConfidence: this.effectiveMinConfidence(signal),
+      paperConfidenceProfile: this.paperConfidenceProfile(),
+      paperConfidenceOverrideEligible: this.isPaperSpreadHunterOverrideEligible(signal),
       availableCash: this.portfolio.availableCash(),
       currentPositionQty: currentPosQty,
       availableSellQty,
@@ -2756,7 +2784,8 @@ class RiskEngine {
 
     const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
     if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return this.block(signal, 'edge_below_min');
-    if (!isProtectiveExit && signal.confidence < this.config.minConfidence) return this.block(signal, 'confidence_below_min');
+    const minConfidence = this.effectiveMinConfidence(signal);
+    if (!isProtectiveExit && signal.confidence < minConfidence) return this.block(signal, 'confidence_below_min', { effectiveMinConfidence: minConfidence });
 
     const openUsd = this.portfolio.totalOpenOrderUsd();
     if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'max_total_open_order_usd');
