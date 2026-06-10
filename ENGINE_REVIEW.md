@@ -56,6 +56,14 @@ The fix replaces that implicit check with an explicit strategy-route model. Spre
 
 `EngineDiagnostics` also records recent candidate outcomes and emits `[ENGINE STARVATION WARNING]` if passing candidates are dominated by route blocks while no orders or duplicate skips occur.
 
+## Risk Engine Diagnostic Review
+
+Risk evaluation now separates consensus rejection from post-consensus risk rejection. `BotEngine.trySignal()` returns immediately when consensus does not authorize a signal, so consensus route blocks no longer get relabeled as RiskEngine failures.
+
+RiskEngine block logs use precise reasons instead of generic `risk_blocked`: `invalid_signal`, `invalid_side`, `invalid_price`, `invalid_size`, `edge_below_min`, `confidence_below_min`, `max_open_orders`, `max_total_open_order_usd`, `max_total_exposure`, `max_market_exposure`, `max_position_per_asset`, `cash_cap`, `no_available_position`, `sell_size_below_min`, and `drawdown_limit`.
+
+`[SIGNAL BLOCK]` logs include the threshold/cap values needed to diagnose runtime failures: expected edge, minimum edge, confidence, minimum confidence, signal size, minimum order size, available cash, current position quantity, available sell quantity, current position USD, total exposure, market exposure, open-order exposure, and drawdown. SpreadHunter BUY failures should now identify whether the signal fell below edge/confidence after consensus adjustment, hit cash/exposure/position caps, or had invalid size/price. TakeProfitExit and StopLossExit SELL failures should identify whether there was no available inventory or the sell was clamped below `MIN_ORDER_USD`.
+
 ## Live Dependency Audit Caution
 
 `npm audit fix` without `--force` leaves known transitive vulnerabilities under the live adapter dependency chain. The remaining advisories are not caused by the paper engine and are not fixed safely by npm without a breaking downgrade:

@@ -156,7 +156,7 @@ function run() {
     const risk = new RiskEngine(ctx.config, ctx.portfolio, ctx.diagnostics);
     const signal = makeSignal({ sizeUsd: 10 });
     assert.strictEqual(risk.evaluate(signal), null, 'Exposure cap should block oversized buy');
-    assert.strictEqual(risk.lastBlockReason, 'exposure_cap');
+    assert.strictEqual(risk.lastBlockReason, 'max_total_exposure');
   }
 
   {

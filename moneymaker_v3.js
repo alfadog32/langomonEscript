@@ -2684,10 +2684,58 @@ class RiskEngine {
     this.portfolio = portfolio;
     this.diagnostics = diagnostics;
     this.lastBlockReason = null;
+    this.lastBlockDetails = null;
   }
 
-  block(signal, reason) {
+  riskDetails(signal) {
+    if (!signal) return { signalPresent: false };
+
+    const matchingOrders = this.portfolio.findOpenOrdersBySignal(signal);
+    const replaceSellQty = this.config.openOrderReplaceEnabled
+      ? matchingOrders.reduce((sum, { order }) => {
+        if (order.side !== 'sell' || !Number.isFinite(order.price) || order.price <= 0) return sum;
+        return sum + order.remainingUsd() / order.price;
+      }, 0)
+      : 0;
+    const currentPosQty = this.portfolio.position(signal.tokenId);
+    const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId) + replaceSellQty;
+    const totalExposureUsd = this.portfolio.totalExposureUsd();
+    const marketExposureUsd = this.portfolio.marketExposureUsd(signal.marketId);
+    const currentPosUsd = Number.isFinite(signal.price) ? currentPosQty * signal.price : NaN;
+    const drawdownPct = this.portfolio.getDrawdownPct();
+
+    return {
+      strategy: signal.strategy || null,
+      side: signal.side || null,
+      tokenId: signal.tokenId || null,
+      price: Number(signal.price),
+      sizeUsd: Number(signal.sizeUsd),
+      minOrderUsd: this.config.minOrderUsd,
+      expectedEdge: Number(signal.expectedEdge),
+      minSignalEdge: this.config.minSignalEdge,
+      confidence: Number(signal.confidence),
+      minConfidence: this.config.minConfidence,
+      availableCash: this.portfolio.availableCash(),
+      currentPositionQty: currentPosQty,
+      availableSellQty,
+      currentPositionUsd: currentPosUsd,
+      totalExposureUsd,
+      maxTotalExposureUsd: this.config.maxTotalExposureUsd,
+      marketExposureUsd,
+      maxMarketExposureUsd: this.config.maxMarketExposureUsd,
+      maxPositionUsdPerAsset: this.config.maxPositionUsdPerAsset,
+      totalOpenOrderUsd: this.portfolio.totalOpenOrderUsd(),
+      maxTotalOpenOrderUsd: this.config.maxTotalOpenOrderUsd,
+      openOrders: this.portfolio.openOrders.size,
+      maxOpenOrders: this.config.maxOpenOrders,
+      drawdownPct,
+      maxDrawdownPct: this.config.maxDrawdownPct,
+    };
+  }
+
+  block(signal, reason, extra = {}) {
     this.lastBlockReason = reason;
+    this.lastBlockDetails = { ...this.riskDetails(signal), ...extra };
     this.diagnostics?.record({
       strategy: signal?.strategy,
       scorePassed: Boolean(signal?.metadata?.consensus?.score >= this.config.consensusThreshold),
@@ -2698,25 +2746,26 @@ class RiskEngine {
 
   evaluate(signal) {
     this.lastBlockReason = null;
-    if (!signal) return this.block(signal, 'risk_blocked');
-    if (!['buy', 'sell'].includes(signal.side)) return this.block(signal, 'risk_blocked');
-    if (!Number.isFinite(signal.price) || signal.price <= 0) return this.block(signal, 'risk_blocked');
-    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) return this.block(signal, 'risk_blocked');
+    this.lastBlockDetails = null;
+    if (!signal) return this.block(signal, 'invalid_signal');
+    if (!['buy', 'sell'].includes(signal.side)) return this.block(signal, 'invalid_side');
+    if (!Number.isFinite(signal.price) || signal.price <= 0 || signal.price >= 1) return this.block(signal, 'invalid_price');
+    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0 || signal.sizeUsd < this.config.minOrderUsd) return this.block(signal, 'invalid_size');
 
-    if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return this.block(signal, 'exposure_cap');
+    if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return this.block(signal, 'max_open_orders');
 
     const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
-    if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return this.block(signal, 'risk_blocked');
-    if (!isProtectiveExit && signal.confidence < this.config.minConfidence) return this.block(signal, 'risk_blocked');
+    if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return this.block(signal, 'edge_below_min');
+    if (!isProtectiveExit && signal.confidence < this.config.minConfidence) return this.block(signal, 'confidence_below_min');
 
     const openUsd = this.portfolio.totalOpenOrderUsd();
-    if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'exposure_cap');
+    if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'max_total_open_order_usd');
 
     const totalEx = this.portfolio.totalExposureUsd();
-    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return this.block(signal, 'exposure_cap');
+    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return this.block(signal, 'max_total_exposure');
 
     const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
-    if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return this.block(signal, 'exposure_cap');
+    if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return this.block(signal, 'max_market_exposure');
 
     const matchingOrders = this.portfolio.findOpenOrdersBySignal(signal);
     const replaceCreditUsd = this.config.openOrderReplaceEnabled
@@ -2734,18 +2783,18 @@ class RiskEngine {
 
     if (signal.side === 'buy') {
       if (this.portfolio.availableCash() + replaceCreditUsd < signal.sizeUsd) return this.block(signal, 'cash_cap');
-      if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return this.block(signal, 'exposure_cap');
+      if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return this.block(signal, 'max_position_per_asset');
     }
 
     if (signal.side === 'sell') {
       const availableQty = this.portfolio.availablePositionQty(signal.tokenId) + replaceSellQty;
-      if (availableQty <= 0) return this.block(signal, 'risk_blocked');
+      if (availableQty <= 0) return this.block(signal, 'no_available_position', { availableSellQty: availableQty });
       const maxSellUsd = availableQty * signal.price;
       signal.sizeUsd = Math.min(signal.sizeUsd, maxSellUsd);
-      if (signal.sizeUsd < this.config.minOrderUsd) return this.block(signal, 'risk_blocked');
+      if (signal.sizeUsd < this.config.minOrderUsd) return this.block(signal, 'sell_size_below_min', { availableSellQty: availableQty, maxSellUsd });
     }
 
-    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return this.block(signal, 'risk_blocked');
+    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return this.block(signal, 'drawdown_limit');
 
     return signal;
   }
@@ -3127,12 +3176,17 @@ class BotEngine {
         this.volGuard,
         this.whaleTracker
       );
+      if (!signal) return;
     }
 
     signal = this.risk.evaluate(signal);
     if (!signal) {
       if (this.config.consensusLogRejected && rawSignal) {
-        warn(`[SIGNAL BLOCK] ${rawSignal.strategy} ${String(rawSignal.side || '').toUpperCase()} ${shortId(rawSignal.tokenId)} block=${this.risk.lastBlockReason || 'risk_blocked'}`);
+        const details = formatRiskBlockDetails(this.risk.lastBlockDetails);
+        warn(
+          `[SIGNAL BLOCK] ${rawSignal.strategy} ${String(rawSignal.side || '').toUpperCase()} ${shortId(rawSignal.tokenId)} ` +
+          `block=${this.risk.lastBlockReason || 'invalid_signal'} ${details}`
+        );
       }
       return;
     }
@@ -3304,6 +3358,43 @@ function shortId(value) {
 function fmtPrice(value) {
   if (!Number.isFinite(value)) return 'n/a';
   return `$${Number(value).toFixed(3)}`;
+}
+
+function cleanLogValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? Number(value.toFixed(6)) : null;
+  if (value === undefined) return null;
+  return value;
+}
+
+function formatRiskBlockDetails(details = {}) {
+  const orderedKeys = [
+    'expectedEdge',
+    'minSignalEdge',
+    'confidence',
+    'minConfidence',
+    'sizeUsd',
+    'minOrderUsd',
+    'availableCash',
+    'currentPositionQty',
+    'availableSellQty',
+    'currentPositionUsd',
+    'totalExposureUsd',
+    'maxTotalExposureUsd',
+    'marketExposureUsd',
+    'maxMarketExposureUsd',
+    'maxPositionUsdPerAsset',
+    'totalOpenOrderUsd',
+    'maxTotalOpenOrderUsd',
+    'openOrders',
+    'maxOpenOrders',
+    'drawdownPct',
+    'maxDrawdownPct',
+  ];
+
+  return orderedKeys
+    .filter((key) => Object.prototype.hasOwnProperty.call(details, key))
+    .map((key) => `${key}=${cleanLogValue(details[key])}`)
+    .join(' ');
 }
 
 function chunks(arr, size) {

@@ -11,6 +11,7 @@
     "start": "node moneymaker_v3.js",
     "check": "node --check moneymaker_v3.js && node --check live_adapter_polymarket.js && node --check live_intent_router.js && node --check telegram/telegram_approval_bot.js",
     "engine:route-selfcheck": "node scripts/engine_route_selfcheck.js",
+    "engine:risk-selfcheck": "node scripts/engine_risk_selfcheck.js",
     "paper": "node moneymaker_v3.js",
     "paper:debug": "CONSENSUS_LOG_REJECTED=true node moneymaker_v3.js",
     "paper:whales:unsafe": "ENABLE_WHALE_TRACKING=true ENABLE_WHALE_COPY_STRATEGY=true node moneymaker_v3.js",
