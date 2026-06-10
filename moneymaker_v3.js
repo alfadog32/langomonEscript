@@ -168,12 +168,19 @@ const CONFIG = {
   consensusTrendMovePct: envNum('CONSENSUS_TREND_MOVE_PCT', 0.035),
   consensusSniperSizeMultiplier: envNum('CONSENSUS_SNIPER_SIZE_MULTIPLIER', 0.65),
   consensusMakerBoost: envNum('CONSENSUS_MAKER_BOOST', 1.05),
+  routeAuthMaxBookAgeMs: envInt('ROUTE_AUTH_MAX_BOOK_AGE_MS', 3_000),
+  engineStarvationWindow: envInt('ENGINE_STARVATION_WINDOW', 50),
+  engineStarvationMinPassingCandidates: envInt('ENGINE_STARVATION_MIN_PASSING_CANDIDATES', 20),
+  engineStarvationRouteBlockPct: envNum('ENGINE_STARVATION_ROUTE_BLOCK_PCT', 0.80),
+  engineStarvationWarnCooldownMs: envInt('ENGINE_STARVATION_WARN_COOLDOWN_MS', 120_000),
   targetWalletHandle: envStr('TARGET_WALLET_HANDLE', 'gabagool22'),
   targetWalletMode: envBool('TARGET_WALLET_MODE', true),
   targetWalletDisplacementPct: envNum('TARGET_WALLET_DISPLACEMENT_PCT', 0.015),
   makerSpreadMultiplier: envNum('MAKER_SPREAD_MULTIPLIER', 1.2),
 
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
+  paperConfidenceProfile: envStr('PAPER_CONFIDENCE_PROFILE', 'conservative'),
+  spreadHunterMinConfidencePaper: envNum('SPREADHUNTER_MIN_CONFIDENCE_PAPER', 0.35),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
   slippageBuffer: envNum('SLIPPAGE_BUFFER', 0.004),
   adverseSelectionBuffer: envNum('ADVERSE_SELECTION_BUFFER', 0.006),
@@ -1553,9 +1560,51 @@ function normalizeTitle(value) {
 // MULTI-VIEW CONSENSUS ENGINE
 // =========================
 
-class MultiConsensusEngine {
+class EngineDiagnostics {
   constructor(config) {
     this.config = config;
+    this.events = [];
+    this.lastStarvationWarningAt = 0;
+  }
+
+  record(event = {}) {
+    this.events.push({ ...event, ts: Date.now() });
+
+    const max = Math.max(10, this.config.engineStarvationWindow || 50);
+    while (this.events.length > max) this.events.shift();
+
+    this.maybeWarnStarvation();
+  }
+
+  maybeWarnStarvation() {
+    const now = Date.now();
+    if (now - this.lastStarvationWarningAt < this.config.engineStarvationWarnCooldownMs) return;
+
+    const passingCandidates = this.events.filter((e) => e.scorePassed).length;
+    const routeBlocks = this.events.filter((e) => e.blockReason === 'route_not_authorized').length;
+    const placed = this.events.filter((e) => e.blockReason === 'order_placed').length;
+    const duplicateSkips = this.events.filter((e) => e.blockReason === 'order_skip_duplicate').length;
+    const routeBlockPct = passingCandidates > 0 ? routeBlocks / passingCandidates : 0;
+
+    if (
+      passingCandidates >= this.config.engineStarvationMinPassingCandidates &&
+      routeBlockPct >= this.config.engineStarvationRouteBlockPct &&
+      placed === 0 &&
+      duplicateSkips === 0
+    ) {
+      warn(
+        `[ENGINE STARVATION WARNING] passingCandidates=${passingCandidates} routeBlocks=${routeBlocks} ` +
+        `placed=0 duplicateSkips=0 likelyRouteModelOverblocking=true`
+      );
+      this.lastStarvationWarningAt = now;
+    }
+  }
+}
+
+class MultiConsensusEngine {
+  constructor(config, diagnostics = null) {
+    this.config = config;
+    this.diagnostics = diagnostics;
     this.midHistory = new Map();
   }
 
@@ -1569,7 +1618,13 @@ class MultiConsensusEngine {
         consensus: {
           score: 1,
           authorized: true,
-          reason: 'Protective exit bypasses consensus gate',
+          reason: 'Protective exit authorized as risk-reducing route',
+          route: {
+            mode: 'RISK_EXIT',
+            state: signal.strategy === 'InventoryExit' ? 'INVENTORY_EXIT' : 'PROTECTIVE_EXIT',
+            authorized: true,
+            reason: 'Protective exit authorized as risk-reducing route',
+          },
         },
       };
       return signal;
@@ -1611,6 +1666,7 @@ class MultiConsensusEngine {
     });
 
     const authorized = score >= this.config.consensusThreshold && route.authorized;
+    const scorePass = score >= this.config.consensusThreshold;
 
     signal.metadata = {
       ...(signal.metadata || {}),
@@ -1634,13 +1690,20 @@ class MultiConsensusEngine {
     };
 
     if (!authorized) {
+      const routeAuth = Boolean(route.authorized);
+      const blockReason = [
+        scorePass ? null : 'score_below_threshold',
+        routeAuth ? null : (route.blockReason || 'route_not_authorized'),
+      ].filter(Boolean).join('+') || 'unknown';
+
+      this.diagnostics?.record({
+        strategy: signal.strategy,
+        route: `${route.mode}:${route.state}`,
+        scorePassed: scorePass,
+        blockReason: routeAuth ? 'score_below_threshold' : (route.blockReason || 'route_not_authorized'),
+      });
+
       if (this.config.consensusLogRejected) {
-        const scorePass = score >= this.config.consensusThreshold;
-        const routeAuth = Boolean(route.authorized);
-        const blockReason = [
-          scorePass ? null : 'score_below_threshold',
-          routeAuth ? null : 'route_not_authorized',
-        ].filter(Boolean).join('+') || 'unknown';
         const componentText = Object.entries(components)
           .map(([name, value]) => `${name}=${Number(value || 0).toFixed(3)}`)
           .join(' ');
@@ -1654,6 +1717,13 @@ class MultiConsensusEngine {
       }
       return null;
     }
+
+    this.diagnostics?.record({
+      strategy: signal.strategy,
+      route: `${route.mode}:${route.state}`,
+      scorePassed: true,
+      blockReason: 'route_authorized',
+    });
 
     this.applyExecutionRoute(signal, route);
     this.applyWhaleConsensusAdjustment(signal, whaleEvent);
@@ -1674,6 +1744,33 @@ class MultiConsensusEngine {
   }
 
   routeExecution(marketData) {
+    const { signal, book, volGuard } = marketData;
+    if (!signal || !isBookComplete(book) || !this.isBookFreshForRoute(book)) {
+      return {
+        mode: 'WAIT',
+        state: 'WAIT',
+        authorized: false,
+        reason: 'stale_book',
+        blockReason: 'stale_book',
+        confidenceMultiplier: 0,
+        edgeMultiplier: 0,
+        sizeMultiplier: 0,
+      };
+    }
+
+    if (volGuard?.isTripped?.(signal.tokenId) && !this.config.quoteDuringVolatility) {
+      return {
+        mode: 'WAIT',
+        state: 'WAIT',
+        authorized: false,
+        reason: 'volatility_guard',
+        blockReason: 'volatility_guard',
+        confidenceMultiplier: 0,
+        edgeMultiplier: 0,
+        sizeMultiplier: 0,
+      };
+    }
+
     const targetDisplacement = this.calculateTargetWalletDisplacement(marketData);
     const volatilityState = this.calculateVolatility(marketData, targetDisplacement);
 
@@ -1703,6 +1800,7 @@ class MultiConsensusEngine {
       state: volatilityState,
       authorized: false,
       reason: 'Market is neither stable enough for maker mode nor cleanly directional enough for sniper mode',
+      blockReason: 'route_not_authorized',
       confidenceMultiplier: 0,
       edgeMultiplier: 0,
       sizeMultiplier: 0,
@@ -1744,9 +1842,73 @@ class MultiConsensusEngine {
     return 'WAIT';
   }
 
-  executeMakerStrategy({ signal, book, components, targetDisplacement, forcedReason }) {
-    const makerStrategies = new Set(['SpreadHunter', 'ComplementArb']);
-    const authorized = makerStrategies.has(signal.strategy) && components.depth >= 0.45 && components.volatility >= 0.36;
+  isBookFreshForRoute(book) {
+    if (!book || !book.cachedAt) return true;
+    return Date.now() - book.cachedAt <= this.config.routeAuthMaxBookAgeMs;
+  }
+
+  spreadHunterMakerStableDecision({ signal, book, volGuard }) {
+    if (signal.strategy !== 'SpreadHunter') return null;
+    if (!isBookComplete(book)) return { authorized: false, reason: 'stale_book', blockReason: 'stale_book' };
+    if (!this.isBookFreshForRoute(book)) return { authorized: false, reason: 'stale_book', blockReason: 'stale_book' };
+    if (book.spread > this.config.hunterMaxSpread) return { authorized: false, reason: 'spread exceeds configured max', blockReason: 'route_not_authorized' };
+    if (volGuard?.isTripped?.(signal.tokenId) && !this.config.quoteDuringVolatility) {
+      return { authorized: false, reason: 'volatility_guard', blockReason: 'volatility_guard' };
+    }
+    if (!Number.isFinite(signal.expectedEdge) || signal.expectedEdge < this.config.minSignalEdge) {
+      return { authorized: false, reason: 'edge below minimum', blockReason: 'route_not_authorized' };
+    }
+
+    const topBidUsd = topDepthUsd(book.bids, 1);
+    const topAskUsd = topDepthUsd(book.asks, 1);
+    if (Math.min(topBidUsd, topAskUsd) < this.config.hunterMinTopDepthUsd) {
+      return { authorized: false, reason: 'depth/liquidity below SpreadHunter minimum', blockReason: 'route_not_authorized' };
+    }
+
+    const liquidityPenalty = Number(signal.metadata?.liquidityPenalty ?? NaN);
+    if (Number.isFinite(liquidityPenalty) && liquidityPenalty <= 0) {
+      return { authorized: false, reason: 'depth/liquidity failed execution estimate', blockReason: 'route_not_authorized' };
+    }
+
+    const ghostThrottle = signal.metadata?.ghostThrottle;
+    if (ghostThrottle && Number(ghostThrottle.sizeMultiplier) <= 0) {
+      return { authorized: false, reason: 'ghost_throttle', blockReason: 'ghost_throttle' };
+    }
+
+    return {
+      authorized: true,
+      reason: 'SpreadHunter authorized for maker-stable spread capture',
+      blockReason: null,
+    };
+  }
+
+  complementArbMakerStableDecision({ signal, components }) {
+    if (signal.strategy !== 'ComplementArb') return null;
+    const authorized = components.structure >= 0.45 && components.depth >= 0.45 && components.volatility >= 0.36;
+    return {
+      authorized,
+      reason: authorized
+        ? 'ComplementArb authorized for complement maker route'
+        : 'ComplementArb maker route requires complement-arbitrage structure, depth, and volatility checks',
+      blockReason: authorized ? null : 'route_not_authorized',
+    };
+  }
+
+  makerStableDecision(context) {
+    return (
+      this.spreadHunterMakerStableDecision(context) ||
+      this.complementArbMakerStableDecision(context) ||
+      {
+        authorized: false,
+        reason: `Stable/displaced book but strategy ${context.signal.strategy} is not maker-compatible`,
+        blockReason: 'route_not_authorized',
+      }
+    );
+  }
+
+  executeMakerStrategy({ signal, book, components, targetDisplacement, forcedReason, volGuard }) {
+    const decision = this.makerStableDecision({ signal, book, components, targetDisplacement, forcedReason, volGuard });
+    const authorized = decision.authorized;
 
     const mid = book.midpoint;
     const spread = Math.max(book.spread, book.tickSize || 0.01);
@@ -1761,8 +1923,9 @@ class MultiConsensusEngine {
       state: 'STABLE',
       authorized,
       reason: authorized
-        ? (forcedReason || 'Stable/displaced book: route to maker mode for spread capture')
-        : `Stable/displaced book but strategy ${signal.strategy} is not maker-compatible`,
+        ? (forcedReason || decision.reason)
+        : decision.reason,
+      blockReason: decision.blockReason || null,
       confidenceMultiplier: targetDisplacement?.detected ? this.config.consensusMakerBoost * 1.05 : this.config.consensusMakerBoost,
       edgeMultiplier: targetDisplacement?.detected ? this.config.consensusMakerBoost * 1.05 : this.config.consensusMakerBoost,
       sizeMultiplier: 1.0,
@@ -1785,16 +1948,20 @@ class MultiConsensusEngine {
       (signal.side === 'buy' && directionalMove > 0) ||
       (signal.side === 'sell' && directionalMove < 0);
 
-    const sniperCompatible = signal.strategy === 'TailEndMispricing' || aligned;
-    const authorized = sniperCompatible && components.volatility >= 0.36 && components.portfolio >= 0.35;
+    const sniperCompatible = signal.strategy === 'TailEndMispricing';
+    const authorized = sniperCompatible && aligned && components.volatility >= 0.36 && components.portfolio >= 0.35;
+    const reason = authorized
+      ? 'Directional move detected: route to sniper mode with reduced size'
+      : !aligned
+        ? 'Trend detected but signal is not aligned with the move'
+        : `Trend detected but strategy ${signal.strategy} is not sniper-compatible`;
 
     return {
       mode: 'SNIPER',
       state: 'TRENDING',
       authorized,
-      reason: authorized
-        ? 'Directional move detected: route to sniper mode with reduced size'
-        : 'Trend detected but signal is not aligned with the move',
+      reason,
+      blockReason: authorized ? null : 'route_not_authorized',
       confidenceMultiplier: aligned ? 1.08 : 0.88,
       edgeMultiplier: aligned ? 1.08 : 0.88,
       sizeMultiplier: this.config.consensusSniperSizeMultiplier,
@@ -2514,31 +2681,120 @@ class PaperOrder {
 // =========================
 
 class RiskEngine {
-  constructor(config, portfolio) {
+  constructor(config, portfolio, diagnostics = null) {
     this.config = config;
     this.portfolio = portfolio;
+    this.diagnostics = diagnostics;
+    this.lastBlockReason = null;
+    this.lastBlockDetails = null;
+  }
+
+  paperConfidenceProfile() {
+    const profile = String(this.config.paperConfidenceProfile || 'conservative').trim().toLowerCase();
+    return ['conservative', 'balanced', 'capital_velocity'].includes(profile) ? profile : 'conservative';
+  }
+
+  isPaperSpreadHunterOverrideEligible(signal) {
+    if (!signal || signal.strategy !== 'SpreadHunter') return false;
+    const profile = this.paperConfidenceProfile();
+    if (!['balanced', 'capital_velocity'].includes(profile)) return false;
+
+    const route = signal.metadata?.consensus?.route || {};
+    return route.authorized === true && route.mode === 'MAKER' && route.state === 'STABLE';
+  }
+
+  effectiveMinConfidence(signal) {
+    const base = this.config.minConfidence;
+    if (!this.isPaperSpreadHunterOverrideEligible(signal)) return base;
+
+    const paperMin = Number(this.config.spreadHunterMinConfidencePaper);
+    if (!Number.isFinite(paperMin) || paperMin <= 0) return base;
+    return Math.min(base, paperMin);
+  }
+
+  riskDetails(signal) {
+    if (!signal) return { signalPresent: false };
+
+    const matchingOrders = this.portfolio.findOpenOrdersBySignal(signal);
+    const replaceSellQty = this.config.openOrderReplaceEnabled
+      ? matchingOrders.reduce((sum, { order }) => {
+        if (order.side !== 'sell' || !Number.isFinite(order.price) || order.price <= 0) return sum;
+        return sum + order.remainingUsd() / order.price;
+      }, 0)
+      : 0;
+    const currentPosQty = this.portfolio.position(signal.tokenId);
+    const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId) + replaceSellQty;
+    const totalExposureUsd = this.portfolio.totalExposureUsd();
+    const marketExposureUsd = this.portfolio.marketExposureUsd(signal.marketId);
+    const currentPosUsd = Number.isFinite(signal.price) ? currentPosQty * signal.price : NaN;
+    const drawdownPct = this.portfolio.getDrawdownPct();
+
+    return {
+      strategy: signal.strategy || null,
+      side: signal.side || null,
+      tokenId: signal.tokenId || null,
+      price: Number(signal.price),
+      sizeUsd: Number(signal.sizeUsd),
+      minOrderUsd: this.config.minOrderUsd,
+      expectedEdge: Number(signal.expectedEdge),
+      minSignalEdge: this.config.minSignalEdge,
+      confidence: Number(signal.confidence),
+      minConfidence: this.config.minConfidence,
+      effectiveMinConfidence: this.effectiveMinConfidence(signal),
+      paperConfidenceProfile: this.paperConfidenceProfile(),
+      paperConfidenceOverrideEligible: this.isPaperSpreadHunterOverrideEligible(signal),
+      availableCash: this.portfolio.availableCash(),
+      currentPositionQty: currentPosQty,
+      availableSellQty,
+      currentPositionUsd: currentPosUsd,
+      totalExposureUsd,
+      maxTotalExposureUsd: this.config.maxTotalExposureUsd,
+      marketExposureUsd,
+      maxMarketExposureUsd: this.config.maxMarketExposureUsd,
+      maxPositionUsdPerAsset: this.config.maxPositionUsdPerAsset,
+      totalOpenOrderUsd: this.portfolio.totalOpenOrderUsd(),
+      maxTotalOpenOrderUsd: this.config.maxTotalOpenOrderUsd,
+      openOrders: this.portfolio.openOrders.size,
+      maxOpenOrders: this.config.maxOpenOrders,
+      drawdownPct,
+      maxDrawdownPct: this.config.maxDrawdownPct,
+    };
+  }
+
+  block(signal, reason, extra = {}) {
+    this.lastBlockReason = reason;
+    this.lastBlockDetails = { ...this.riskDetails(signal), ...extra };
+    this.diagnostics?.record({
+      strategy: signal?.strategy,
+      scorePassed: Boolean(signal?.metadata?.consensus?.score >= this.config.consensusThreshold),
+      blockReason: reason,
+    });
+    return null;
   }
 
   evaluate(signal) {
-    if (!signal) return null;
-    if (!['buy', 'sell'].includes(signal.side)) return null;
-    if (!Number.isFinite(signal.price) || signal.price <= 0) return null;
-    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) return null;
+    this.lastBlockReason = null;
+    this.lastBlockDetails = null;
+    if (!signal) return this.block(signal, 'invalid_signal');
+    if (!['buy', 'sell'].includes(signal.side)) return this.block(signal, 'invalid_side');
+    if (!Number.isFinite(signal.price) || signal.price <= 0 || signal.price >= 1) return this.block(signal, 'invalid_price');
+    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0 || signal.sizeUsd < this.config.minOrderUsd) return this.block(signal, 'invalid_size');
 
-    if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return null;
+    if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return this.block(signal, 'max_open_orders');
 
     const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
-    if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return null;
-    if (!isProtectiveExit && signal.confidence < this.config.minConfidence) return null;
+    if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return this.block(signal, 'edge_below_min');
+    const minConfidence = this.effectiveMinConfidence(signal);
+    if (!isProtectiveExit && signal.confidence < minConfidence) return this.block(signal, 'confidence_below_min', { effectiveMinConfidence: minConfidence });
 
     const openUsd = this.portfolio.totalOpenOrderUsd();
-    if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return null;
+    if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'max_total_open_order_usd');
 
     const totalEx = this.portfolio.totalExposureUsd();
-    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return null;
+    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return this.block(signal, 'max_total_exposure');
 
     const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
-    if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return null;
+    if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return this.block(signal, 'max_market_exposure');
 
     const matchingOrders = this.portfolio.findOpenOrdersBySignal(signal);
     const replaceCreditUsd = this.config.openOrderReplaceEnabled
@@ -2555,19 +2811,19 @@ class RiskEngine {
     const currentPosUsd = currentPosQty * signal.price;
 
     if (signal.side === 'buy') {
-      if (this.portfolio.availableCash() + replaceCreditUsd < signal.sizeUsd) return null;
-      if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return null;
+      if (this.portfolio.availableCash() + replaceCreditUsd < signal.sizeUsd) return this.block(signal, 'cash_cap');
+      if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return this.block(signal, 'max_position_per_asset');
     }
 
     if (signal.side === 'sell') {
       const availableQty = this.portfolio.availablePositionQty(signal.tokenId) + replaceSellQty;
-      if (availableQty <= 0) return null;
+      if (availableQty <= 0) return this.block(signal, 'no_available_position', { availableSellQty: availableQty });
       const maxSellUsd = availableQty * signal.price;
       signal.sizeUsd = Math.min(signal.sizeUsd, maxSellUsd);
-      if (signal.sizeUsd < this.config.minOrderUsd) return null;
+      if (signal.sizeUsd < this.config.minOrderUsd) return this.block(signal, 'sell_size_below_min', { availableSellQty: availableQty, maxSellUsd });
     }
 
-    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return null;
+    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return this.block(signal, 'drawdown_limit');
 
     return signal;
   }
@@ -2578,10 +2834,11 @@ class RiskEngine {
 // =========================
 
 class PaperExecutionEngine {
-  constructor(config, portfolio, cache) {
+  constructor(config, portfolio, cache, diagnostics = null) {
     this.config = config;
     this.portfolio = portfolio;
     this.cache = cache;
+    this.diagnostics = diagnostics;
   }
 
   findComparableOpenOrders(signal) {
@@ -2610,6 +2867,11 @@ class PaperExecutionEngine {
 
       if (replaceable.length === 0) {
         info(`[ORDER SKIP DUPLICATE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} [${signal.strategy}] active=${comparableOrders.length}`);
+        this.diagnostics?.record({
+          strategy: signal.strategy,
+          scorePassed: true,
+          blockReason: 'order_skip_duplicate',
+        });
         return false;
       }
 
@@ -2623,6 +2885,11 @@ class PaperExecutionEngine {
     this.portfolio.addOrder(order);
     this.portfolio.recordGhostOrder(signal, book);
     info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
+    this.diagnostics?.record({
+      strategy: signal.strategy,
+      scorePassed: true,
+      blockReason: 'order_placed',
+    });
     return true;
   }
 
@@ -2771,9 +3038,10 @@ class BotEngine {
     this.portfolio.loadState();
 
     this.volGuard = new VolatilityGuard(config);
-    this.risk = new RiskEngine(config, this.portfolio);
-    this.execution = new PaperExecutionEngine(config, this.portfolio, this.cache);
-    this.consensus = new MultiConsensusEngine(config);
+    this.diagnostics = new EngineDiagnostics(config);
+    this.risk = new RiskEngine(config, this.portfolio, this.diagnostics);
+    this.execution = new PaperExecutionEngine(config, this.portfolio, this.cache, this.diagnostics);
+    this.consensus = new MultiConsensusEngine(config, this.diagnostics);
     this.whaleTracker = config.enableWhaleTracking ? new AsyncWhaleWatcher(config) : null;
 
     this.research = new ResearchEngine(this.poly, this.cache, config);
@@ -2937,10 +3205,20 @@ class BotEngine {
         this.volGuard,
         this.whaleTracker
       );
+      if (!signal) return;
     }
 
     signal = this.risk.evaluate(signal);
-    if (!signal) return;
+    if (!signal) {
+      if (this.config.consensusLogRejected && rawSignal) {
+        const details = formatRiskBlockDetails(this.risk.lastBlockDetails);
+        warn(
+          `[SIGNAL BLOCK] ${rawSignal.strategy} ${String(rawSignal.side || '').toUpperCase()} ${shortId(rawSignal.tokenId)} ` +
+          `block=${this.risk.lastBlockReason || 'invalid_signal'} ${details}`
+        );
+      }
+      return;
+    }
 
     const placed = this.execution.place(signal, book);
     if (placed) {
@@ -3111,6 +3389,43 @@ function fmtPrice(value) {
   return `$${Number(value).toFixed(3)}`;
 }
 
+function cleanLogValue(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? Number(value.toFixed(6)) : null;
+  if (value === undefined) return null;
+  return value;
+}
+
+function formatRiskBlockDetails(details = {}) {
+  const orderedKeys = [
+    'expectedEdge',
+    'minSignalEdge',
+    'confidence',
+    'minConfidence',
+    'sizeUsd',
+    'minOrderUsd',
+    'availableCash',
+    'currentPositionQty',
+    'availableSellQty',
+    'currentPositionUsd',
+    'totalExposureUsd',
+    'maxTotalExposureUsd',
+    'marketExposureUsd',
+    'maxMarketExposureUsd',
+    'maxPositionUsdPerAsset',
+    'totalOpenOrderUsd',
+    'maxTotalOpenOrderUsd',
+    'openOrders',
+    'maxOpenOrders',
+    'drawdownPct',
+    'maxDrawdownPct',
+  ];
+
+  return orderedKeys
+    .filter((key) => Object.prototype.hasOwnProperty.call(details, key))
+    .map((key) => `${key}=${cleanLogValue(details[key])}`)
+    .join(' ');
+}
+
 function chunks(arr, size) {
   const out = [];
   for (let i = 0; i < arr.length; i += size) {
@@ -3161,7 +3476,23 @@ async function main() {
   await bot.start();
 }
 
-main().catch((e) => {
-  errlog(`Fatal start error: ${e.stack || e.message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((e) => {
+    errlog(`Fatal start error: ${e.stack || e.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  CONFIG,
+  EngineDiagnostics,
+  MultiConsensusEngine,
+  RiskEngine,
+  PaperExecutionEngine,
+  PaperPortfolio,
+  PaperOrder,
+  Signal,
+  VolatilityGuard,
+  isBookComplete,
+  topDepthUsd,
+};

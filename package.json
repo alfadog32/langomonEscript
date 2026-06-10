@@ -9,7 +9,13 @@
   },
   "scripts": {
     "start": "node moneymaker_v3.js",
-    "check": "node --check moneymaker_v3.js && node --check live_adapter_polymarket.js && node --check live_intent_router.js && node --check telegram/telegram_approval_bot.js",
+    "check": "node --check moneymaker_v3.js && node --check live_adapter_polymarket.js && node --check live_intent_router.js && node --check telegram/telegram_approval_bot.js && node --check dashboard_server.js",
+    "engine:route-selfcheck": "node scripts/engine_route_selfcheck.js",
+    "engine:risk-selfcheck": "node scripts/engine_risk_selfcheck.js",
+    "engine:confidence-selfcheck": "node scripts/engine_confidence_selfcheck.js",
+    "dashboard": "node dashboard_server.js",
+    "dashboard:check": "node --check dashboard_server.js",
+    "repo:sanity": "bash scripts/repo_sanity_check.sh",
     "paper": "node moneymaker_v3.js",
     "paper:debug": "CONSENSUS_LOG_REJECTED=true node moneymaker_v3.js",
     "paper:whales:unsafe": "ENABLE_WHALE_TRACKING=true ENABLE_WHALE_COPY_STRATEGY=true node moneymaker_v3.js",
@@ -23,6 +29,8 @@
     "pm2:fresh": "pm2 delete langomonEscript || true && pm2 flush && pm2 start ./moneymaker_v3.js --name langomonEscript --update-env"
   },
   "dependencies": {
+    "@polymarket/clob-client-v2": "^1.0.6",
+    "viem": "^2.52.2",
     "ws": "^8.18.0"
   }
 }
