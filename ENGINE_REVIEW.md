@@ -55,3 +55,13 @@ The fix replaces that implicit check with an explicit strategy-route model. Spre
 - `WAIT:WAIT` does not authorize.
 
 `EngineDiagnostics` also records recent candidate outcomes and emits `[ENGINE STARVATION WARNING]` if passing candidates are dominated by route blocks while no orders or duplicate skips occur.
+
+## Live Dependency Audit Caution
+
+`npm audit fix` without `--force` leaves known transitive vulnerabilities under the live adapter dependency chain. The remaining advisories are not caused by the paper engine and are not fixed safely by npm without a breaking downgrade:
+
+- `@polymarket/clob-client-v2@1.0.6` depends on `@ethersproject/providers@5.8.0` and `@ethersproject/wallet@5.8.0`.
+- The ethers v5 chain depends on `elliptic@6.6.1`, which npm flags for risky cryptographic primitive implementation.
+- `@ethersproject/providers@5.8.0` also carries a nested `ws@8.18.0`, which npm flags for uninitialized memory disclosure.
+
+Npm recommends `npm audit fix --force`, but that would install `@polymarket/clob-client-v2@0.0.3` as a breaking change. Do not take that downgrade without a dedicated live-adapter compatibility review. The paper engine does not import live secrets, does not sign orders, and does not submit live orders; these advisories are a live-readiness caution until the Polymarket client or ethers dependency chain can be upgraded safely.
