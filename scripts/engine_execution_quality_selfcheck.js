@@ -74,6 +74,9 @@ function makeConfig(overrides = {}) {
     paperMakerRecoveryMaxActive: 1,
     paperMakerRecoveryMinSignalScore: 0.70,
     paperMakerRecoveryMinConfidence: 0.35,
+    paperMakerDistanceDecayPerNoFill: 0.18,
+    paperMakerMinOptimizedDistance: 0.015,
+    paperMakerMaxNoFillDecayStreak: 5,
     ...overrides,
   };
 }
@@ -167,6 +170,10 @@ function seedNoFillOutcomes(bot, signal, count = 3, quality = 0.50, distanceFrom
     }, Date.now() - 60_000 - i);
     bot.portfolio.recordExecutionEvent('order_expired_no_fill', signal, Date.now() - 30_000 - i);
   }
+}
+
+function assertApprox(actual, expected, tolerance, message) {
+  assert(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected}, got ${actual}`);
 }
 
 function makeCalibratedSignal(overrides = {}) {
@@ -399,6 +406,43 @@ function run() {
 
   {
     const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-decay-zero-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.7495, expectedEdge: 0.04, confidence: 0.45 });
+    bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.800, bestAsk: 0.840, midpoint: 0.820, spread: 0.040, tickSize: 0.001 }));
+    bot.flushSophieMakerRecoveryCandidates();
+    const order = [...bot.portfolio.openOrders.values()][0];
+    assert.strictEqual(order.price, 0.751, 'zero no-fill streak should keep one-tick recovery behavior');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-decay-one-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.742, expectedEdge: 0.04, confidence: 0.45 });
+    seedNoFillOutcomes(bot, signal, 1, 0.50, 0.058);
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.800, bestAsk: 0.840, midpoint: 0.820, spread: 0.040, tickSize: 0.0001 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    const order = [...bot.portfolio.openOrders.values()][0];
+    const distance = Number((0.800 - order.price).toFixed(4));
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER DISTANCE DECAY]') && line.includes('noFillStreak=1')), 'one no-fill should log maker distance decay');
+    assertApprox(distance, 0.0476, 0.0002, 'one no-fill should reduce 0.058 distance by 18%');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-decay-two-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.742, expectedEdge: 0.04, confidence: 0.45 });
+    seedNoFillOutcomes(bot, signal, 2, 0.50, 0.058);
+    bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.800, bestAsk: 0.840, midpoint: 0.820, spread: 0.040, tickSize: 0.0001 }));
+    bot.flushSophieMakerRecoveryCandidates();
+    const order = [...bot.portfolio.openOrders.values()][0];
+    const distance = Number((0.800 - order.price).toFixed(4));
+    assertApprox(distance, 0.0390, 0.0002, 'two no-fills should reduce 0.058 distance by compounded 18% decay');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
     const asset = makeAsset('maker-optimizer-low-edge-token');
     const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.015, confidence: 0.45 });
     const logs = captureLogs(() => {
@@ -429,7 +473,11 @@ function run() {
       bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.539, bestAsk: 0.54, midpoint: 0.5395, spread: 0.001, tickSize: 0.01 }));
       bot.flushSophieMakerRecoveryCandidates();
     });
-    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]') && line.includes('would_cross_spread')), 'rounded optimized quote must not cross spread');
+    assert(
+      logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]')
+        && (line.includes('would_cross_spread') || line.includes('no_safe_tick_available'))),
+      'unsafe spread fixture should block without placing'
+    );
     assert.strictEqual(bot.portfolio.openOrders.size, 0);
   }
 

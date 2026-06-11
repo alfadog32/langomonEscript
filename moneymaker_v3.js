@@ -168,6 +168,9 @@ const CONFIG = {
   paperMakerRecoveryMaxActive: envInt('PAPER_MAKER_RECOVERY_MAX_ACTIVE', 1),
   paperMakerRecoveryMinSignalScore: envNum('PAPER_MAKER_RECOVERY_MIN_SIGNAL_SCORE', 0.70),
   paperMakerRecoveryMinConfidence: envNum('PAPER_MAKER_RECOVERY_MIN_CONFIDENCE', 0.35),
+  paperMakerDistanceDecayPerNoFill: envNum('PAPER_MAKER_DISTANCE_DECAY_PER_NOFILL', 0.18),
+  paperMakerMinOptimizedDistance: envNum('PAPER_MAKER_MIN_OPTIMIZED_DISTANCE', 0.015),
+  paperMakerMaxNoFillDecayStreak: envInt('PAPER_MAKER_MAX_NOFILL_DECAY_STREAK', 5),
   paperMakerNudgeEnabled: envBool('PAPER_MAKER_NUDGE_ENABLED', false),
   paperMakerNudgeMaxTicks: envInt('PAPER_MAKER_NUDGE_MAX_TICKS', 1),
   paperMakerNudgeMinEdgeAfterNudge: envNum('PAPER_MAKER_NUDGE_MIN_EDGE_AFTER_NUDGE', 0.012),
@@ -3996,28 +3999,74 @@ class BotEngine {
     const tick = Number(book.tickSize || signal.metadata?.tickSize || 0.01);
     if (!Number.isFinite(tick) || tick <= 0) return null;
 
-    const maxTicks = Math.max(1, this.config.paperMakerOptimizerMaxTicks || 1);
     const oldPrice = Number(signal.price);
+    const baseDistance = Math.max(0, Number(quality.distanceFromTouch || this.quoteDistanceFromTouch(signal, book)));
+    const stats = this.portfolio.executionStatsFor(signal, 60 * 60_000);
+    const noFillStreak = Math.max(0, Number(stats.noFillStreak || 0));
+    const cappedNoFillStreak = Math.min(Math.max(0, this.config.paperMakerMaxNoFillDecayStreak || 0), noFillStreak);
+    const decayPerNoFill = clamp(Number(this.config.paperMakerDistanceDecayPerNoFill), 0, 0.95);
+    const decayMultiplier = Math.pow(1 - decayPerNoFill, cappedNoFillStreak);
+    const targetDistance = Math.max(
+      Math.max(0, Number(this.config.paperMakerMinOptimizedDistance || 0)),
+      baseDistance * decayMultiplier
+    );
+    const edgeMoveBudget = Math.max(
+      0,
+      Number(signal.expectedEdge) - Math.max(this.config.paperMakerRecoveryMinEdgeAfterMove, this.config.minSignalEdge || 0)
+    );
+    const maxTicks = Math.max(1, this.config.paperMakerOptimizerMaxTicks || 1);
+    const oneTickPrice = signal.side === 'buy'
+      ? oldPrice + tick * maxTicks
+      : oldPrice - tick * maxTicks;
+    let desiredPrice;
+    let edgeLimitedPrice;
+    let makerLimitedPrice;
     let optimizedPrice = oldPrice;
 
+    info(
+      `[SOPHIE MAKER DISTANCE DECAY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `baseDistance=${cleanLogValue(baseDistance)} noFillStreak=${noFillStreak} decayPerNoFill=${cleanLogValue(decayPerNoFill)} ` +
+      `decayMultiplier=${cleanLogValue(decayMultiplier)} targetDistance=${cleanLogValue(targetDistance)}`
+    );
+
     if (signal.side === 'buy') {
-      optimizedPrice = Math.min(oldPrice + tick * maxTicks, Number(book.bestBid));
+      const touchPrice = Number(book.bestBid);
+      desiredPrice = cappedNoFillStreak > 0 ? touchPrice - targetDistance : oneTickPrice;
+      edgeLimitedPrice = oldPrice + edgeMoveBudget;
+      makerLimitedPrice = Math.min(Number(book.bestBid), Number(book.bestAsk) - tick);
+      optimizedPrice = Math.min(desiredPrice, edgeLimitedPrice, makerLimitedPrice);
     } else {
-      optimizedPrice = Math.max(oldPrice - tick * maxTicks, Number(book.bestAsk));
+      const touchPrice = Number(book.bestAsk);
+      desiredPrice = cappedNoFillStreak > 0 ? touchPrice + targetDistance : oneTickPrice;
+      edgeLimitedPrice = oldPrice - edgeMoveBudget;
+      makerLimitedPrice = Math.max(Number(book.bestAsk), Number(book.bestBid) + tick);
+      optimizedPrice = Math.max(desiredPrice, edgeLimitedPrice, makerLimitedPrice);
     }
 
     optimizedPrice = roundToTick(clamp(optimizedPrice, 0.01, 0.99), tick);
     if (!Number.isFinite(optimizedPrice) || Math.abs(optimizedPrice - oldPrice) < 1e-9) {
-      this.logStarvedOptimizerBlock(signal, quality, 'no_safe_tick_available', oldPrice, optimizedPrice);
+      this.logStarvedOptimizerBlock(signal, quality, 'no_safe_tick_available', oldPrice, optimizedPrice, null, null, {
+        noFillStreak,
+        decayMultiplier,
+        targetDistance,
+      });
       return null;
     }
 
     if (signal.side === 'buy' && optimizedPrice >= Number(book.bestAsk)) {
-      this.logStarvedOptimizerBlock(signal, quality, 'would_cross_spread', oldPrice, optimizedPrice);
+      this.logStarvedOptimizerBlock(signal, quality, 'would_cross_spread', oldPrice, optimizedPrice, null, null, {
+        noFillStreak,
+        decayMultiplier,
+        targetDistance,
+      });
       return null;
     }
     if (signal.side === 'sell' && optimizedPrice <= Number(book.bestBid)) {
-      this.logStarvedOptimizerBlock(signal, quality, 'would_cross_spread', oldPrice, optimizedPrice);
+      this.logStarvedOptimizerBlock(signal, quality, 'would_cross_spread', oldPrice, optimizedPrice, null, null, {
+        noFillStreak,
+        decayMultiplier,
+        targetDistance,
+      });
       return null;
     }
 
@@ -4038,6 +4087,9 @@ class BotEngine {
           edgeBeforeMove: Number(signal.expectedEdge),
           edgeAfterMove,
           ticksMoved: Math.round(priceDelta / tick),
+          noFillStreak,
+          decayMultiplier,
+          targetDistance,
           neverCrossSpread: true,
           paperOnly: true,
         },
@@ -4057,6 +4109,8 @@ class BotEngine {
     const failed = [];
     if (edgeAfterMove < recoveryFloor.minEdgeAfterMove) failed.push('edge_after_move');
     if (Number.isFinite(recoveryFloor.riskMinEdge) && edgeAfterMove < recoveryFloor.riskMinEdge) failed.push('risk_min_edge');
+    if (optimizedQuality.distanceFromTouch > baseDistance + 1e-9) failed.push('distance_not_improved');
+    if (optimizedQuality.predictedFillProbability <= quality.predictedFillProbability + 1e-9) failed.push('fill_probability_not_improved');
     if (quality.sophieSignalScore < recoveryFloor.minSignalScore) failed.push('signal_score');
     if (Number(signal.confidence) < recoveryFloor.minConfidence) failed.push('confidence');
     if (this.portfolio.openOrders.size >= recoveryFloor.maxActive) failed.push('active_order_cap');
@@ -4064,6 +4118,9 @@ class BotEngine {
       this.logStarvedOptimizerBlock(signal, quality, 'recovery_floor_failed', oldPrice, optimizedPrice, edgeAfterMove, optimizedQuality, {
         failed: failed.join(','),
         recoveryFloor: this.formatMakerRecoveryFloor(recoveryFloor),
+        noFillStreak,
+        decayMultiplier,
+        targetDistance,
       });
       return null;
     }
@@ -4081,6 +4138,9 @@ class BotEngine {
       oldDistance: quality.distanceFromTouch,
       optimizedDistance: optimizedQuality.distanceFromTouch,
       optimizedFillProb: optimizedQuality.predictedFillProbability,
+      noFillStreak,
+      decayMultiplier,
+      targetDistance,
       recoveryFloor,
       utility: this.makerRecoveryUtility(optimized, optimizedQuality, edgeAfterMove),
     };
@@ -4158,6 +4218,7 @@ class BotEngine {
         `oldPrice=${fmtPrice(candidate.oldPrice)} optimizedPrice=${fmtPrice(candidate.optimizedPrice)} ` +
         `edgeBefore=${cleanLogValue(candidate.edgeBefore)} edgeAfter=${cleanLogValue(candidate.edgeAfterMove)} ` +
         `optimizedFillProb=${candidate.optimizedFillProb} oldDistance=${candidate.oldDistance} optimizedDistance=${candidate.optimizedDistance} ` +
+        `noFillStreak=${candidate.noFillStreak} decayMultiplier=${cleanLogValue(candidate.decayMultiplier)} ` +
         `recoveryFloor=${this.formatMakerRecoveryFloor(candidate.recoveryFloor)} riskOk=true paperOnly=true`
       );
       this.execution.place(risked, candidate.book);
@@ -4182,6 +4243,8 @@ class BotEngine {
       `optimizedFillProb=${optimizedQuality?.predictedFillProbability ?? 'NA'} oldDistance=${quality.distanceFromTouch} ` +
       `optimizedDistance=${optimizedQuality?.distanceFromTouch ?? 'NA'} signalScore=${quality.sophieSignalScore} ` +
       `confidence=${cleanLogValue(signal.confidence)} recoveryFloor=${recoveryFloor} ` +
+      `noFillStreak=${extra.noFillStreak ?? 'NA'} decayMultiplier=${Number.isFinite(extra.decayMultiplier) ? cleanLogValue(extra.decayMultiplier) : 'NA'} ` +
+      `targetDistance=${Number.isFinite(extra.targetDistance) ? cleanLogValue(extra.targetDistance) : 'NA'} ` +
       `failed=${extra.failed || reason} riskOk=${extra.riskOk ?? 'NA'} riskReason=${extra.riskReason || 'NA'} ` +
       `disallowedFailures=${extra.disallowedFailures || 'none'} paperOnly=true`
     );
