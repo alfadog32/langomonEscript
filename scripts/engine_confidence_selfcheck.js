@@ -118,12 +118,19 @@ function run() {
     assert(evaluated, 'conservative scenario should pass consensus before risk');
     assert.strictEqual(risked, null, 'conservative blocks confidence below 0.45');
     assert.strictEqual(ctx.risk.lastBlockReason, 'confidence_below_min');
-    assert.strictEqual(ctx.risk.lastBlockDetails.effectiveMinConfidence, 0.45);
+    assert.strictEqual(ctx.risk.lastBlockDetails.minConfidence, 0.45);
+    assert.strictEqual(ctx.risk.lastBlockDetails.confidenceProfile, 'conservative');
+    assert.strictEqual(ctx.risk.lastBlockDetails.thresholdSource, 'MIN_CONFIDENCE');
   }
 
   {
     const ctx = makeContext({ paperConfidenceProfile: 'capital_velocity' });
-    const { risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38, expectedEdge: 0.02 }));
+    const { evaluated, risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38, expectedEdge: 0.02 }));
+    assert(evaluated, 'capital_velocity scenario should pass consensus before risk');
+    const threshold = ctx.risk.confidenceThreshold(evaluated);
+    assert.strictEqual(threshold.minConfidence, 0.35);
+    assert.strictEqual(threshold.confidenceProfile, 'capital_velocity');
+    assert.strictEqual(threshold.thresholdSource, 'SPREADHUNTER_MIN_CONFIDENCE_PAPER');
     assert(risked, 'capital_velocity allows safe positive-edge SpreadHunter at confidence 0.38 with threshold 0.35');
     assert.strictEqual(ctx.risk.lastBlockReason, null);
   }
@@ -157,6 +164,19 @@ function run() {
   }
 
   {
+    const ctx = makeContext({
+      paperConfidenceProfile: 'capital_velocity',
+      maxTotalExposureUsd: 3,
+      maxMarketExposureUsd: 1_000,
+      maxPositionUsdPerAsset: 1_000,
+    });
+    const { evaluated, risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38, sizeUsd: 10 }));
+    assert(evaluated, 'exposure-cap scenario should pass consensus before risk');
+    assert.strictEqual(risked, null, 'exposure cap still blocks after confidence override');
+    assert.strictEqual(ctx.risk.lastBlockReason, 'max_total_exposure');
+  }
+
+  {
     const ctx = makeContext({ paperConfidenceProfile: 'capital_velocity' });
     const execution = new PaperExecutionEngine(ctx.config, ctx.portfolio, { getBook: () => makeBook() }, ctx.diagnostics);
     const { risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38 }));
@@ -172,6 +192,7 @@ function run() {
     assert.strictEqual(liveConfig.liveAutoExecute, false, 'live safety not affected: LIVE_AUTO_EXECUTE remains false by default');
     assert.strictEqual(liveConfig.liveKillSwitch, true, 'live safety not affected: LIVE_KILL_SWITCH remains true by default');
     assert.strictEqual(liveConfig.liveDryRunOnly, true, 'live safety not affected: LIVE_DRY_RUN_ONLY remains true by default');
+    assert.strictEqual(makeConfig({ paperConfidenceProfile: 'capital_velocity' }).autoLiveMinConfidence, CONFIG.autoLiveMinConfidence);
   }
 
   console.log('engine confidence self-check passed');
