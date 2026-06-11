@@ -96,7 +96,7 @@ Portfolio reports now include dust and execution-health summaries:
 
 ```text
 Dust Positions: count=N value=$X.XX
-Execution Health: ordersPlacedLastHour=N fillsLastHour=N duplicateSkipsLastHour=N replacementsLastHour=N oldestOpenOrderAgeSec=N fillRateLastHour=X%
+Execution Health: candidateEvaluationsLastHour=N paperOrdersPlacedLastHour=N paperOrdersAdmittedLastHour=N paperOrdersRejectedBySophieLastHour=N ordersPlacedLastHour=N fillsLastHour=N duplicateSkipsLastHour=N replacementsLastHour=N oldestOpenOrderAgeSec=N fillRateLastHour=X%
 ```
 
 If open orders age beyond `FILL_STARVATION_WARN_SEC` with no fills in the last hour, the engine logs `[ENGINE STARVATION WARNING] ... reason=no_recent_fills`. This is diagnostic only; it does not loosen strategy, risk, routing, duplicate, stale-book, volatility, exposure, drawdown, or ghost controls.
@@ -127,6 +127,12 @@ where `replacementFriction` is `SOPHIE_SLOT_EVICTION_MIN_IMPROVEMENT`. Eviction 
 After the first Sophie gate pass, observed paper quality improved to `fillsLastHour=3` and `fillRateLastHour=1.2%`, but order flow was still too noisy (`ordersPlacedLastHour=257`, `duplicateSkipsLastHour=740`) and active paper orders could fall to zero. Runtime logs showed many candidates clustered around `sophieExecutionQuality=0.39-0.48`, including some with strong edge, confidence, fill probability, and near-touch pricing. That indicates the execution-quality scale is compressed for current market conditions, not that confidence should be lowered or order capacity should be raised.
 
 Sophie now has a calibrated paper-only admission band below the strict `SOPHIE_MIN_EXECUTION_QUALITY` threshold. A near-threshold candidate may be admitted only when all hard floors pass: minimum calibrated quality, edge, confidence, predicted fill probability, maximum distance from touch, active SpreadHunter order cap, and per-scan admission cap. These candidates still run through RiskEngine afterward. This is safer than lowering confidence or raising `MAX_OPEN_ORDERS` because it admits only bounded, near-touch, high-edge paper candidates while keeping cash, exposure, drawdown, stale-book, volatility, duplicate, dust, and ghost safety intact.
+
+The latest calibration then over-filtered: `Open Orders=0`, `Open Order Exposure=$0.00`, `ordersPlacedLastHour=7`, `fillsLastHour=0`, and no duplicate/replacement/max-open-order pressure. Observed candidates were still clustered below the strict gate, for example `sophieExecutionQuality=0.425-0.439`, `predictedFillProbability=0.305-0.375`, edge around `0.016-0.027`, and distance from touch around `0.05-0.09`. That created zero active paper orders even though some candidates were strong enough to test in a bounded paper bootstrap lane.
+
+Sophie now includes paper-only bootstrap admission for zero-order starvation. Strict admission is checked first, calibrated admission second, and bootstrap admission only runs when active paper SpreadHunter orders are below the configured target. Bootstrap candidates must pass hard floors for signal score, execution quality, expected edge, confidence, predicted fill probability, and distance from touch; they are collected for the scan, ranked by bootstrap utility, and admitted only up to the per-scan and active-order caps. Bootstrap utility weights signal score, execution quality, predicted fill probability, normalized edge, confidence, and touch proximity. This is safer than raising `MAX_OPEN_ORDERS` or disabling Sophie because it admits at most the best bounded paper candidates and still requires normal RiskEngine, stale-book, volatility, cash, exposure, drawdown, duplicate, dust, and ghost checks.
+
+Execution-health metrics now distinguish scan pressure from real order placement: `candidateEvaluationsLastHour`, `paperOrdersAdmittedLastHour`, `paperOrdersRejectedBySophieLastHour`, and `paperOrdersPlacedLastHour`. Readiness uses actual `paperOrdersPlacedLastHour` for the order-volume cap while still reporting candidate evaluations.
 
 Repeated low-quality blocks are cooldown-limited and summarized so the same token/side/strategy does not flood logs every scan. Repeated unchanged candidates can also enter a short cooldown after low-quality blocks, reducing duplicate pressure without deleting existing orders or pretending fills happened.
 

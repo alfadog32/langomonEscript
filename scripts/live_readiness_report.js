@@ -107,6 +107,10 @@ function parseLastExecutionHealth(lines) {
       return match ? Number(match[1]) : NaN;
     };
     return {
+      candidateEvaluationsLastHour: get('candidateEvaluationsLastHour'),
+      paperOrdersPlacedLastHour: get('paperOrdersPlacedLastHour'),
+      paperOrdersAdmittedLastHour: get('paperOrdersAdmittedLastHour'),
+      paperOrdersRejectedBySophieLastHour: get('paperOrdersRejectedBySophieLastHour'),
       ordersPlacedLastHour: get('ordersPlacedLastHour'),
       fillsLastHour: get('fillsLastHour'),
       duplicateSkipsLastHour: get('duplicateSkipsLastHour'),
@@ -162,7 +166,19 @@ function main() {
   const totalExposureUsd = parseLastNumber(engineLines, /Open Orders:\s+\d+\s+\|\s+Exposure:\s+\$([0-9.]+)/);
   const executionHealth = parseLastExecutionHealth(engineLines);
   const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour) ? executionHealth.fillsLastHour : countRecent(engineLines, /\[FILL\]/);
-  const ordersPlacedLastHour = Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(engineLines, /\[ORDER\]/);
+  const candidateEvaluationsLastHour = Number.isFinite(executionHealth.candidateEvaluationsLastHour)
+    ? executionHealth.candidateEvaluationsLastHour
+    : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\]|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
+  const paperOrdersAdmittedLastHour = Number.isFinite(executionHealth.paperOrdersAdmittedLastHour)
+    ? executionHealth.paperOrdersAdmittedLastHour
+    : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\].*decision=ADMIT|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
+  const paperOrdersRejectedBySophieLastHour = Number.isFinite(executionHealth.paperOrdersRejectedBySophieLastHour)
+    ? executionHealth.paperOrdersRejectedBySophieLastHour
+    : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\].*BLOCK_LOW_QUALITY|\[SOPHIE EXECUTION THROTTLE\]/);
+  const paperOrdersPlacedLastHour = Number.isFinite(executionHealth.paperOrdersPlacedLastHour)
+    ? executionHealth.paperOrdersPlacedLastHour
+    : (Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(engineLines, /\[ORDER\]/));
+  const ordersPlacedLastHour = paperOrdersPlacedLastHour;
   const duplicateSkipsLastHour = Number.isFinite(executionHealth.duplicateSkipsLastHour) ? executionHealth.duplicateSkipsLastHour : countRecent(engineLines, /\[ORDER SKIP DUPLICATE\]/);
   const maxOpenOrderBlocksLastHour = Number.isFinite(executionHealth.maxOpenOrderBlocksLastHour)
     ? executionHealth.maxOpenOrderBlocksLastHour
@@ -172,7 +188,7 @@ function main() {
   const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
-  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push('no active paper orders; Sophie quality gate may be over-filtering');
+  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push('no active paper orders; Sophie bootstrap/calibrated gates admitted no candidates');
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);
   if (Number.isFinite(totalExposureUsd) && totalExposureUsd > CONFIG.maxTotalExposureUsd) reasons.push(`exposure $${totalExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);
@@ -214,6 +230,10 @@ function main() {
     paperEngineHealth: {
       recentPortfolioReportFound,
       openOrders: Number.isFinite(openOrders) ? openOrders : null,
+      candidateEvaluationsLastHour,
+      paperOrdersPlacedLastHour,
+      paperOrdersAdmittedLastHour,
+      paperOrdersRejectedBySophieLastHour,
       ordersPlacedLastHour,
       fillsLastHour,
       duplicateSkipsLastHour,
