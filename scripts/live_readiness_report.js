@@ -145,6 +145,14 @@ function boolStatus(value, expected) {
   return { value, expected, ok: value === expected };
 }
 
+function recentMatchingLines(lines, pattern, now = Date.now(), windowMs = 10 * 60_000) {
+  return lines.filter((line) => {
+    if (!pattern.test(line)) return false;
+    const ts = Date.parse(line.slice(0, 24));
+    return !Number.isFinite(ts) || now - ts <= windowMs;
+  });
+}
+
 function main() {
   loadEnvFile(path.join(ROOT, '.env'));
 
@@ -166,7 +174,9 @@ function main() {
 
   const engineProc = byName.get('langomonEscript');
   const engineLogPath = engineProc?.pm2_env?.pm_out_log_path || path.join(process.env.HOME || '', '.pm2/logs/langomonEscript-out.log');
+  const engineErrorLogPath = engineProc?.pm2_env?.pm_err_log_path || path.join(process.env.HOME || '', '.pm2/logs/langomonEscript-error.log');
   const engineLines = tailLines(engineLogPath, 1000);
+  const engineErrorLines = tailLines(engineErrorLogPath, 300);
   const recentPortfolioReportFound = engineLines.some((line) => line.includes('--- PORTFOLIO REPORT ---'));
   const openOrders = parseLastNumber(engineLines, /Open Orders:\s+(\d+)/);
   const drawdownPct = parseLastNumber(engineLines, /Drawdown:\s+([0-9.]+)%/);
@@ -213,7 +223,21 @@ function main() {
   const recentStarvationWarning = countRecent(engineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
   const makerOptimizerAdmitsLastHour = countRecent(engineLines, /\[SOPHIE MAKER OPTIMIZER ADMIT\]/);
   const makerOptimizerBlocksLastHour = countRecent(engineLines, /\[SOPHIE MAKER OPTIMIZER BLOCK\]/);
-  const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
+  const pmUptime = Number(engineProc?.pm2_env?.pm_uptime || 0);
+  const uptimeSec = pmUptime > 0 ? Math.max(0, Math.round((Date.now() - pmUptime) / 1000)) : null;
+  const unstableRestarts = Number(engineProc?.pm2_env?.unstable_restarts || 0);
+  const crashPattern = /Fatal start error|Loop error|uncaughtException|Unhandled|FATAL|SyntaxError|ReferenceError|TypeError|process exited|exited with code/i;
+  const recentErrorLines = recentMatchingLines(engineErrorLines, crashPattern);
+  const recentExitLines = recentMatchingLines(engineLines, /\b(process exited|exited with code|uncaughtException|Unhandled|Fatal start error)\b/i, Date.now(), 5 * 60_000);
+  const recentUnstableRestart = unstableRestarts > 0 && Number.isFinite(uptimeSec) && uptimeSec < 120;
+  const crashLoopOk = !engineProc || (engineProc.pm2_env?.status === 'online' && !recentUnstableRestart && recentErrorLines.length === 0 && recentExitLines.length === 0);
+  const crashLoopEvidence = {
+    status: engineProc?.pm2_env?.status || null,
+    uptimeSec,
+    unstableRestarts,
+    recentErrorLines: recentErrorLines.length,
+    recentExitLines: recentExitLines.length,
+  };
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
   if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push(`no active paper orders; candidateEvaluationsLastHour=${candidateEvaluationsLastHour} paperOrdersAdmittedLastHour=${paperOrdersAdmittedLastHour} paperOrdersPlacedLastHour=${paperOrdersPlacedLastHour} makerOptimizerAdmitsLastHour=${makerOptimizerAdmitsLastHour} makerOptimizerBlocksLastHour=${makerOptimizerBlocksLastHour}`);
@@ -287,6 +311,7 @@ function main() {
       makerOptimizerBlocksLastHour,
       recentStarvationWarning,
       crashLoopOk,
+      crashLoopEvidence,
       drawdownPct: Number.isFinite(drawdownPct) ? drawdownPct : null,
       maxDrawdownPct: CONFIG.maxDrawdownPct,
       totalExposureUsd: Number.isFinite(totalExposureUsd) ? totalExposureUsd : null,

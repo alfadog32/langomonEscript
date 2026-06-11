@@ -164,6 +164,10 @@ const CONFIG = {
   paperMakerOptimizerEnabled: envBool('PAPER_MAKER_OPTIMIZER_ENABLED', true),
   paperMakerOptimizerMinEdgeAfterMove: envNum('PAPER_MAKER_OPTIMIZER_MIN_EDGE_AFTER_MOVE', 0.012),
   paperMakerOptimizerMaxTicks: envInt('PAPER_MAKER_OPTIMIZER_MAX_TICKS', 1),
+  paperMakerRecoveryMinEdgeAfterMove: envNum('PAPER_MAKER_RECOVERY_MIN_EDGE_AFTER_MOVE', 0.006),
+  paperMakerRecoveryMaxActive: envInt('PAPER_MAKER_RECOVERY_MAX_ACTIVE', 1),
+  paperMakerRecoveryMinSignalScore: envNum('PAPER_MAKER_RECOVERY_MIN_SIGNAL_SCORE', 0.70),
+  paperMakerRecoveryMinConfidence: envNum('PAPER_MAKER_RECOVERY_MIN_CONFIDENCE', 0.35),
   paperMakerNudgeEnabled: envBool('PAPER_MAKER_NUDGE_ENABLED', false),
   paperMakerNudgeMaxTicks: envInt('PAPER_MAKER_NUDGE_MAX_TICKS', 1),
   paperMakerNudgeMinEdgeAfterNudge: envNum('PAPER_MAKER_NUDGE_MIN_EDGE_AFTER_NUDGE', 0.012),
@@ -3475,6 +3479,7 @@ class BotEngine {
     this.sophieCalibratedAdmissionsThisScan = 0;
     this.sophieBootstrapAdmissionsThisScan = 0;
     this.sophieBootstrapCandidates = [];
+    this.sophieMakerRecoveryCandidates = [];
     this.sophieBootstrapLastLogged = new Map();
     this.sophieFillProbLastLogged = new Map();
     this.sophieNoFillLearnLastLogged = new Map();
@@ -3595,6 +3600,7 @@ class BotEngine {
     this.sophieCalibratedAdmissionsThisScan = 0;
     this.sophieBootstrapAdmissionsThisScan = 0;
     this.sophieBootstrapCandidates = [];
+    this.sophieMakerRecoveryCandidates = [];
     this.whaleTracker?.tick?.();
 
     if (this.cycle === 1 || this.cycle % this.config.marketRefreshEveryCycles === 0) {
@@ -3630,6 +3636,7 @@ class BotEngine {
     }
 
     this.flushSophieBootstrapCandidates();
+    this.flushSophieMakerRecoveryCandidates();
     this.execution.processOpenOrders();
 
     if (this.cycle % this.config.reportEveryCycles === 0) {
@@ -3967,13 +3974,24 @@ class BotEngine {
     return signal;
   }
 
-  optimizeStarvedPaperMakerQuote(signal, book, quality, reason = 'low_quality') {
+  buildStarvedPaperMakerQuote(signal, book, quality, reason = 'low_quality') {
     if (!this.config.paperMakerOptimizerEnabled) return null;
     if (!signal || signal.strategy !== 'SpreadHunter') return null;
     if (isProtectiveExitStrategy(signal.strategy) || !isBookComplete(book)) return null;
-    if (this.portfolio.openOrders.size > 0 || this.spreadHunterOpenOrderCount() > 0) return null;
+    if (this.portfolio.openOrders.size > 0 || this.spreadHunterOpenOrderCount() > 0) {
+      this.logStarvedOptimizerBlock(signal, quality, 'active_orders_present');
+      return null;
+    }
     if (!['buy', 'sell'].includes(String(signal.side || '').toLowerCase())) return null;
     if (!Number.isFinite(signal.price) || !Number.isFinite(signal.expectedEdge)) return null;
+
+    const bootstrapFailures = this.bootstrapAdmissionFailures(signal, quality);
+    const allowedFailures = new Set(['edge', 'fill_probability', 'distance_from_touch']);
+    const disallowedFailures = bootstrapFailures.filter((failure) => !allowedFailures.has(failure));
+    if (disallowedFailures.length > 0) {
+      this.logStarvedOptimizerBlock(signal, quality, 'not_recovery_failure_set', null, null, null, null, { disallowedFailures: disallowedFailures.join(',') });
+      return null;
+    }
 
     const tick = Number(book.tickSize || signal.metadata?.tickSize || 0.01);
     if (!Number.isFinite(tick) || tick <= 0) return null;
@@ -4005,10 +4023,6 @@ class BotEngine {
 
     const priceDelta = Math.abs(optimizedPrice - oldPrice);
     const edgeAfterMove = Number(signal.expectedEdge) - priceDelta;
-    if (edgeAfterMove < this.config.paperMakerOptimizerMinEdgeAfterMove) {
-      this.logStarvedOptimizerBlock(signal, quality, 'edge_after_move_too_low', oldPrice, optimizedPrice, edgeAfterMove);
-      return null;
-    }
 
     const optimized = new Signal({
       ...signal,
@@ -4031,24 +4045,141 @@ class BotEngine {
     });
     const optimizedQuality = this.evaluateSophieExecutionQuality(optimized, book);
     optimized.metadata.sophieExecution = optimizedQuality;
-    optimizedQuality.qualityDecision = 'OPTIMIZED_MAKER_ADMIT';
+    optimizedQuality.qualityDecision = 'OPTIMIZED_MAKER_RECOVERY_QUEUED';
 
-    info(
-      `[SOPHIE MAKER OPTIMIZER ADMIT] ${optimized.side.toUpperCase()} ${shortId(optimized.tokenId)} ` +
-      `oldPrice=${fmtPrice(oldPrice)} optimizedPrice=${fmtPrice(optimizedPrice)} ticksMoved=${Math.round(priceDelta / tick)} ` +
-      `edgeBefore=${cleanLogValue(signal.expectedEdge)} edgeAfter=${cleanLogValue(edgeAfterMove)} ` +
-      `oldDistance=${quality.distanceFromTouch} newDistance=${optimizedQuality.distanceFromTouch} reason=${reason} paperOnly=true riskEngine=required`
-    );
-    return { signal: optimized, quality: optimizedQuality };
+    const recoveryFloor = {
+      minEdgeAfterMove: this.config.paperMakerRecoveryMinEdgeAfterMove,
+      minSignalScore: this.config.paperMakerRecoveryMinSignalScore,
+      minConfidence: this.config.paperMakerRecoveryMinConfidence,
+      maxActive: this.config.paperMakerRecoveryMaxActive,
+    };
+    const failed = [];
+    if (edgeAfterMove < recoveryFloor.minEdgeAfterMove) failed.push('edge_after_move');
+    if (quality.sophieSignalScore < recoveryFloor.minSignalScore) failed.push('signal_score');
+    if (Number(signal.confidence) < recoveryFloor.minConfidence) failed.push('confidence');
+    if (this.portfolio.openOrders.size >= recoveryFloor.maxActive) failed.push('active_order_cap');
+    if (failed.length > 0) {
+      this.logStarvedOptimizerBlock(signal, quality, 'recovery_floor_failed', oldPrice, optimizedPrice, edgeAfterMove, optimizedQuality, {
+        failed: failed.join(','),
+        recoveryFloor: this.formatMakerRecoveryFloor(recoveryFloor),
+      });
+      return null;
+    }
+
+    return {
+      signal: optimized,
+      quality: optimizedQuality,
+      asset: null,
+      book,
+      reason,
+      oldPrice,
+      optimizedPrice,
+      edgeBefore: Number(signal.expectedEdge),
+      edgeAfterMove,
+      oldDistance: quality.distanceFromTouch,
+      optimizedDistance: optimizedQuality.distanceFromTouch,
+      optimizedFillProb: optimizedQuality.predictedFillProbability,
+      recoveryFloor,
+      utility: this.makerRecoveryUtility(optimized, optimizedQuality, edgeAfterMove),
+    };
   }
 
-  logStarvedOptimizerBlock(signal, quality, reason, oldPrice = null, optimizedPrice = null, edgeAfterMove = null) {
+  formatMakerRecoveryFloor(floor = {}) {
+    return [
+      `edge>=${cleanLogValue(floor.minEdgeAfterMove)}`,
+      `signalScore>=${cleanLogValue(floor.minSignalScore)}`,
+      `confidence>=${cleanLogValue(floor.minConfidence)}`,
+      `maxActive=${floor.maxActive}`,
+    ].join('|');
+  }
+
+  makerRecoveryUtility(signal, quality, edgeAfterMove) {
+    return (
+      (0.45 * clamp(edgeAfterMove / 0.02, 0, 1)) +
+      (0.25 * clamp(quality.predictedFillProbability, 0, 1)) +
+      (0.20 * clamp(quality.sophieSignalScore, 0, 1)) +
+      (0.10 * clamp(Number(signal.confidence) || 0, 0, 1))
+    );
+  }
+
+  queueStarvedPaperMakerQuote(signal, asset, book, quality, reason = 'low_quality') {
+    const candidate = this.buildStarvedPaperMakerQuote(signal, book, quality, reason);
+    if (!candidate) return false;
+    candidate.asset = asset;
+    this.sophieMakerRecoveryCandidates.push(candidate);
+    quality.qualityDecision = 'OPTIMIZED_MAKER_RECOVERY_QUEUED';
+    this.lastSophieQualityDecision = quality;
+    return true;
+  }
+
+  flushSophieMakerRecoveryCandidates() {
+    if (!this.sophieMakerRecoveryCandidates.length) return;
+    if (this.portfolio.openOrders.size > 0 || this.spreadHunterOpenOrderCount() > 0) {
+      for (const candidate of this.sophieMakerRecoveryCandidates) {
+        this.logStarvedOptimizerBlock(candidate.signal, candidate.quality, 'active_orders_present', candidate.oldPrice, candidate.optimizedPrice, candidate.edgeAfterMove, candidate.quality, {
+          recoveryFloor: this.formatMakerRecoveryFloor(candidate.recoveryFloor),
+        });
+      }
+      this.sophieMakerRecoveryCandidates = [];
+      return;
+    }
+
+    const ranked = this.sophieMakerRecoveryCandidates
+      .slice()
+      .sort((a, b) => b.utility - a.utility)
+      .slice(0, Math.max(1, this.config.paperMakerRecoveryMaxActive));
+
+    for (const candidate of ranked) {
+      if (this.portfolio.openOrders.size >= this.config.paperMakerRecoveryMaxActive) {
+        this.logStarvedOptimizerBlock(candidate.signal, candidate.quality, 'active_order_cap', candidate.oldPrice, candidate.optimizedPrice, candidate.edgeAfterMove, candidate.quality, {
+          recoveryFloor: this.formatMakerRecoveryFloor(candidate.recoveryFloor),
+        });
+        continue;
+      }
+
+      const risked = this.risk.evaluate(candidate.signal);
+      if (!risked) {
+        this.logStarvedOptimizerBlock(candidate.signal, candidate.quality, 'risk_rejected', candidate.oldPrice, candidate.optimizedPrice, candidate.edgeAfterMove, candidate.quality, {
+          recoveryFloor: this.formatMakerRecoveryFloor(candidate.recoveryFloor),
+          riskOk: false,
+          riskReason: this.risk.lastBlockReason || 'invalid_signal',
+        });
+        continue;
+      }
+
+      candidate.quality.qualityDecision = 'OPTIMIZED_MAKER_ADMIT';
+      this.lastSophieQualityDecision = candidate.quality;
+      this.recordSophieAdmission(candidate.signal, candidate.quality);
+      info(
+        `[SOPHIE MAKER OPTIMIZER ADMIT] ${candidate.signal.side.toUpperCase()} ${shortId(candidate.signal.tokenId)} ` +
+        `oldPrice=${fmtPrice(candidate.oldPrice)} optimizedPrice=${fmtPrice(candidate.optimizedPrice)} ` +
+        `edgeBefore=${cleanLogValue(candidate.edgeBefore)} edgeAfter=${cleanLogValue(candidate.edgeAfterMove)} ` +
+        `optimizedFillProb=${candidate.optimizedFillProb} oldDistance=${candidate.oldDistance} optimizedDistance=${candidate.optimizedDistance} ` +
+        `recoveryFloor=${this.formatMakerRecoveryFloor(candidate.recoveryFloor)} riskOk=true paperOnly=true`
+      );
+      this.execution.place(risked, candidate.book);
+    }
+
+    this.sophieMakerRecoveryCandidates = [];
+  }
+
+  logStarvedOptimizerBlock(signal, quality, reason, oldPrice = null, optimizedPrice = null, edgeAfterMove = null, optimizedQuality = null, extra = {}) {
+    const recoveryFloor = extra.recoveryFloor || this.formatMakerRecoveryFloor({
+      minEdgeAfterMove: this.config.paperMakerRecoveryMinEdgeAfterMove,
+      minSignalScore: this.config.paperMakerRecoveryMinSignalScore,
+      minConfidence: this.config.paperMakerRecoveryMinConfidence,
+      maxActive: this.config.paperMakerRecoveryMaxActive,
+    });
     warn(
       `[SOPHIE MAKER OPTIMIZER BLOCK] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
       `reason=${reason} openOrders=${this.portfolio.openOrders.size} oldPrice=${Number.isFinite(oldPrice) ? fmtPrice(oldPrice) : 'NA'} ` +
       `optimizedPrice=${Number.isFinite(optimizedPrice) ? fmtPrice(optimizedPrice) : 'NA'} ` +
       `edgeBefore=${cleanLogValue(signal.expectedEdge)} edgeAfter=${Number.isFinite(edgeAfterMove) ? cleanLogValue(edgeAfterMove) : 'NA'} ` +
-      `fillProb=${quality.predictedFillProbability} distanceFromTouch=${quality.distanceFromTouch} paperOnly=true`
+      `optimizedFillProb=${optimizedQuality?.predictedFillProbability ?? 'NA'} oldDistance=${quality.distanceFromTouch} ` +
+      `optimizedDistance=${optimizedQuality?.distanceFromTouch ?? 'NA'} signalScore=${quality.sophieSignalScore} ` +
+      `confidence=${cleanLogValue(signal.confidence)} recoveryFloor=${recoveryFloor} ` +
+      `failed=${extra.failed || reason} riskOk=${extra.riskOk ?? 'NA'} riskReason=${extra.riskReason || 'NA'} ` +
+      `disallowedFailures=${extra.disallowedFailures || 'none'} paperOnly=true`
     );
   }
 
@@ -4062,16 +4193,6 @@ class BotEngine {
     const now = Date.now();
     const repeatCooldownUntil = this.sophieRepeatCandidateCooldownUntil.get(repeatKey) || 0;
     if (repeatCooldownUntil > now) {
-      const optimized = this.optimizeStarvedPaperMakerQuote(signal, book, quality, 'repeat_cooldown_starvation');
-      if (optimized) {
-        signal.price = optimized.signal.price;
-        signal.expectedEdge = optimized.signal.expectedEdge;
-        signal.metadata = optimized.signal.metadata;
-        Object.assign(quality, optimized.quality);
-        this.lastSophieQualityDecision = quality;
-        this.recordSophieAdmission(signal, quality);
-        return true;
-      }
       quality.qualityDecision = 'REPEAT_COOLDOWN';
       this.lastSophieQualityDecision = quality;
       this.recordRepeatCandidateSuppression(signal, repeatKey);
@@ -4144,15 +4265,8 @@ class BotEngine {
       if (this.config.sophieBootstrapAdmissionEnabled && signal.strategy === 'SpreadHunter') {
         this.recordBootstrapBlock(signal, quality);
       }
-      const optimized = this.optimizeStarvedPaperMakerQuote(signal, book, quality, 'zero_open_orders_low_quality');
-      if (optimized) {
-        signal.price = optimized.signal.price;
-        signal.expectedEdge = optimized.signal.expectedEdge;
-        signal.metadata = optimized.signal.metadata;
-        Object.assign(quality, optimized.quality);
-        this.lastSophieQualityDecision = quality;
-        this.recordSophieAdmission(signal, quality);
-        return true;
+      if (this.queueStarvedPaperMakerQuote(signal, asset, book, quality, 'zero_open_orders_low_quality')) {
+        return false;
       }
       this.recordLowQualityBlock(signal, quality);
       this.sophieRepeatCandidateCooldownUntil.set(repeatKey, now + this.config.sophieRepeatCandidateCooldownMs);
