@@ -11,6 +11,40 @@ const { readConfig: readTelegramConfig } = require('../telegram/telegram_approva
 const ROOT = process.cwd();
 const REQUIRED_PM2 = ['langomonEscript', 'liveIntentRouter', 'telegramApprovalBot', 'moneyMakerDashboard'];
 
+function loadEnvFile(filePath) {
+  const resolved = path.resolve(filePath);
+  if (!fs.existsSync(resolved)) return;
+
+  const raw = fs.readFileSync(resolved, 'utf8');
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (process.env[key] === undefined) process.env[key] = value;
+  }
+}
+
+function normalizeBaseUrl(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function dashboardHealthCommand() {
+  const publicUrl = normalizeBaseUrl(process.env.DASHBOARD_PUBLIC_URL);
+  if (publicUrl) return `curl -s ${publicUrl}/health`;
+
+  const host = String(process.env.DASHBOARD_HOST || '127.0.0.1').trim() || '127.0.0.1';
+  const port = Number.parseInt(process.env.DASHBOARD_PORT || '18888', 10);
+  const displayHost = host === '0.0.0.0' ? '127.0.0.1' : host;
+  return `curl -s http://${displayHost}:${Number.isFinite(port) ? port : 18888}/health`;
+}
+
 function runCommand(command, args, options = {}) {
   try {
     return {
@@ -79,6 +113,8 @@ function boolStatus(value, expected) {
 }
 
 function main() {
+  loadEnvFile(path.join(ROOT, '.env'));
+
   const reasons = [];
   const pm2 = readPm2List();
   const byName = new Map(pm2.processes.map((proc) => [proc.name, proc]));
@@ -168,7 +204,7 @@ function main() {
     dashboard: {
       syntaxOk: dashboardSyntax.ok,
       processOnline: pm2Checks.moneyMakerDashboard === 'online',
-      manualHealthCommand: 'curl -s http://127.0.0.1:8787/health',
+      manualHealthCommand: dashboardHealthCommand(),
     },
     reasons,
   };
