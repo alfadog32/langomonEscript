@@ -64,6 +64,28 @@ RiskEngine block logs use precise reasons instead of generic `risk_blocked`: `in
 
 `[SIGNAL BLOCK]` logs include the threshold/cap values needed to diagnose runtime failures: expected edge, minimum edge, confidence, minimum confidence, signal size, minimum order size, available cash, current position quantity, available sell quantity, current position USD, total exposure, market exposure, open-order exposure, and drawdown. SpreadHunter BUY failures should now identify whether the signal fell below edge/confidence after consensus adjustment, hit cash/exposure/position caps, or had invalid size/price. TakeProfitExit and StopLossExit SELL failures should identify whether there was no available inventory or the sell was clamped below `MIN_ORDER_USD`.
 
+## Paper Confidence Profiles
+
+After route authorization was fixed, runtime paper flow was still starved because valid SpreadHunter `MAKER:STABLE` candidates had expected edge above `MIN_SIGNAL_EDGE` but confidence around `0.35-0.40`, below the global `MIN_CONFIDENCE=0.45`. Cash, exposure, open-order, and drawdown limits were not the active blocker.
+
+MoneyMaker now separates paper confidence calibration from live safety with `PAPER_CONFIDENCE_PROFILE`:
+
+- `conservative`: always uses normal `MIN_CONFIDENCE`.
+- `balanced`: default paper profile; uses normal `MIN_CONFIDENCE` and keeps the safer baseline.
+- `capital_velocity`: paper-only research mode that lets authorized SpreadHunter `MAKER:STABLE` candidates use `SPREADHUNTER_MIN_CONFIDENCE_PAPER` instead of the global confidence threshold.
+
+The lower paper threshold does not bypass consensus route authorization, expected edge, stale-book checks, volatility guard, cash, exposure, drawdown, duplicate-open-order protection, or ghost safety. It only changes the confidence threshold after those upstream maker-stable safety checks are already satisfied. `[SIGNAL BLOCK]` logs now show the actual `minConfidence` used plus `confidenceProfile` and `thresholdSource`, so a confidence block can be traced to either `MIN_CONFIDENCE` or `SPREADHUNTER_MIN_CONFIDENCE_PAPER`.
+
+To manually test order flow in paper mode on the server, set:
+
+```bash
+PAPER_CONFIDENCE_PROFILE=capital_velocity
+SPREADHUNTER_MIN_CONFIDENCE_PAPER=0.35
+MIN_CONFIDENCE=0.45
+```
+
+Do not change live trading flags for this paper calibration. Live submission remains disabled unless explicitly enabled in the separate live adapter flow.
+
 ## Live Dependency Audit Caution
 
 `npm audit fix` without `--force` leaves known transitive vulnerabilities under the live adapter dependency chain. The remaining advisories are not caused by the paper engine and are not fixed safely by npm without a breaking downgrade:

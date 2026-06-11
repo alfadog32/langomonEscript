@@ -179,7 +179,7 @@ const CONFIG = {
   makerSpreadMultiplier: envNum('MAKER_SPREAD_MULTIPLIER', 1.2),
 
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
-  paperConfidenceProfile: envStr('PAPER_CONFIDENCE_PROFILE', 'conservative'),
+  paperConfidenceProfile: envStr('PAPER_CONFIDENCE_PROFILE', 'balanced'),
   spreadHunterMinConfidencePaper: envNum('SPREADHUNTER_MIN_CONFIDENCE_PAPER', 0.35),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
   slippageBuffer: envNum('SLIPPAGE_BUFFER', 0.004),
@@ -2690,26 +2690,49 @@ class RiskEngine {
   }
 
   paperConfidenceProfile() {
-    const profile = String(this.config.paperConfidenceProfile || 'conservative').trim().toLowerCase();
-    return ['conservative', 'balanced', 'capital_velocity'].includes(profile) ? profile : 'conservative';
+    const profile = String(this.config.paperConfidenceProfile || 'balanced').trim().toLowerCase();
+    return ['conservative', 'balanced', 'capital_velocity'].includes(profile) ? profile : 'balanced';
   }
 
   isPaperSpreadHunterOverrideEligible(signal) {
     if (!signal || signal.strategy !== 'SpreadHunter') return false;
     const profile = this.paperConfidenceProfile();
-    if (!['balanced', 'capital_velocity'].includes(profile)) return false;
+    if (profile !== 'capital_velocity') return false;
 
     const route = signal.metadata?.consensus?.route || {};
     return route.authorized === true && route.mode === 'MAKER' && route.state === 'STABLE';
   }
 
-  effectiveMinConfidence(signal) {
+  confidenceThreshold(signal) {
     const base = this.config.minConfidence;
-    if (!this.isPaperSpreadHunterOverrideEligible(signal)) return base;
+    const profile = this.paperConfidenceProfile();
+    const overrideEligible = this.isPaperSpreadHunterOverrideEligible(signal);
+
+    if (!overrideEligible) {
+      return {
+        minConfidence: base,
+        confidenceProfile: profile,
+        thresholdSource: 'MIN_CONFIDENCE',
+        paperConfidenceOverrideEligible: false,
+      };
+    }
 
     const paperMin = Number(this.config.spreadHunterMinConfidencePaper);
-    if (!Number.isFinite(paperMin) || paperMin <= 0) return base;
-    return Math.min(base, paperMin);
+    if (!Number.isFinite(paperMin) || paperMin <= 0) {
+      return {
+        minConfidence: base,
+        confidenceProfile: profile,
+        thresholdSource: 'MIN_CONFIDENCE',
+        paperConfidenceOverrideEligible: true,
+      };
+    }
+
+    return {
+      minConfidence: Math.min(base, paperMin),
+      confidenceProfile: profile,
+      thresholdSource: 'SPREADHUNTER_MIN_CONFIDENCE_PAPER',
+      paperConfidenceOverrideEligible: true,
+    };
   }
 
   riskDetails(signal) {
@@ -2728,6 +2751,7 @@ class RiskEngine {
     const marketExposureUsd = this.portfolio.marketExposureUsd(signal.marketId);
     const currentPosUsd = Number.isFinite(signal.price) ? currentPosQty * signal.price : NaN;
     const drawdownPct = this.portfolio.getDrawdownPct();
+    const confidenceThreshold = this.confidenceThreshold(signal);
 
     return {
       strategy: signal.strategy || null,
@@ -2739,10 +2763,11 @@ class RiskEngine {
       expectedEdge: Number(signal.expectedEdge),
       minSignalEdge: this.config.minSignalEdge,
       confidence: Number(signal.confidence),
-      minConfidence: this.config.minConfidence,
-      effectiveMinConfidence: this.effectiveMinConfidence(signal),
-      paperConfidenceProfile: this.paperConfidenceProfile(),
-      paperConfidenceOverrideEligible: this.isPaperSpreadHunterOverrideEligible(signal),
+      minConfidence: confidenceThreshold.minConfidence,
+      configuredMinConfidence: this.config.minConfidence,
+      confidenceProfile: confidenceThreshold.confidenceProfile,
+      thresholdSource: confidenceThreshold.thresholdSource,
+      paperConfidenceOverrideEligible: confidenceThreshold.paperConfidenceOverrideEligible,
       availableCash: this.portfolio.availableCash(),
       currentPositionQty: currentPosQty,
       availableSellQty,
@@ -2784,8 +2809,10 @@ class RiskEngine {
 
     const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
     if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return this.block(signal, 'edge_below_min');
-    const minConfidence = this.effectiveMinConfidence(signal);
-    if (!isProtectiveExit && signal.confidence < minConfidence) return this.block(signal, 'confidence_below_min', { effectiveMinConfidence: minConfidence });
+    const confidenceThreshold = this.confidenceThreshold(signal);
+    if (!isProtectiveExit && signal.confidence < confidenceThreshold.minConfidence) {
+      return this.block(signal, 'confidence_below_min', confidenceThreshold);
+    }
 
     const openUsd = this.portfolio.totalOpenOrderUsd();
     if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'max_total_open_order_usd');
@@ -3401,6 +3428,8 @@ function formatRiskBlockDetails(details = {}) {
     'minSignalEdge',
     'confidence',
     'minConfidence',
+    'confidenceProfile',
+    'thresholdSource',
     'sizeUsd',
     'minOrderUsd',
     'availableCash',
