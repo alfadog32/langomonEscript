@@ -103,6 +103,29 @@ If open orders age beyond `FILL_STARVATION_WARN_SEC` with no fills in the last h
 
 `npm run live:readiness` is a read-only operator report. It does not place orders, read live private keys, send Telegram messages, or enable live flags. It checks PM2 process presence, recent paper health, safety flags, Telegram token/chat-id presence with redaction, and dashboard syntax. `READY_FOR_MICRO_LIVE=false` is expected until paper health and process checks are clean; even a passing report is only for dry-run review, not automatic live execution.
 
+## Sophie Execution Quality
+
+The current paper problem is no longer starvation from confidence blocks. The engine is active but inefficient: recent operations showed roughly 1 fill from about 580 paper order placements, or about `1 / 580 = 0.17%`, with duplicate skips and max-open-order pressure dominating the loop. Raising `MAX_OPEN_ORDERS` would hide the symptom by letting more low-fill orders rest; it would not improve fill probability, order-slot quality, or churn. Force-selling dust is also unsafe because sub-`MIN_ORDER_USD` positions cannot be assumed executable; dust remains suppression-only and tracked in reports/state.
+
+Sophie now scores paper execution quality separately from theoretical signal quality. The signal score still answers whether the strategy signal is attractive. The execution-quality score asks whether the order is likely to fill efficiently without wasting a scarce paper order slot.
+
+The implemented formula blends:
+
+- `sophieSignalScore`: consensus score when available, otherwise signal confidence.
+- Edge and confidence quality.
+- `predictedFillProbability`, estimated from token/side/strategy fill history, strategy fill history, quote distance from touch, spread quality, top-depth quality, ghost favorable rate, duplicate pressure, and no-fill pressure.
+- Slot, duplicate, no-fill, churn, and open-order age penalties.
+
+The paper gate uses `SOPHIE_MIN_EXECUTION_QUALITY` for non-protective entries. Protective exits bypass the Sophie throttle. Low-fill token/side/strategy combinations can enter a cooldown when attempts and duplicate skips are high with no fills. When order slots are saturated, the slot manager uses:
+
+```text
+candidateUtility > weakestOpenOrderUtility + replacementFriction
+```
+
+where `replacementFriction` is `SOPHIE_SLOT_EVICTION_MIN_IMPROVEMENT`. Eviction is paper-only, never targets protective exits, requires the open order to be older than `SOPHIE_SLOT_EVICTION_MIN_OPEN_ORDER_AGE_SEC`, and only admits candidates that do not increase open-order exposure relative to the evicted order.
+
+`npm run live:readiness` now keeps `READY_FOR_MICRO_LIVE=false` unless all safety and efficiency checks pass: expected PM2 processes online, safe live flags, recent portfolio report, `fillsLastHour >= 3`, `fillRateLastHour >= 1.0%`, `ordersPlacedLastHour <= 150`, `duplicateSkipsLastHour <= 500`, `maxOpenOrderBlocksLastHour <= 50`, and no recent engine starvation warning. Passing readiness still means dry-run review only, not automatic live execution.
+
 ## Live Dependency Audit Caution
 
 `npm audit fix` without `--force` leaves known transitive vulnerabilities under the live adapter dependency chain. The remaining advisories are not caused by the paper engine and are not fixed safely by npm without a breaking downgrade:

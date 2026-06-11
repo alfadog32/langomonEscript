@@ -98,6 +98,27 @@ function parseLastNumber(lines, pattern) {
   return NaN;
 }
 
+function parseLastExecutionHealth(lines) {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes('Execution Health:')) continue;
+    const get = (key) => {
+      const match = line.match(new RegExp(`${key}=([0-9.]+)%?`));
+      return match ? Number(match[1]) : NaN;
+    };
+    return {
+      ordersPlacedLastHour: get('ordersPlacedLastHour'),
+      fillsLastHour: get('fillsLastHour'),
+      duplicateSkipsLastHour: get('duplicateSkipsLastHour'),
+      replacementsLastHour: get('replacementsLastHour'),
+      oldestOpenOrderAgeSec: get('oldestOpenOrderAgeSec'),
+      maxOpenOrderBlocksLastHour: get('maxOpenOrderBlocksLastHour'),
+      fillRateLastHour: get('fillRateLastHour'),
+    };
+  }
+  return {};
+}
+
 function countRecent(lines, pattern, now = Date.now(), windowMs = 60 * 60_000) {
   let count = 0;
   for (const line of lines) {
@@ -139,8 +160,15 @@ function main() {
   const drawdownPct = parseLastNumber(engineLines, /Drawdown:\s+([0-9.]+)%/);
   const openOrderExposureUsd = parseLastNumber(engineLines, /Open Order Exposure:\s+\$([0-9.]+)/);
   const totalExposureUsd = parseLastNumber(engineLines, /Open Orders:\s+\d+\s+\|\s+Exposure:\s+\$([0-9.]+)/);
-  const fillsLastHour = countRecent(engineLines, /\[FILL\]/);
-  const ordersPlacedLastHour = countRecent(engineLines, /\[ORDER\]/);
+  const executionHealth = parseLastExecutionHealth(engineLines);
+  const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour) ? executionHealth.fillsLastHour : countRecent(engineLines, /\[FILL\]/);
+  const ordersPlacedLastHour = Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(engineLines, /\[ORDER\]/);
+  const duplicateSkipsLastHour = Number.isFinite(executionHealth.duplicateSkipsLastHour) ? executionHealth.duplicateSkipsLastHour : countRecent(engineLines, /\[ORDER SKIP DUPLICATE\]/);
+  const maxOpenOrderBlocksLastHour = Number.isFinite(executionHealth.maxOpenOrderBlocksLastHour)
+    ? executionHealth.maxOpenOrderBlocksLastHour
+    : countRecent(engineLines, /\[SOPHIE SLOT BLOCK\]|block=max_open_orders/);
+  const fillRateLastHour = Number.isFinite(executionHealth.fillRateLastHour) ? executionHealth.fillRateLastHour : (ordersPlacedLastHour > 0 ? (fillsLastHour / ordersPlacedLastHour) * 100 : 0);
+  const recentStarvationWarning = countRecent(engineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
   const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
@@ -149,7 +177,12 @@ function main() {
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);
   if (Number.isFinite(totalExposureUsd) && totalExposureUsd > CONFIG.maxTotalExposureUsd) reasons.push(`exposure $${totalExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);
   if (Number.isFinite(openOrderExposureUsd) && openOrderExposureUsd > CONFIG.maxTotalOpenOrderUsd) reasons.push(`open order exposure $${openOrderExposureUsd} exceeds cap $${CONFIG.maxTotalOpenOrderUsd}`);
-  if (fillsLastHour <= 0) reasons.push('no paper fills detected in last hour');
+  if (fillsLastHour < 3) reasons.push(`fillsLastHour ${fillsLastHour} below required 3`);
+  if (fillRateLastHour < 1.0) reasons.push(`fillRateLastHour ${fillRateLastHour}% below required 1.0%`);
+  if (ordersPlacedLastHour > 150) reasons.push(`ordersPlacedLastHour ${ordersPlacedLastHour} exceeds max 150`);
+  if (duplicateSkipsLastHour > 500) reasons.push(`duplicateSkipsLastHour ${duplicateSkipsLastHour} exceeds max 500`);
+  if (maxOpenOrderBlocksLastHour > 50) reasons.push(`maxOpenOrderBlocksLastHour ${maxOpenOrderBlocksLastHour} exceeds max 50`);
+  if (recentStarvationWarning) reasons.push('recent engine starvation warning detected');
 
   const liveConfig = readLiveConfig(ROOT);
   const safetyFlags = {
@@ -183,7 +216,11 @@ function main() {
       openOrders: Number.isFinite(openOrders) ? openOrders : null,
       ordersPlacedLastHour,
       fillsLastHour,
+      duplicateSkipsLastHour,
+      maxOpenOrderBlocksLastHour,
+      fillRateLastHour,
       fillsDetected: fillsLastHour > 0,
+      recentStarvationWarning,
       crashLoopOk,
       drawdownPct: Number.isFinite(drawdownPct) ? drawdownPct : null,
       maxDrawdownPct: CONFIG.maxDrawdownPct,
