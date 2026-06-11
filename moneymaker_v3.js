@@ -103,6 +103,13 @@ const CONFIG = {
   openOrderReplaceEnabled: envBool('OPEN_ORDER_REPLACE_ENABLED', true),
   openOrderReplaceMinPriceDeltaTicks: envInt('OPEN_ORDER_REPLACE_MIN_PRICE_DELTA_TICKS', 1),
   openOrderReplaceAfterMs: envInt('OPEN_ORDER_REPLACE_AFTER_MS', 15_000),
+  openOrderReplaceMinAgeMs: envInt('ORDER_REPLACE_MIN_AGE_SEC', 45) * 1000,
+  openOrderReplacePriceEpsilon: envNum('ORDER_REPLACE_PRICE_EPSILON', 0.001),
+  openOrderReplaceAllowSamePrice: envBool('ORDER_REPLACE_ALLOW_SAME_PRICE', false),
+  openOrderReplaceForceRefreshMs: envInt('ORDER_REPLACE_FORCE_REFRESH_SEC', 120) * 1000,
+  dustExitSuppressEnabled: envBool('DUST_EXIT_SUPPRESS_ENABLED', true),
+  dustExitLogCooldownMs: envInt('DUST_EXIT_LOG_COOLDOWN_SEC', 300) * 1000,
+  fillStarvationWarnMs: envInt('FILL_STARVATION_WARN_SEC', 900) * 1000,
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
   // Practical revenue/risk optimization controls.
@@ -2324,6 +2331,13 @@ class PaperPortfolio {
     this.fills = [];
     this.ghostOrders = [];
     this.ghostStats = { total: 0, favorable: 0, unfavorable: 0 };
+    this.executionEvents = [];
+    this.executionTotals = {
+      paperOrdersPlaced: 0,
+      paperOrderReplacements: 0,
+      paperDuplicateSkips: 0,
+      paperFills: 0,
+    };
   }
 
   position(tokenId) {
@@ -2451,6 +2465,24 @@ class PaperPortfolio {
     return this.totalOpenOrderUsd();
   }
 
+  dustPositions(markPrices = new Map()) {
+    return [...this.positions.entries()]
+      .filter(([, qty]) => qty > 0)
+      .map(([tokenId, qty]) => {
+        const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
+        return { tokenId, qty, mark, value: qty * mark };
+      })
+      .filter((pos) => pos.value > 0 && pos.value < this.config.minOrderUsd);
+  }
+
+  dustSummary(markPrices = new Map()) {
+    const positions = this.dustPositions(markPrices);
+    return {
+      count: positions.length,
+      valueUsd: positions.reduce((sum, pos) => sum + pos.value, 0),
+    };
+  }
+
   topPositions(markPrices = new Map(), limit = 10) {
     return [...this.positions.entries()]
       .filter(([, qty]) => qty > 0)
@@ -2493,6 +2525,45 @@ class PaperPortfolio {
 
   cancelOrder(orderId) {
     this.openOrders.delete(orderId);
+  }
+
+  recordExecutionEvent(type, ts = Date.now()) {
+    this.executionEvents.push({ type, ts });
+    while (this.executionEvents.length > 5000) this.executionEvents.shift();
+
+    if (type === 'order_placed') this.executionTotals.paperOrdersPlaced += 1;
+    if (type === 'order_replacement') this.executionTotals.paperOrderReplacements += 1;
+    if (type === 'duplicate_skip') this.executionTotals.paperDuplicateSkips += 1;
+    if (type === 'fill') this.executionTotals.paperFills += 1;
+  }
+
+  executionHealth(now = Date.now()) {
+    const hourAgo = now - 60 * 60_000;
+    const recent = this.executionEvents.filter((event) => Number(event.ts) >= hourAgo);
+    const countType = (type) => recent.filter((event) => event.type === type).length;
+    const openOrders = [...this.openOrders.values()];
+    const agesSec = openOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
+    const ordersPlacedLastHour = countType('order_placed');
+    const fillsLastHour = countType('fill');
+    const duplicateSkipsLastHour = countType('duplicate_skip');
+    const replacementsLastHour = countType('order_replacement');
+    const oldestOpenOrderAgeSec = agesSec.length ? Math.max(...agesSec) : 0;
+    const avgOpenOrderAgeSec = agesSec.length
+      ? agesSec.reduce((sum, age) => sum + age, 0) / agesSec.length
+      : 0;
+
+    return {
+      ...this.executionTotals,
+      ordersPlacedLastHour,
+      fillsLastHour,
+      duplicateSkipsLastHour,
+      replacementsLastHour,
+      oldestOpenOrderAgeSec,
+      avgOpenOrderAgeSec,
+      openOrderExposureUsd: this.openOrderExposureUsd(),
+      fillRateLastHour: ordersPlacedLastHour > 0 ? (fillsLastHour / ordersPlacedLastHour) * 100 : 0,
+      fillStarvationReason: openOrders.length > 0 && fillsLastHour === 0 ? 'no_recent_fills' : null,
+    };
   }
 
   recordGhostOrder(signal, book) {
@@ -2617,6 +2688,8 @@ class PaperPortfolio {
         strategyPnl: Object.fromEntries(this.strategyPnl),
         ghostStats: this.ghostStats,
         fills: this.fills.slice(-500),
+        executionTotals: this.executionTotals,
+        executionEvents: this.executionEvents.slice(-1000),
       };
 
       fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
@@ -2643,6 +2716,11 @@ class PaperPortfolio {
       this.strategyPnl = new Map(Object.entries(data.strategyPnl || {}).map(([k, v]) => [k, Number(v)]));
       this.ghostStats = data.ghostStats || this.ghostStats;
       this.fills = Array.isArray(data.fills) ? data.fills : [];
+      this.executionTotals = {
+        ...this.executionTotals,
+        ...(data.executionTotals || {}),
+      };
+      this.executionEvents = Array.isArray(data.executionEvents) ? data.executionEvents : [];
 
       info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity().toFixed(2)}`);
     } catch (e) {
@@ -2874,15 +2952,40 @@ class PaperExecutionEngine {
   }
 
   shouldReplaceOpenOrder(existingOrder, signal, book) {
-    if (!this.config.openOrderReplaceEnabled) return false;
+    if (!this.config.openOrderReplaceEnabled) return { replace: false, reason: 'disabled' };
 
     const tick = book?.tickSize || signal.metadata?.tickSize || 0.01;
     const minTicks = Math.max(1, this.config.openOrderReplaceMinPriceDeltaTicks || 1);
     const minPriceDelta = tick * minTicks;
     const priceDelta = Math.abs(Number(signal.price) - Number(existingOrder.price));
     const ageMs = Date.now() - existingOrder.createdAt;
+    const epsilon = Math.max(0, Number(this.config.openOrderReplacePriceEpsilon) || 0);
+    const samePrice = priceDelta < epsilon;
+    const minAgeMs = Math.max(0, this.config.openOrderReplaceMinAgeMs || 0);
+    const forceRefreshMs = Math.max(minAgeMs, this.config.openOrderReplaceForceRefreshMs || 0);
 
-    return priceDelta >= minPriceDelta || ageMs >= this.config.openOrderReplaceAfterMs;
+    if (ageMs < minAgeMs) {
+      return { replace: false, reason: 'age', ageMs, minAgeMs, priceDelta, epsilon, samePrice };
+    }
+
+    if (samePrice && !this.config.openOrderReplaceAllowSamePrice && ageMs < forceRefreshMs) {
+      return { replace: false, reason: 'same_price', ageMs, minAgeMs, forceRefreshMs, priceDelta, epsilon, samePrice };
+    }
+
+    const legacyReplace = priceDelta >= minPriceDelta || ageMs >= this.config.openOrderReplaceAfterMs;
+    const forceRefresh = samePrice && ageMs >= forceRefreshMs;
+    const meaningfulPriceChange = !samePrice && priceDelta >= Math.max(epsilon, minPriceDelta);
+
+    return {
+      replace: forceRefresh || meaningfulPriceChange || legacyReplace,
+      reason: forceRefresh ? 'force_refresh' : meaningfulPriceChange ? 'price_change' : legacyReplace ? 'legacy' : 'duplicate',
+      ageMs,
+      minAgeMs,
+      forceRefreshMs,
+      priceDelta,
+      epsilon,
+      samePrice,
+    };
   }
 
   place(signal, book) {
@@ -2890,10 +2993,31 @@ class PaperExecutionEngine {
     const maxComparable = Math.max(1, this.config.maxOpenOrdersPerTokenSideStrategy || 1);
 
     if (comparableOrders.length >= maxComparable) {
-      const replaceable = comparableOrders.filter(({ order }) => this.shouldReplaceOpenOrder(order, signal, book));
+      const decisions = comparableOrders.map(({ id, order }) => ({
+        id,
+        order,
+        decision: this.shouldReplaceOpenOrder(order, signal, book),
+      }));
+      const replaceable = decisions.filter(({ decision }) => decision.replace);
 
       if (replaceable.length === 0) {
-        info(`[ORDER SKIP DUPLICATE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} [${signal.strategy}] active=${comparableOrders.length}`);
+        const decision = decisions[0]?.decision || {};
+        if (decision.reason === 'age') {
+          info(
+            `[ORDER REPLACE SKIP AGE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+            `age=${Math.round((decision.ageMs || 0) / 1000)}s minAge=${Math.round((decision.minAgeMs || 0) / 1000)}s`
+          );
+        } else if (decision.reason === 'same_price') {
+          const order = decisions[0].order;
+          info(
+            `[ORDER REPLACE SKIP SAME PRICE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+            `old=${fmtPrice(order.price)} new=${fmtPrice(signal.price)} ` +
+            `age=${Math.round((decision.ageMs || 0) / 1000)}s epsilon=${decision.epsilon}`
+          );
+        } else {
+          info(`[ORDER SKIP DUPLICATE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} [${signal.strategy}] active=${comparableOrders.length}`);
+        }
+        this.portfolio.recordExecutionEvent('duplicate_skip');
         this.diagnostics?.record({
           strategy: signal.strategy,
           scorePassed: true,
@@ -2904,12 +3028,14 @@ class PaperExecutionEngine {
 
       for (const { id, order } of comparableOrders) {
         this.portfolio.cancelOrder(id);
+        this.portfolio.recordExecutionEvent('order_replacement');
         info(`[ORDER REPLACE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} old=${fmtPrice(order.price)} new=${fmtPrice(signal.price)} age=${Math.round((Date.now() - order.createdAt) / 1000)}s [${signal.strategy}]`);
       }
     }
 
     const order = new PaperOrder(signal);
     this.portfolio.addOrder(order);
+    this.portfolio.recordExecutionEvent('order_placed');
     this.portfolio.recordGhostOrder(signal, book);
     info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
     this.diagnostics?.record({
@@ -2945,6 +3071,7 @@ class PaperExecutionEngine {
         size: fillSize,
         strategy: order.strategy,
       });
+      this.portfolio.recordExecutionEvent('fill');
 
       order.filledUsd += fill.fillUsd;
 
@@ -3077,6 +3204,9 @@ class BotEngine {
     this.wsClient = null;
     this.researchInFlight = null;
     this.autoLiveCandidateLastWritten = new Map();
+    this.dustExitLastLogged = new Map();
+    this.lastDustExitSuppressed = null;
+    this.lastFillStarvationWarningAt = 0;
 
     this.strategies = [
       new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
@@ -3240,6 +3370,11 @@ class BotEngine {
       if (!signal) return;
     }
 
+    if (this.shouldSuppressDustExit(signal)) {
+      this.suppressDustExit(signal);
+      return;
+    }
+
     signal = this.risk.evaluate(signal);
     if (!signal) {
       if (this.config.consensusLogRejected && rawSignal) {
@@ -3255,6 +3390,45 @@ class BotEngine {
     const placed = this.execution.place(signal, book);
     if (placed) {
       this.maybeWriteLiveCandidate(signal, asset, book);
+    }
+  }
+
+  shouldSuppressDustExit(signal) {
+    if (!this.config.dustExitSuppressEnabled) return false;
+    if (!signal || signal.side !== 'sell') return false;
+    if (!Number.isFinite(signal.price) || signal.price <= 0) return false;
+
+    const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId);
+    const availableSellUsd = availableSellQty * signal.price;
+    return availableSellUsd > 0 && availableSellUsd < this.config.minOrderUsd;
+  }
+
+  suppressDustExit(signal) {
+    const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId);
+    const availableSellUsd = availableSellQty * signal.price;
+    const cooldownMs = Math.max(0, this.config.dustExitLogCooldownMs || 0);
+    const cooldownSec = Math.round(cooldownMs / 1000);
+    const key = `${signal.strategy}:${signal.side}:${signal.tokenId}`;
+    const now = Date.now();
+    const last = this.dustExitLastLogged.get(key) || 0;
+
+    this.lastDustExitSuppressed = {
+      reason: 'DUST_EXIT_SUPPRESSED',
+      strategy: signal.strategy,
+      side: signal.side,
+      tokenId: signal.tokenId,
+      availableSellQty,
+      availableSellUsd,
+      minOrderUsd: this.config.minOrderUsd,
+      cooldownSec,
+    };
+
+    if (now - last >= cooldownMs) {
+      this.dustExitLastLogged.set(key, now);
+      warn(
+        `[DUST EXIT SUPPRESSED] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `availableSellUsd=${availableSellUsd.toFixed(3)} minOrderUsd=${this.config.minOrderUsd} cooldownSec=${cooldownSec}`
+      );
     }
   }
 
@@ -3356,6 +3530,31 @@ class BotEngine {
     info(`Equity: $${equity.toFixed(2)} | Cash: $${this.portfolio.cash.toFixed(2)} | Drawdown: ${drawdown.toFixed(2)}%`);
     info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd().toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
     info(`Position Exposure: $${this.portfolio.positionExposureUsd(markPrices).toFixed(2)} | Open Order Exposure: $${this.portfolio.openOrderExposureUsd().toFixed(2)} | Available Cash: $${this.portfolio.availableCash().toFixed(2)}`);
+
+    const dust = this.portfolio.dustSummary(markPrices);
+    info(`Dust Positions: count=${dust.count} value=$${dust.valueUsd.toFixed(2)}`);
+
+    const health = this.portfolio.executionHealth();
+    info(
+      `Execution Health: ordersPlacedLastHour=${health.ordersPlacedLastHour} ` +
+      `fillsLastHour=${health.fillsLastHour} duplicateSkipsLastHour=${health.duplicateSkipsLastHour} ` +
+      `replacementsLastHour=${health.replacementsLastHour} ` +
+      `oldestOpenOrderAgeSec=${Math.round(health.oldestOpenOrderAgeSec)} ` +
+      `fillRateLastHour=${health.fillRateLastHour.toFixed(1)}%`
+    );
+
+    if (
+      this.portfolio.openOrders.size > 0 &&
+      health.fillsLastHour === 0 &&
+      health.oldestOpenOrderAgeSec >= this.config.fillStarvationWarnMs / 1000 &&
+      Date.now() - this.lastFillStarvationWarningAt >= this.config.fillStarvationWarnMs
+    ) {
+      this.lastFillStarvationWarningAt = Date.now();
+      warn(
+        `[ENGINE STARVATION WARNING] openOrders=${this.portfolio.openOrders.size} ` +
+        `oldestOpenOrderAgeSec=${Math.round(health.oldestOpenOrderAgeSec)} fillsLastHour=0 reason=no_recent_fills`
+      );
+    }
 
     if (this.portfolio.ghostStats.total > 0) {
       const favorableRate = (this.portfolio.ghostStats.favorable / this.portfolio.ghostStats.total) * 100;
