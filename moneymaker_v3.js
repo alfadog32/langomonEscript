@@ -3090,6 +3090,11 @@ class BotEngine {
   async start() {
     banner();
     info('Starting Polymarket MoneyMaker V3 (Paper)...');
+    info(
+      `[CONFIDENCE CONFIG] profile=${this.risk.paperConfidenceProfile()} ` +
+      `minConfidence=${this.config.minConfidence} ` +
+      `spreadHunterPaperMin=${this.config.spreadHunterMinConfidencePaper}`
+    );
 
     await this.refreshResearch();
 
@@ -3430,6 +3435,7 @@ function formatRiskBlockDetails(details = {}) {
     'minConfidence',
     'confidenceProfile',
     'thresholdSource',
+    'paperConfidenceOverrideEligible',
     'sizeUsd',
     'minOrderUsd',
     'availableCash',
@@ -3514,6 +3520,7 @@ if (require.main === module) {
 
 module.exports = {
   CONFIG,
+  BotEngine,
   EngineDiagnostics,
   MultiConsensusEngine,
   RiskEngine,
