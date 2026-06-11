@@ -79,7 +79,7 @@ function makeSignal(overrides = {}) {
     tokenId: 'confidence-token',
     marketId: 'confidence-market',
     side: 'buy',
-    price: 0.44,
+    price: 0.48,
     sizeUsd: 10,
     expectedEdge: 0.02,
     confidence: 0.38,
@@ -106,6 +106,8 @@ function makeContext(configOverrides = {}, volGuard = null) {
 function makeRuntimeBot(configOverrides = {}) {
   const config = makeConfig({
     stateFile: path.join('/tmp', `engine-confidence-selfcheck-${process.pid}.json`),
+    enableConsensus: false,
+    sophieMinExecutionQuality: 0.50,
     ...configOverrides,
   });
   const bot = new BotEngine(config);
@@ -154,14 +156,22 @@ function run() {
 
   {
     const bot = makeRuntimeBot({ paperConfidenceProfile: 'capital_velocity' });
-    bot.trySignal(makeSignal({ confidence: 0.38, expectedEdge: 0.02 }), makeAsset(), makeBook());
+    bot.trySignal(makeSignal({
+      confidence: 0.38,
+      expectedEdge: 0.02,
+      metadata: { consensus: { route: { authorized: true, mode: 'MAKER', state: 'STABLE' } } },
+    }), makeAsset(), makeBook());
     assert.strictEqual(bot.risk.lastBlockReason, null, 'runtime trySignal path should not block eligible capital_velocity SpreadHunter');
     assert.strictEqual(bot.portfolio.openOrders.size, 1, 'runtime trySignal path should place the paper order');
   }
 
   {
     const bot = makeRuntimeBot({ paperConfidenceProfile: 'conservative' });
-    bot.trySignal(makeSignal({ confidence: 0.38, expectedEdge: 0.02 }), makeAsset(), makeBook());
+    bot.trySignal(makeSignal({
+      confidence: 0.38,
+      expectedEdge: 0.02,
+      metadata: { consensus: { route: { authorized: true, mode: 'MAKER', state: 'STABLE' } } },
+    }), makeAsset(), makeBook());
     assert.strictEqual(bot.risk.lastBlockReason, 'confidence_below_min', 'runtime trySignal path should keep conservative MIN_CONFIDENCE');
     assert.strictEqual(bot.risk.lastBlockDetails.minConfidence, 0.45);
     assert.strictEqual(bot.risk.lastBlockDetails.thresholdSource, 'MIN_CONFIDENCE');

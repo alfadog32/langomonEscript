@@ -143,10 +143,29 @@ const CONFIG = {
   sophieBootstrapMinFillProb: envNum('SOPHIE_BOOTSTRAP_MIN_FILL_PROB', 0.33),
   sophieBootstrapMaxDistanceFromTouch: envNum('SOPHIE_BOOTSTRAP_MAX_DISTANCE_FROM_TOUCH', 0.07),
   sophieBootstrapMinSignalScore: envNum('SOPHIE_BOOTSTRAP_MIN_SIGNAL_SCORE', 0.70),
+  sophieFillDistancePenaltyEnabled: envBool('SOPHIE_FILL_DISTANCE_PENALTY_ENABLED', true),
+  sophieFillDistanceIdeal: envNum('SOPHIE_FILL_DISTANCE_IDEAL', 0.02),
+  sophieFillDistanceMaxReasonable: envNum('SOPHIE_FILL_DISTANCE_MAX_REASONABLE', 0.05),
+  sophieFillDistanceHardCap: envNum('SOPHIE_FILL_DISTANCE_HARD_CAP', 0.07),
+  sophieFillProbCapWhenFar: envNum('SOPHIE_FILL_PROB_CAP_WHEN_FAR', 0.20),
+  sophieFillProbCapWhenVeryFar: envNum('SOPHIE_FILL_PROB_CAP_WHEN_VERY_FAR', 0.10),
+  sophieNoFillLearningEnabled: envBool('SOPHIE_NO_FILL_LEARNING_ENABLED', true),
+  sophieNoFillStreakLimit: envInt('SOPHIE_NO_FILL_STREAK_LIMIT', 3),
+  sophieNoFillTokenCooldownMs: envInt('SOPHIE_NO_FILL_TOKEN_COOLDOWN_SEC', 900) * 1000,
+  sophieNoFillFillProbMultiplier: envNum('SOPHIE_NO_FILL_FILLPROB_MULTIPLIER', 0.50),
+  sophieBootstrapSameTokenCooldownMs: envInt('SOPHIE_BOOTSTRAP_SAME_TOKEN_COOLDOWN_SEC', 300) * 1000,
+  sophieBootstrapMaxSameTokenAdmissionsPerHour: envInt('SOPHIE_BOOTSTRAP_MAX_SAME_TOKEN_ADMISSIONS_PER_HOUR', 3),
+  sophieBootstrapRequireImprovementAfterNoFill: envBool('SOPHIE_BOOTSTRAP_REQUIRE_IMPROVEMENT_AFTER_NO_FILL', true),
+  sophieBootstrapMinQualityImprovement: envNum('SOPHIE_BOOTSTRAP_MIN_QUALITY_IMPROVEMENT', 0.04),
   sophieLowQualityBlockCooldownMs: envInt('SOPHIE_LOW_QUALITY_BLOCK_COOLDOWN_SEC', 120) * 1000,
   sophieLowQualityBlockSummaryMs: envInt('SOPHIE_LOW_QUALITY_BLOCK_SUMMARY_SEC', 300) * 1000,
   sophieRepeatCandidateCooldownMs: envInt('SOPHIE_REPEAT_CANDIDATE_COOLDOWN_SEC', 90) * 1000,
   sophieMaxRepeatCandidateLogsPerWindow: envInt('SOPHIE_MAX_REPEAT_CANDIDATE_LOGS_PER_WINDOW', 3),
+  paperMakerNudgeEnabled: envBool('PAPER_MAKER_NUDGE_ENABLED', false),
+  paperMakerNudgeMaxTicks: envInt('PAPER_MAKER_NUDGE_MAX_TICKS', 1),
+  paperMakerNudgeMinEdgeAfterNudge: envNum('PAPER_MAKER_NUDGE_MIN_EDGE_AFTER_NUDGE', 0.012),
+  paperMakerNudgeMaxDistanceFromTouch: envNum('PAPER_MAKER_NUDGE_MAX_DISTANCE_FROM_TOUCH', 0.05),
+  paperMakerNudgeOnlyAfterNoFillMs: envInt('PAPER_MAKER_NUDGE_ONLY_AFTER_NO_FILL_SEC', 900) * 1000,
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
   // Practical revenue/risk optimization controls.
@@ -2565,6 +2584,7 @@ class PaperPortfolio {
   }
 
   recordExecutionEvent(type, details = {}, ts = Date.now()) {
+    const numeric = (value) => (Number.isFinite(Number(value)) ? Number(value) : null);
     this.executionEvents.push({
       type,
       ts,
@@ -2572,6 +2592,11 @@ class PaperPortfolio {
       side: details.side ? String(details.side).toLowerCase() : null,
       strategy: details.strategy || null,
       reason: details.reason || null,
+      quality: numeric(details.quality ?? details.sophieExecutionQuality),
+      distanceFromTouch: numeric(details.distanceFromTouch),
+      predictedFillProbability: numeric(details.predictedFillProbability),
+      timeToFillSec: numeric(details.timeToFillSec),
+      filledUsd: numeric(details.filledUsd),
     });
     while (this.executionEvents.length > 5000) this.executionEvents.shift();
 
@@ -2589,6 +2614,8 @@ class PaperPortfolio {
     const agesSec = openOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
     const candidateEvaluationsLastHour = countType('candidate_evaluation');
     const paperOrdersPlacedLastHour = countType('order_placed');
+    const paperOrdersFilledLastHour = countType('fill');
+    const paperOrdersExpiredNoFillLastHour = countType('order_expired_no_fill') + countType('order_replaced_no_fill');
     const paperOrdersAdmittedLastHour = countType('order_admitted');
     const paperOrdersRejectedBySophieLastHour = countType('quality_block') + countType('quality_throttle');
     const fillsLastHour = countType('fill');
@@ -2599,11 +2626,19 @@ class PaperPortfolio {
     const avgOpenOrderAgeSec = agesSec.length
       ? agesSec.reduce((sum, age) => sum + age, 0) / agesSec.length
       : 0;
+    const noFillStreaks = this.noFillStreaks(now);
+    const noFillStreakMax = noFillStreaks.length ? Math.max(...noFillStreaks.map((item) => item.noFillStreak)) : 0;
+    const fillEventsWithTime = recent.filter((event) => event.type === 'fill' && Number.isFinite(event.timeToFillSec));
+    const avgTimeToFillSec = fillEventsWithTime.length
+      ? fillEventsWithTime.reduce((sum, event) => sum + event.timeToFillSec, 0) / fillEventsWithTime.length
+      : null;
 
     return {
       ...this.executionTotals,
       candidateEvaluationsLastHour,
       paperOrdersPlacedLastHour,
+      paperOrdersFilledLastHour,
+      paperOrdersExpiredNoFillLastHour,
       paperOrdersAdmittedLastHour,
       paperOrdersRejectedBySophieLastHour,
       ordersPlacedLastHour: paperOrdersPlacedLastHour,
@@ -2613,10 +2648,34 @@ class PaperPortfolio {
       maxOpenOrderBlocksLastHour,
       oldestOpenOrderAgeSec,
       avgOpenOrderAgeSec,
+      noFillStreakMax,
+      avgTimeToFillSec,
       openOrderExposureUsd: this.openOrderExposureUsd(),
       fillRateLastHour: paperOrdersPlacedLastHour > 0 ? (fillsLastHour / paperOrdersPlacedLastHour) * 100 : 0,
+      fillRateByPlacedOrdersLastHour: paperOrdersPlacedLastHour > 0 ? (paperOrdersFilledLastHour / paperOrdersPlacedLastHour) * 100 : 0,
       fillStarvationReason: openOrders.length > 0 && fillsLastHour === 0 ? 'no_recent_fills' : null,
     };
+  }
+
+  noFillStreaks(now = Date.now(), windowMs = 60 * 60_000) {
+    const since = now - windowMs;
+    const grouped = new Map();
+    for (const event of this.executionEvents) {
+      if (Number(event.ts) < since) continue;
+      const key = `${event.tokenId}:${event.side}:${event.strategy}`;
+      if (!grouped.has(key)) grouped.set(key, []);
+      grouped.get(key).push(event);
+    }
+
+    return [...grouped.entries()].map(([key, events]) => {
+      const sorted = events.slice().sort((a, b) => a.ts - b.ts);
+      let streak = 0;
+      for (const event of sorted) {
+        if (event.type === 'fill') streak = 0;
+        if (event.type === 'order_expired_no_fill' || event.type === 'order_replaced_no_fill') streak += 1;
+      }
+      return { key, noFillStreak: streak };
+    });
   }
 
   executionStatsFor(signal, windowMs = 60 * 60_000, now = Date.now()) {
@@ -2642,7 +2701,10 @@ class PaperPortfolio {
     ));
     const agesSec = comparableOpenOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
     const fillsLastHour = count(matchingEvents, 'fill');
+    const admittedLastHour = count(matchingEvents, 'order_admitted');
     const freshOrdersLastHour = count(matchingEvents, 'order_placed');
+    const placedLastHour = freshOrdersLastHour;
+    const expiredNoFillLastHour = count(matchingEvents, 'order_expired_no_fill') + count(matchingEvents, 'order_replaced_no_fill');
     const replacementsLastHour = count(matchingEvents, 'order_replacement');
     const duplicateSkipsLastHour = count(matchingEvents, 'duplicate_skip');
     const attemptsLastHour = freshOrdersLastHour + replacementsLastHour + duplicateSkipsLastHour + count(matchingEvents, 'quality_block') + count(matchingEvents, 'quality_throttle');
@@ -2650,16 +2712,44 @@ class PaperPortfolio {
     const strategyAttempts = count(strategyEvents, 'order_placed') + count(strategyEvents, 'order_replacement') + count(strategyEvents, 'duplicate_skip');
     const fillEvents = matchingEvents.filter((event) => event.type === 'fill').sort((a, b) => b.ts - a.ts);
     const orderEvents = matchingEvents.filter((event) => event.type === 'order_placed').sort((a, b) => b.ts - a.ts);
+    const lifecycleEvents = matchingEvents
+      .filter((event) => event.type === 'fill' || event.type === 'order_expired_no_fill' || event.type === 'order_replaced_no_fill')
+      .sort((a, b) => a.ts - b.ts);
+    let noFillStreak = 0;
+    for (const event of lifecycleEvents) {
+      if (event.type === 'fill') noFillStreak = 0;
+      if (event.type === 'order_expired_no_fill' || event.type === 'order_replaced_no_fill') noFillStreak += 1;
+    }
+    const fillsWithTime = matchingEvents.filter((event) => event.type === 'fill' && Number.isFinite(event.timeToFillSec));
+    const avgTimeToFillSec = fillsWithTime.length
+      ? fillsWithTime.reduce((sum, event) => sum + event.timeToFillSec, 0) / fillsWithTime.length
+      : null;
+    const qualities = matchingEvents
+      .filter((event) => event.type === 'order_admitted' && Number.isFinite(event.quality))
+      .map((event) => event.quality);
+    const bestAdmittedQualityLastHour = qualities.length ? Math.max(...qualities) : null;
+    const lastAdmitted = matchingEvents
+      .filter((event) => event.type === 'order_admitted')
+      .sort((a, b) => b.ts - a.ts)[0] || null;
 
     return {
       attemptsLastHour,
+      admittedLastHour,
+      placedLastHour,
       freshOrdersLastHour,
+      expiredNoFillLastHour,
       replacementsLastHour,
       duplicateSkipsLastHour,
       fillsLastHour,
       fillRateLastHour: attemptsLastHour > 0 ? fillsLastHour / attemptsLastHour : 0,
+      realizedFillRateLastHour: placedLastHour > 0 ? fillsLastHour / placedLastHour : 0,
       strategyFillRateLastHour: strategyAttempts > 0 ? strategyFills / strategyAttempts : 0,
-      noFillStreak: fillsLastHour === 0 ? attemptsLastHour : 0,
+      noFillStreak,
+      avgTimeToFillSec,
+      bestAdmittedQualityLastHour,
+      lastAdmittedTs: lastAdmitted?.ts || null,
+      lastAdmittedQuality: lastAdmitted?.quality ?? null,
+      lastAdmittedDistanceFromTouch: lastAdmitted?.distanceFromTouch ?? null,
       lastFillTs: fillEvents[0]?.ts || null,
       lastOrderTs: orderEvents[0]?.ts || null,
       oldestOpenOrderAgeSec: agesSec.length ? Math.max(...agesSec) : 0,
@@ -3173,6 +3263,15 @@ class PaperExecutionEngine {
       }
 
       for (const { id, order } of comparableOrders) {
+        if ((order.filledUsd || 0) <= 0) {
+          this.portfolio.recordExecutionEvent('order_replaced_no_fill', {
+            ...order,
+            reason: 'replacement',
+            quality: order.signal?.metadata?.sophieExecution?.sophieExecutionQuality,
+            distanceFromTouch: order.signal?.metadata?.sophieExecution?.distanceFromTouch,
+            predictedFillProbability: order.signal?.metadata?.sophieExecution?.predictedFillProbability,
+          });
+        }
         this.portfolio.cancelOrder(id);
         this.portfolio.recordExecutionEvent('order_replacement', signal);
         info(`[ORDER REPLACE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} old=${fmtPrice(order.price)} new=${fmtPrice(signal.price)} age=${Math.round((Date.now() - order.createdAt) / 1000)}s [${signal.strategy}]`);
@@ -3197,6 +3296,15 @@ class PaperExecutionEngine {
 
     for (const [orderId, order] of [...this.portfolio.openOrders.entries()]) {
       if (order.isExpired()) {
+        if ((order.filledUsd || 0) <= 0) {
+          this.portfolio.recordExecutionEvent('order_expired_no_fill', {
+            ...order,
+            reason: 'expired',
+            quality: order.signal?.metadata?.sophieExecution?.sophieExecutionQuality,
+            distanceFromTouch: order.signal?.metadata?.sophieExecution?.distanceFromTouch,
+            predictedFillProbability: order.signal?.metadata?.sophieExecution?.predictedFillProbability,
+          });
+        }
         this.portfolio.cancelOrder(orderId);
         continue;
       }
@@ -3217,7 +3325,11 @@ class PaperExecutionEngine {
         size: fillSize,
         strategy: order.strategy,
       });
-      this.portfolio.recordExecutionEvent('fill', order);
+      this.portfolio.recordExecutionEvent('fill', {
+        ...order,
+        timeToFillSec: Math.max(0, (now - order.createdAt) / 1000),
+        filledUsd: fill.fillUsd,
+      });
 
       order.filledUsd += fill.fillUsd;
 
@@ -3359,6 +3471,9 @@ class BotEngine {
     this.sophieBootstrapAdmissionsThisScan = 0;
     this.sophieBootstrapCandidates = [];
     this.sophieBootstrapLastLogged = new Map();
+    this.sophieFillProbLastLogged = new Map();
+    this.sophieNoFillLearnLastLogged = new Map();
+    this.sophieBootstrapTokenCooldownUntil = new Map();
     this.sophieLowQualityLastLogged = new Map();
     this.sophieLowQualitySummary = { windowStartedAt: Date.now(), blocked: 0, qualities: [], tokenIds: new Set() };
     this.sophieRepeatCandidateCooldownUntil = new Map();
@@ -3541,6 +3656,17 @@ class BotEngine {
       sophieExecution: quality,
     };
 
+    const nudged = this.maybeApplyPaperMakerNudge(signal, book, quality);
+    if (nudged) {
+      signal = nudged;
+      const nudgedQuality = this.evaluateSophieExecutionQuality(signal, book);
+      signal.metadata = {
+        ...(signal.metadata || {}),
+        sophieExecution: nudgedQuality,
+      };
+      Object.assign(quality, nudgedQuality);
+    }
+
     if (!isProtectiveExitStrategy(signal.strategy)) {
       this.portfolio.recordExecutionEvent('candidate_evaluation', signal);
     }
@@ -3648,7 +3774,7 @@ class BotEngine {
       ? clamp((Date.now() - existingOrder.createdAt) / Math.max(1, this.config.orderTtlMs), 0, 1)
       : clamp(stats.avgOpenOrderAgeSec / Math.max(1, this.config.orderTtlMs / 1000), 0, 1);
     const fillProbDefaultsUsed = stats.attemptsLastHour === 0 && stats.strategyFillRateLastHour === 0;
-    const predictedFillProbability = clamp(
+    const rawPredictedFillProbability = clamp(
       (historicalFillRate * 0.20) +
       (strategyFillRate * 0.15) +
       (quoteDistanceQuality * 0.20) +
@@ -3660,6 +3786,8 @@ class BotEngine {
       0,
       1
     );
+    const fillCalibration = this.calibratePredictedFillProbability(signal, rawPredictedFillProbability, distanceFromTouch, stats);
+    const predictedFillProbability = fillCalibration.adjustedFillProbability;
     const executionQuality = clamp(
       (signalScore * 0.20) +
       (edgeScore * 0.15) +
@@ -3682,7 +3810,10 @@ class BotEngine {
     return {
       sophieSignalScore: Number(signalScore.toFixed(4)),
       sophieExecutionQuality: Number(executionQuality.toFixed(4)),
+      rawPredictedFillProbability: Number(rawPredictedFillProbability.toFixed(4)),
       predictedFillProbability: Number(predictedFillProbability.toFixed(4)),
+      fillProbabilityCalibrationReason: fillCalibration.reason,
+      fillProbabilityOverestimated: Boolean(fillCalibration.overestimated),
       slotPressure: Number(slotPressure.toFixed(4)),
       duplicatePressure: Number(duplicatePressure.toFixed(4)),
       noFillPressure: Number(noFillPressure.toFixed(4)),
@@ -3696,6 +3827,135 @@ class BotEngine {
       stats,
       qualityDecision: 'PENDING',
     };
+  }
+
+  calibratePredictedFillProbability(signal, rawFillProb, distanceFromTouch, stats) {
+    let adjusted = clamp(rawFillProb, 0, 1);
+    let reason = 'none';
+    let overestimated = false;
+
+    if (this.config.sophieFillDistancePenaltyEnabled) {
+      const ideal = Math.max(0, this.config.sophieFillDistanceIdeal);
+      const maxReasonable = Math.max(ideal, this.config.sophieFillDistanceMaxReasonable);
+      const hardCap = Math.max(maxReasonable, this.config.sophieFillDistanceHardCap);
+
+      const beyondIdeal = distanceFromTouch > ideal + 1e-9;
+      if (beyondIdeal && distanceFromTouch <= maxReasonable) {
+        const progress = clamp((distanceFromTouch - ideal) / Math.max(0.001, maxReasonable - ideal), 0, 1);
+        const multiplier = 1 - (progress * 0.45);
+        adjusted *= multiplier;
+        reason = 'distance_penalty';
+      }
+
+      if (distanceFromTouch > maxReasonable) {
+        adjusted = Math.min(adjusted, this.config.sophieFillProbCapWhenFar);
+        reason = 'far_from_touch';
+        overestimated = true;
+      }
+
+      if (distanceFromTouch >= hardCap) {
+        adjusted = Math.min(adjusted, this.config.sophieFillProbCapWhenVeryFar);
+        reason = 'very_far_from_touch';
+        overestimated = true;
+      }
+    }
+
+    if (this.config.sophieNoFillLearningEnabled && stats.noFillStreak >= this.config.sophieNoFillStreakLimit) {
+      adjusted *= clamp(this.config.sophieNoFillFillProbMultiplier, 0, 1);
+      reason = reason === 'none' ? 'no_fill_streak' : `${reason}+no_fill_streak`;
+      overestimated = true;
+      this.logNoFillLearning(signal, stats, rawFillProb, adjusted);
+    }
+
+    if (adjusted < rawFillProb) {
+      this.logFillProbabilityCalibration(signal, rawFillProb, adjusted, distanceFromTouch, reason);
+    }
+
+    return {
+      adjustedFillProbability: clamp(adjusted, 0, 1),
+      reason,
+      overestimated,
+    };
+  }
+
+  logFillProbabilityCalibration(signal, rawFillProb, adjustedFillProb, distanceFromTouch, reason) {
+    const key = `${this.sophieExecutionKey(signal)}:${reason}`;
+    const now = Date.now();
+    const last = this.sophieFillProbLastLogged.get(key) || 0;
+    if (now - last < this.config.sophieLowQualityBlockCooldownMs) return;
+    this.sophieFillProbLastLogged.set(key, now);
+    info(
+      `[SOPHIE FILL PROB CALIBRATED] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `rawFillProb=${rawFillProb.toFixed(3)} adjustedFillProb=${adjustedFillProb.toFixed(3)} ` +
+      `distanceFromTouch=${Number(distanceFromTouch).toFixed(3)} reason=${reason}`
+    );
+  }
+
+  logNoFillLearning(signal, stats, rawFillProb, adjustedFillProb) {
+    const key = this.sophieExecutionKey(signal);
+    const now = Date.now();
+    const last = this.sophieNoFillLearnLastLogged.get(key) || 0;
+    if (now - last < this.config.sophieLowQualityBlockCooldownMs) return;
+    this.sophieNoFillLearnLastLogged.set(key, now);
+    warn(
+      `[SOPHIE NO-FILL LEARN] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `noFillStreak=${stats.noFillStreak} rawFillProb=${rawFillProb.toFixed(3)} ` +
+      `adjustedFillProb=${adjustedFillProb.toFixed(3)} cooldownSec=${Math.round(this.config.sophieNoFillTokenCooldownMs / 1000)}`
+    );
+  }
+
+  maybeApplyPaperMakerNudge(signal, book, quality) {
+    if (!signal || signal.strategy !== 'SpreadHunter') return null;
+    if (isProtectiveExitStrategy(signal.strategy) || !isBookComplete(book)) return null;
+    if (!Number.isFinite(signal.price) || !Number.isFinite(signal.expectedEdge)) return null;
+    if (quality.distanceFromTouch <= this.config.paperMakerNudgeMaxDistanceFromTouch) return null;
+
+    const stats = this.portfolio.executionStatsFor(signal, 60 * 60_000);
+    const now = Date.now();
+    const hasOldNoFillOrder = stats.oldestOpenOrderAgeSec * 1000 >= this.config.paperMakerNudgeOnlyAfterNoFillMs;
+    const hasNoFillHistory = stats.noFillStreak > 0 || (stats.lastOrderTs && now - stats.lastOrderTs >= this.config.paperMakerNudgeOnlyAfterNoFillMs);
+    if (!hasOldNoFillOrder && !hasNoFillHistory) return null;
+
+    const tick = Number(book.tickSize || signal.metadata?.tickSize || 0.01);
+    if (!Number.isFinite(tick) || tick <= 0) return null;
+    const move = tick * Math.max(1, this.config.paperMakerNudgeMaxTicks || 1);
+    let suggestedPrice = Number(signal.price);
+    if (signal.side === 'buy') {
+      suggestedPrice = Math.min(Number(signal.price) + move, Number(book.bestAsk) - tick);
+    } else if (signal.side === 'sell') {
+      suggestedPrice = Math.max(Number(signal.price) - move, Number(book.bestBid) + tick);
+    } else {
+      return null;
+    }
+
+    suggestedPrice = roundToTick(clamp(suggestedPrice, 0.01, 0.99), tick);
+    if (!Number.isFinite(suggestedPrice) || suggestedPrice === signal.price) return null;
+
+    const oldPrice = Number(signal.price);
+    const priceDelta = Math.abs(suggestedPrice - oldPrice);
+    const edgeAfterNudge = Number(signal.expectedEdge) - priceDelta;
+    if (edgeAfterNudge < this.config.paperMakerNudgeMinEdgeAfterNudge) return null;
+
+    info(
+      `[PAPER MAKER NUDGE SUGGESTED] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `oldPrice=${fmtPrice(oldPrice)} suggestedPrice=${fmtPrice(suggestedPrice)} ` +
+      `edgeAfterNudge=${edgeAfterNudge.toFixed(3)} reason=no_fills_far_from_touch enabled=${this.config.paperMakerNudgeEnabled}`
+    );
+
+    if (!this.config.paperMakerNudgeEnabled) return null;
+
+    signal.price = suggestedPrice;
+    signal.expectedEdge = edgeAfterNudge;
+    signal.metadata = {
+      ...(signal.metadata || {}),
+      paperMakerNudge: {
+        applied: true,
+        oldPrice,
+        suggestedPrice,
+        edgeAfterNudge,
+      },
+    };
+    return signal;
   }
 
   applySophieExecutionGate(signal, asset, book, quality) {
@@ -3725,6 +3985,18 @@ class BotEngine {
 
     const windowStats = this.portfolio.executionStatsFor(signal, this.config.sophieDuplicatePressureWindowMs);
     if (
+      this.config.sophieNoFillLearningEnabled &&
+      windowStats.noFillStreak >= this.config.sophieNoFillStreakLimit
+    ) {
+      this.sophieNoFillCooldownUntil.set(key, now + this.config.sophieNoFillTokenCooldownMs);
+      quality.qualityDecision = 'THROTTLE_NO_FILL_LEARN';
+      this.lastSophieQualityDecision = quality;
+      this.portfolio.recordExecutionEvent('quality_throttle', signal);
+      this.logNoFillLearning(signal, windowStats, quality.rawPredictedFillProbability, quality.predictedFillProbability);
+      return false;
+    }
+
+    if (
       windowStats.attemptsLastHour >= this.config.sophieMaxAttemptsPerTokenWindow &&
       windowStats.duplicateSkipsLastHour >= this.config.sophieMaxDuplicateSkipsPerTokenWindow &&
       windowStats.fillsLastHour === 0 &&
@@ -3747,7 +4019,7 @@ class BotEngine {
         this.sophieCalibratedAdmissionsThisScan += 1;
         quality.qualityDecision = 'CALIBRATED_ADMIT';
         this.lastSophieQualityDecision = quality;
-        this.portfolio.recordExecutionEvent('order_admitted', signal);
+        this.recordSophieAdmission(signal, quality);
         info(
           `[SOPHIE CALIBRATED ADMIT] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
           `quality=${quality.sophieExecutionQuality} minQuality=${this.config.sophieCalibratedMinQuality} ` +
@@ -3782,7 +4054,7 @@ class BotEngine {
 
     quality.qualityDecision = 'ADMIT';
     this.lastSophieQualityDecision = quality;
-    this.portfolio.recordExecutionEvent('order_admitted', signal);
+    this.recordSophieAdmission(signal, quality);
     info(
       `[SOPHIE ORDER QUALITY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
       `signalScore=${quality.sophieSignalScore} executionQuality=${quality.sophieExecutionQuality} ` +
@@ -3792,14 +4064,54 @@ class BotEngine {
     return true;
   }
 
+  recordSophieAdmission(signal, quality) {
+    this.portfolio.recordExecutionEvent('order_admitted', {
+      ...signal,
+      quality: quality.sophieExecutionQuality,
+      distanceFromTouch: quality.distanceFromTouch,
+      predictedFillProbability: quality.predictedFillProbability,
+    });
+  }
+
   shouldBootstrapQueue(signal, quality) {
     if (!this.config.sophieBootstrapAdmissionEnabled) return false;
     if (signal.strategy !== 'SpreadHunter') return false;
+    if (this.bootstrapSameTokenCooldownActive(signal, quality)) return false;
     if (this.spreadHunterOpenOrderCount() >= this.config.sophieBootstrapOnlyWhenOpenOrdersBelow) return false;
     if (this.spreadHunterOpenOrderCount() >= this.config.sophieBootstrapMaxActiveOrders) return false;
     if (this.sophieBootstrapAdmissionsThisScan >= this.config.sophieBootstrapMaxAdmissionsPerScan) return false;
 
     return this.bootstrapAdmissionFailures(signal, quality).length === 0;
+  }
+
+  bootstrapSameTokenCooldownActive(signal, quality) {
+    const key = this.sophieExecutionKey(signal);
+    const now = Date.now();
+    const cooldownUntil = this.sophieBootstrapTokenCooldownUntil.get(key) || 0;
+    if (cooldownUntil > now) return true;
+
+    const stats = this.portfolio.executionStatsFor(signal, 60 * 60_000);
+    const admissionsTooHigh = stats.admittedLastHour >= this.config.sophieBootstrapMaxSameTokenAdmissionsPerHour;
+    const repeatedNoFill = stats.noFillStreak >= this.config.sophieNoFillStreakLimit;
+    if (!admissionsTooHigh && !repeatedNoFill) return false;
+
+    if (this.config.sophieBootstrapRequireImprovementAfterNoFill) {
+      const lastQuality = Number(stats.bestAdmittedQualityLastHour);
+      const qualityImproved = Number.isFinite(lastQuality) &&
+        quality.sophieExecutionQuality >= lastQuality + this.config.sophieBootstrapMinQualityImprovement;
+      const lastDistance = Number(stats.lastAdmittedDistanceFromTouch);
+      const distanceImproved = Number.isFinite(lastDistance) &&
+        quality.distanceFromTouch <= Math.max(0, lastDistance - this.config.sophieFillDistanceIdeal);
+      if (qualityImproved || distanceImproved) return false;
+    }
+
+    this.sophieBootstrapTokenCooldownUntil.set(key, now + this.config.sophieBootstrapSameTokenCooldownMs);
+    warn(
+      `[SOPHIE BOOTSTRAP COOLDOWN] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `reason=repeated_no_fill admissionsLastHour=${stats.admittedLastHour} noFillStreak=${stats.noFillStreak} ` +
+      `cooldownSec=${Math.round(this.config.sophieBootstrapSameTokenCooldownMs / 1000)}`
+    );
+    return true;
   }
 
   bootstrapAdmissionFailures(signal, quality) {
@@ -3873,7 +4185,7 @@ class BotEngine {
       this.sophieBootstrapAdmissionsThisScan += 1;
       candidate.quality.qualityDecision = 'BOOTSTRAP_ADMIT';
       this.lastSophieQualityDecision = candidate.quality;
-      this.portfolio.recordExecutionEvent('order_admitted', candidate.signal);
+      this.recordSophieAdmission(candidate.signal, candidate.quality);
       info(
         `[SOPHIE BOOTSTRAP ADMIT] ${candidate.signal.side.toUpperCase()} ${shortId(candidate.signal.tokenId)} ` +
         `signalScore=${candidate.quality.sophieSignalScore} quality=${candidate.quality.sophieExecutionQuality} ` +
@@ -4012,7 +4324,7 @@ class BotEngine {
     ) {
       this.portfolio.cancelOrder(weakest.id);
       this.portfolio.recordExecutionEvent('slot_evict', signal);
-      this.portfolio.recordExecutionEvent('order_admitted', signal);
+      this.recordSophieAdmission(signal, quality);
       quality.qualityDecision = 'EVICT_ADMIT';
       this.lastSophieQualityDecision = quality;
       warn(
@@ -4178,14 +4490,20 @@ class BotEngine {
     info(
       `Execution Health: candidateEvaluationsLastHour=${health.candidateEvaluationsLastHour} ` +
       `paperOrdersPlacedLastHour=${health.paperOrdersPlacedLastHour} ` +
+      `paperOrdersFilledLastHour=${health.paperOrdersFilledLastHour} ` +
+      `paperOrdersExpiredNoFillLastHour=${health.paperOrdersExpiredNoFillLastHour} ` +
       `paperOrdersAdmittedLastHour=${health.paperOrdersAdmittedLastHour} ` +
       `paperOrdersRejectedBySophieLastHour=${health.paperOrdersRejectedBySophieLastHour} ` +
       `ordersPlacedLastHour=${health.ordersPlacedLastHour} ` +
       `fillsLastHour=${health.fillsLastHour} duplicateSkipsLastHour=${health.duplicateSkipsLastHour} ` +
       `replacementsLastHour=${health.replacementsLastHour} ` +
       `oldestOpenOrderAgeSec=${Math.round(health.oldestOpenOrderAgeSec)} ` +
+      `avgOpenOrderAgeSec=${Math.round(health.avgOpenOrderAgeSec)} ` +
+      `noFillStreakMax=${health.noFillStreakMax} ` +
+      `avgTimeToFillSec=${health.avgTimeToFillSec == null ? 'NA' : Math.round(health.avgTimeToFillSec)} ` +
       `maxOpenOrderBlocksLastHour=${health.maxOpenOrderBlocksLastHour} ` +
-      `fillRateLastHour=${health.fillRateLastHour.toFixed(1)}%`
+      `fillRateLastHour=${health.fillRateLastHour.toFixed(1)}% ` +
+      `fillRateByPlacedOrdersLastHour=${health.fillRateByPlacedOrdersLastHour.toFixed(1)}%`
     );
 
     if (

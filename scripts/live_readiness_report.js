@@ -109,6 +109,8 @@ function parseLastExecutionHealth(lines) {
     return {
       candidateEvaluationsLastHour: get('candidateEvaluationsLastHour'),
       paperOrdersPlacedLastHour: get('paperOrdersPlacedLastHour'),
+      paperOrdersFilledLastHour: get('paperOrdersFilledLastHour'),
+      paperOrdersExpiredNoFillLastHour: get('paperOrdersExpiredNoFillLastHour'),
       paperOrdersAdmittedLastHour: get('paperOrdersAdmittedLastHour'),
       paperOrdersRejectedBySophieLastHour: get('paperOrdersRejectedBySophieLastHour'),
       ordersPlacedLastHour: get('ordersPlacedLastHour'),
@@ -116,8 +118,12 @@ function parseLastExecutionHealth(lines) {
       duplicateSkipsLastHour: get('duplicateSkipsLastHour'),
       replacementsLastHour: get('replacementsLastHour'),
       oldestOpenOrderAgeSec: get('oldestOpenOrderAgeSec'),
+      avgOpenOrderAgeSec: get('avgOpenOrderAgeSec'),
+      noFillStreakMax: get('noFillStreakMax'),
+      avgTimeToFillSec: get('avgTimeToFillSec'),
       maxOpenOrderBlocksLastHour: get('maxOpenOrderBlocksLastHour'),
       fillRateLastHour: get('fillRateLastHour'),
+      fillRateByPlacedOrdersLastHour: get('fillRateByPlacedOrdersLastHour'),
     };
   }
   return {};
@@ -172,6 +178,12 @@ function main() {
   const paperOrdersAdmittedLastHour = Number.isFinite(executionHealth.paperOrdersAdmittedLastHour)
     ? executionHealth.paperOrdersAdmittedLastHour
     : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\].*decision=ADMIT|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
+  const paperOrdersFilledLastHour = Number.isFinite(executionHealth.paperOrdersFilledLastHour)
+    ? executionHealth.paperOrdersFilledLastHour
+    : fillsLastHour;
+  const paperOrdersExpiredNoFillLastHour = Number.isFinite(executionHealth.paperOrdersExpiredNoFillLastHour)
+    ? executionHealth.paperOrdersExpiredNoFillLastHour
+    : countRecent(engineLines, /\[ORDER REPLACE\]/);
   const paperOrdersRejectedBySophieLastHour = Number.isFinite(executionHealth.paperOrdersRejectedBySophieLastHour)
     ? executionHealth.paperOrdersRejectedBySophieLastHour
     : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\].*BLOCK_LOW_QUALITY|\[SOPHIE EXECUTION THROTTLE\]/);
@@ -184,6 +196,12 @@ function main() {
     ? executionHealth.maxOpenOrderBlocksLastHour
     : countRecent(engineLines, /\[SOPHIE SLOT BLOCK\]|block=max_open_orders/);
   const fillRateLastHour = Number.isFinite(executionHealth.fillRateLastHour) ? executionHealth.fillRateLastHour : (ordersPlacedLastHour > 0 ? (fillsLastHour / ordersPlacedLastHour) * 100 : 0);
+  const noFillStreakMax = Number.isFinite(executionHealth.noFillStreakMax) ? executionHealth.noFillStreakMax : 0;
+  const avgTimeToFillSec = Number.isFinite(executionHealth.avgTimeToFillSec) ? executionHealth.avgTimeToFillSec : null;
+  const fillRateByPlacedOrdersLastHour = Number.isFinite(executionHealth.fillRateByPlacedOrdersLastHour)
+    ? executionHealth.fillRateByPlacedOrdersLastHour
+    : fillRateLastHour;
+  const fillProbabilityOverestimated = countRecent(engineLines, /\[SOPHIE FILL PROB CALIBRATED\].*far_from_touch|\[SOPHIE NO-FILL LEARN\]/) > 0;
   const recentStarvationWarning = countRecent(engineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
   const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
 
@@ -198,6 +216,11 @@ function main() {
   if (ordersPlacedLastHour > 150) reasons.push(`ordersPlacedLastHour ${ordersPlacedLastHour} exceeds max 150`);
   if (duplicateSkipsLastHour > 500) reasons.push(`duplicateSkipsLastHour ${duplicateSkipsLastHour} exceeds max 500`);
   if (maxOpenOrderBlocksLastHour > 50) reasons.push(`maxOpenOrderBlocksLastHour ${maxOpenOrderBlocksLastHour} exceeds max 50`);
+  if (noFillStreakMax > 3) reasons.push(`noFillStreakMax ${noFillStreakMax} exceeds max 3`);
+  if (paperOrdersExpiredNoFillLastHour > Math.max(10, paperOrdersPlacedLastHour)) {
+    reasons.push(`paperOrdersExpiredNoFillLastHour ${paperOrdersExpiredNoFillLastHour} is excessive`);
+  }
+  if (fillProbabilityOverestimated) reasons.push('predicted fill probability overestimated; no-fill learning active');
   if (recentStarvationWarning) reasons.push('recent engine starvation warning detected');
 
   const liveConfig = readLiveConfig(ROOT);
@@ -232,6 +255,8 @@ function main() {
       openOrders: Number.isFinite(openOrders) ? openOrders : null,
       candidateEvaluationsLastHour,
       paperOrdersPlacedLastHour,
+      paperOrdersFilledLastHour,
+      paperOrdersExpiredNoFillLastHour,
       paperOrdersAdmittedLastHour,
       paperOrdersRejectedBySophieLastHour,
       ordersPlacedLastHour,
@@ -239,6 +264,10 @@ function main() {
       duplicateSkipsLastHour,
       maxOpenOrderBlocksLastHour,
       fillRateLastHour,
+      fillRateByPlacedOrdersLastHour,
+      noFillStreakMax,
+      avgTimeToFillSec,
+      fillProbabilityOverestimated,
       fillsDetected: fillsLastHour > 0,
       recentStarvationWarning,
       crashLoopOk,

@@ -48,6 +48,25 @@ function makeConfig(overrides = {}) {
     sophieBootstrapMinFillProb: 0.33,
     sophieBootstrapMaxDistanceFromTouch: 0.07,
     sophieBootstrapMinSignalScore: 0.70,
+    sophieFillDistancePenaltyEnabled: true,
+    sophieFillDistanceIdeal: 0.02,
+    sophieFillDistanceMaxReasonable: 0.05,
+    sophieFillDistanceHardCap: 0.07,
+    sophieFillProbCapWhenFar: 0.20,
+    sophieFillProbCapWhenVeryFar: 0.10,
+    sophieNoFillLearningEnabled: true,
+    sophieNoFillStreakLimit: 3,
+    sophieNoFillTokenCooldownMs: 900_000,
+    sophieNoFillFillProbMultiplier: 0.50,
+    sophieBootstrapSameTokenCooldownMs: 300_000,
+    sophieBootstrapMaxSameTokenAdmissionsPerHour: 3,
+    sophieBootstrapRequireImprovementAfterNoFill: true,
+    sophieBootstrapMinQualityImprovement: 0.04,
+    paperMakerNudgeEnabled: false,
+    paperMakerNudgeMaxTicks: 1,
+    paperMakerNudgeMinEdgeAfterNudge: 0.012,
+    paperMakerNudgeMaxDistanceFromTouch: 0.05,
+    paperMakerNudgeOnlyAfterNoFillMs: 900_000,
     ...overrides,
   };
 }
@@ -131,10 +150,22 @@ function seedLowFillPressure(bot, signal) {
   }
 }
 
+function seedNoFillOutcomes(bot, signal, count = 3, quality = 0.50, distanceFromTouch = 0.06) {
+  for (let i = 0; i < count; i += 1) {
+    bot.portfolio.recordExecutionEvent('order_admitted', {
+      ...signal,
+      quality,
+      distanceFromTouch,
+      predictedFillProbability: 0.18,
+    }, Date.now() - 60_000 - i);
+    bot.portfolio.recordExecutionEvent('order_expired_no_fill', signal, Date.now() - 30_000 - i);
+  }
+}
+
 function makeCalibratedSignal(overrides = {}) {
   return makeSignal({
     side: 'buy',
-    price: 0.47,
+    price: 0.48,
     expectedEdge: 0.021,
     confidence: 0.43,
     metadata: {
@@ -157,7 +188,7 @@ function makeCalibratedBook(overrides = {}) {
 function makeBootstrapSignal(overrides = {}) {
   return makeSignal({
     side: 'buy',
-    price: 0.45,
+    price: 0.48,
     expectedEdge: 0.017,
     confidence: 0.45,
     metadata: {
@@ -215,7 +246,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieBootstrapAdmissionEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapAdmissionEnabled: false });
     const asset = makeAsset('calibrated-pass-token');
     const signal = makeCalibratedSignal({ tokenId: asset.tokenId });
     bot.trySignal(signal, asset, makeCalibratedBook());
@@ -224,7 +255,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieBootstrapAdmissionEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapAdmissionEnabled: false });
     const asset = makeAsset('calibrated-low-edge');
     bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId, expectedEdge: 0.019 }), asset, makeCalibratedBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if edge is too low');
@@ -232,7 +263,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieBootstrapAdmissionEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapAdmissionEnabled: false });
     const asset = makeAsset('calibrated-low-confidence');
     bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId, confidence: 0.41 }), asset, makeCalibratedBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if confidence is too low');
@@ -240,7 +271,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieCalibratedMinFillProb: 0.80, sophieBootstrapAdmissionEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedMinFillProb: 0.80, sophieBootstrapAdmissionEnabled: false });
     const asset = makeAsset('calibrated-low-fill-prob');
     bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId }), asset, makeCalibratedBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if fill probability is too low');
@@ -248,7 +279,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieBootstrapAdmissionEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapAdmissionEnabled: false });
     const asset = makeAsset('calibrated-far-touch');
     bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId, price: 0.46 }), asset, makeCalibratedBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if distance from touch is too large');
@@ -256,7 +287,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieCalibratedMaxAdmissionsPerScan: 1, sophieBootstrapAdmissionEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedMaxAdmissionsPerScan: 1, sophieBootstrapAdmissionEnabled: false });
     const first = makeCalibratedSignal({ tokenId: 'calibrated-cap-1' });
     const second = makeCalibratedSignal({ tokenId: 'calibrated-cap-2' });
     bot.trySignal(first, makeAsset(first.tokenId), makeCalibratedBook());
@@ -266,7 +297,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
     const asset = makeAsset('bootstrap-pass-token');
     const signal = makeBootstrapSignal({ tokenId: asset.tokenId });
     queueAndFlush(bot, signal, asset, makeBootstrapBook());
@@ -275,7 +306,74 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60 });
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const signal = makeBootstrapSignal({ tokenId: 'far-fill-token', price: 0.44 });
+    const quality = bot.evaluateSophieExecutionQuality(signal, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    assert(quality.distanceFromTouch > 0.05, 'far fixture should be far from touch');
+    assert(quality.predictedFillProbability <= 0.20, 'far-from-touch candidate should have predicted fill probability capped');
+    assert.strictEqual(quality.fillProbabilityCalibrationReason, 'far_from_touch');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const signal = makeBootstrapSignal({ tokenId: 'very-far-fill-token', price: 0.42 });
+    const quality = bot.evaluateSophieExecutionQuality(signal, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    assert(quality.distanceFromTouch >= 0.07, 'very-far fixture should exceed hard distance cap');
+    assert(quality.predictedFillProbability <= 0.10, 'very-far candidate should be heavily fill-probability capped');
+    assert.strictEqual(quality.fillProbabilityCalibrationReason, 'very_far_from_touch');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const signal = makeBootstrapSignal({ tokenId: 'no-fill-learn-token', price: 0.49 });
+    const before = bot.evaluateSophieExecutionQuality(signal, makeBook({ bestBid: 0.50, bestAsk: 0.54, spread: 0.04 }));
+    seedNoFillOutcomes(bot, signal, 3);
+    const after = bot.evaluateSophieExecutionQuality(signal, makeBook({ bestBid: 0.50, bestAsk: 0.54, spread: 0.04 }));
+    assert(after.predictedFillProbability < before.predictedFillProbability, 'no-fill streak should reduce predicted fill probability');
+    bot.trySignal(signal, makeAsset(signal.tokenId), makeBook({ bestBid: 0.50, bestAsk: 0.54, spread: 0.04 }));
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'THROTTLE_NO_FILL_LEARN', 'no-fill streak should throttle repeated admissions');
+  }
+
+  {
+    const bot = makeBot({
+      maxOpenOrders: 10,
+      sophieMinExecutionQuality: 0.70,
+      sophieNoFillLearningEnabled: false,
+    });
+    const asset = makeAsset('bootstrap-cooldown-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId });
+    seedNoFillOutcomes(bot, signal, 4, 0.62, 0.02);
+    const logs = captureLogs(() => {
+      queueAndFlush(bot, signal, asset, makeBootstrapBook());
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE BOOTSTRAP COOLDOWN]')), 'repeated same-token bootstrap admission should enter cooldown');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, paperMakerNudgeEnabled: false });
+    const asset = makeAsset('nudge-disabled-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.43, expectedEdge: 0.03 });
+    seedNoFillOutcomes(bot, signal, 1);
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    });
+    assert(logs.some((line) => line.includes('[PAPER MAKER NUDGE SUGGESTED]') && line.includes('enabled=false')), 'disabled maker nudge should log suggestion');
+    assert.strictEqual(signal.price, 0.43, 'disabled maker nudge must not change price');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, paperMakerNudgeEnabled: true });
+    const asset = makeAsset('nudge-enabled-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.43, expectedEdge: 0.03 });
+    seedNoFillOutcomes(bot, signal, 1);
+    bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    assert.strictEqual(signal.price, 0.44, 'enabled paper maker nudge should move one tick closer to touch');
+    assert(signal.expectedEdge >= bot.config.paperMakerNudgeMinEdgeAfterNudge, 'nudge must preserve minimum edge');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
     addOpenOrder(bot, makeSignal({ tokenId: 'bootstrap-cap-1' }), 90_000);
     addOpenOrder(bot, makeSignal({ tokenId: 'bootstrap-cap-2' }), 90_000);
     const asset = makeAsset('bootstrap-at-cap');
@@ -285,7 +383,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
     const asset = makeAsset('bootstrap-low-edge');
     queueAndFlush(bot, makeBootstrapSignal({ tokenId: asset.tokenId, expectedEdge: 0.015 }), asset, makeBootstrapBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'bootstrap candidate should fail if edge is below floor');
@@ -293,7 +391,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
     const asset = makeAsset('bootstrap-low-confidence');
     queueAndFlush(bot, makeBootstrapSignal({ tokenId: asset.tokenId, confidence: 0.37 }), asset, makeBootstrapBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'bootstrap candidate should fail if confidence is below floor');
@@ -301,7 +399,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60, sophieBootstrapMinFillProb: 0.80 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapMinFillProb: 0.80 });
     const asset = makeAsset('bootstrap-low-fill');
     queueAndFlush(bot, makeBootstrapSignal({ tokenId: asset.tokenId }), asset, makeBootstrapBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'bootstrap candidate should fail if fill probability is below floor');
@@ -309,7 +407,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
     const asset = makeAsset('bootstrap-far-touch');
     queueAndFlush(bot, makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42 }), asset, makeBootstrapBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'bootstrap candidate should fail if distance from touch is above max');
@@ -317,7 +415,12 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapMaxAdmissionsPerScan: 1 });
+    const bot = makeBot({
+      maxOpenOrders: 10,
+      sophieMinExecutionQuality: 0.70,
+      sophieCalibratedAdmissionEnabled: false,
+      sophieBootstrapMaxAdmissionsPerScan: 1,
+    });
     const weak = makeBootstrapSignal({
       tokenId: 'bootstrap-rank-weak',
       expectedEdge: 0.017,
@@ -338,9 +441,9 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.60 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
     const asset = makeAsset('bootstrap-risk-block');
-    const sell = makeBootstrapSignal({ tokenId: asset.tokenId, side: 'sell', price: 0.59 });
+    const sell = makeBootstrapSignal({ tokenId: asset.tokenId, side: 'sell', price: 0.56 });
     queueAndFlush(bot, sell, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
     assert.strictEqual(bot.portfolio.openOrders.size, 0, 'bootstrap must not bypass RiskEngine');
     assert.strictEqual(bot.risk.lastBlockReason, 'no_available_position');
