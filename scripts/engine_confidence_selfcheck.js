@@ -2,8 +2,10 @@
 'use strict';
 
 const assert = require('assert');
+const path = require('path');
 const {
   CONFIG,
+  BotEngine,
   EngineDiagnostics,
   MultiConsensusEngine,
   RiskEngine,
@@ -101,6 +103,21 @@ function makeContext(configOverrides = {}, volGuard = null) {
   return { config, diagnostics, consensus, portfolio, volGuard: guard, cache, risk };
 }
 
+function makeRuntimeBot(configOverrides = {}) {
+  const config = makeConfig({
+    stateFile: path.join('/tmp', `engine-confidence-selfcheck-${process.pid}.json`),
+    ...configOverrides,
+  });
+  const bot = new BotEngine(config);
+  bot.cache = {
+    getMarketAssets: () => [],
+    getBook: () => makeBook(),
+    markPrices: () => new Map(),
+  };
+  bot.execution.cache = bot.cache;
+  return bot;
+}
+
 function evaluateConsensus(ctx, signal, book = makeBook()) {
   return ctx.consensus.evaluateSignal(signal, makeAsset(signal.tokenId), book, ctx.cache, ctx.portfolio, ctx.volGuard, null);
 }
@@ -133,6 +150,22 @@ function run() {
     assert.strictEqual(threshold.thresholdSource, 'SPREADHUNTER_MIN_CONFIDENCE_PAPER');
     assert(risked, 'capital_velocity allows safe positive-edge SpreadHunter at confidence 0.38 with threshold 0.35');
     assert.strictEqual(ctx.risk.lastBlockReason, null);
+  }
+
+  {
+    const bot = makeRuntimeBot({ paperConfidenceProfile: 'capital_velocity' });
+    bot.trySignal(makeSignal({ confidence: 0.38, expectedEdge: 0.02 }), makeAsset(), makeBook());
+    assert.strictEqual(bot.risk.lastBlockReason, null, 'runtime trySignal path should not block eligible capital_velocity SpreadHunter');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'runtime trySignal path should place the paper order');
+  }
+
+  {
+    const bot = makeRuntimeBot({ paperConfidenceProfile: 'conservative' });
+    bot.trySignal(makeSignal({ confidence: 0.38, expectedEdge: 0.02 }), makeAsset(), makeBook());
+    assert.strictEqual(bot.risk.lastBlockReason, 'confidence_below_min', 'runtime trySignal path should keep conservative MIN_CONFIDENCE');
+    assert.strictEqual(bot.risk.lastBlockDetails.minConfidence, 0.45);
+    assert.strictEqual(bot.risk.lastBlockDetails.thresholdSource, 'MIN_CONFIDENCE');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0, 'blocked runtime trySignal path must not place a paper order');
   }
 
   {

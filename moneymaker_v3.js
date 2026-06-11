@@ -103,6 +103,26 @@ const CONFIG = {
   openOrderReplaceEnabled: envBool('OPEN_ORDER_REPLACE_ENABLED', true),
   openOrderReplaceMinPriceDeltaTicks: envInt('OPEN_ORDER_REPLACE_MIN_PRICE_DELTA_TICKS', 1),
   openOrderReplaceAfterMs: envInt('OPEN_ORDER_REPLACE_AFTER_MS', 15_000),
+  openOrderReplaceMinAgeMs: envInt('ORDER_REPLACE_MIN_AGE_SEC', 45) * 1000,
+  openOrderReplacePriceEpsilon: envNum('ORDER_REPLACE_PRICE_EPSILON', 0.001),
+  openOrderReplaceAllowSamePrice: envBool('ORDER_REPLACE_ALLOW_SAME_PRICE', false),
+  openOrderReplaceForceRefreshMs: envInt('ORDER_REPLACE_FORCE_REFRESH_SEC', 120) * 1000,
+  orderReplaceDynamicEpsilonEnabled: envBool('ORDER_REPLACE_DYNAMIC_EPSILON_ENABLED', true),
+  orderReplaceSkipLogBatchMs: envInt('ORDER_REPLACE_SKIP_LOG_BATCH_SEC', 300) * 1000,
+  debugReplaceSkips: envBool('DEBUG_ORDER_REPLACE_SKIPS', false),
+  dustExitSuppressEnabled: envBool('DUST_EXIT_SUPPRESS_ENABLED', true),
+  dustExitLogCooldownMs: envInt('DUST_EXIT_LOG_COOLDOWN_SEC', 300) * 1000,
+  fillStarvationWarnMs: envInt('FILL_STARVATION_WARN_SEC', 900) * 1000,
+  sophieExecutionQualityEnabled: envBool('SOPHIE_EXECUTION_QUALITY_ENABLED', true),
+  sophieMinExecutionQuality: envNum('SOPHIE_MIN_EXECUTION_QUALITY', 0.55),
+  sophieSlotEvictionEnabled: envBool('SOPHIE_SLOT_EVICTION_ENABLED', true),
+  sophieSlotEvictionMinImprovement: envNum('SOPHIE_SLOT_EVICTION_MIN_IMPROVEMENT', 0.08),
+  sophieSlotEvictionMinOpenOrderAgeMs: envInt('SOPHIE_SLOT_EVICTION_MIN_OPEN_ORDER_AGE_SEC', 60) * 1000,
+  sophieNoFillCooldownMs: envInt('SOPHIE_NO_FILL_COOLDOWN_SEC', 600) * 1000,
+  sophieMinFillRateTarget: envNum('SOPHIE_MIN_FILL_RATE_TARGET', 0.01),
+  sophieDuplicatePressureWindowMs: envInt('SOPHIE_DUPLICATE_PRESSURE_WINDOW_SEC', 900) * 1000,
+  sophieMaxDuplicateSkipsPerTokenWindow: envInt('SOPHIE_MAX_DUPLICATE_SKIPS_PER_TOKEN_WINDOW', 20),
+  sophieMaxAttemptsPerTokenWindow: envInt('SOPHIE_MAX_ATTEMPTS_PER_TOKEN_WINDOW', 12),
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
   // Practical revenue/risk optimization controls.
@@ -2324,6 +2344,13 @@ class PaperPortfolio {
     this.fills = [];
     this.ghostOrders = [];
     this.ghostStats = { total: 0, favorable: 0, unfavorable: 0 };
+    this.executionEvents = [];
+    this.executionTotals = {
+      paperOrdersPlaced: 0,
+      paperOrderReplacements: 0,
+      paperDuplicateSkips: 0,
+      paperFills: 0,
+    };
   }
 
   position(tokenId) {
@@ -2451,6 +2478,24 @@ class PaperPortfolio {
     return this.totalOpenOrderUsd();
   }
 
+  dustPositions(markPrices = new Map()) {
+    return [...this.positions.entries()]
+      .filter(([, qty]) => qty > 0)
+      .map(([tokenId, qty]) => {
+        const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
+        return { tokenId, qty, mark, value: qty * mark };
+      })
+      .filter((pos) => pos.value > 0 && pos.value < this.config.minOrderUsd);
+  }
+
+  dustSummary(markPrices = new Map()) {
+    const positions = this.dustPositions(markPrices);
+    return {
+      count: positions.length,
+      valueUsd: positions.reduce((sum, pos) => sum + pos.value, 0),
+    };
+  }
+
   topPositions(markPrices = new Map(), limit = 10) {
     return [...this.positions.entries()]
       .filter(([, qty]) => qty > 0)
@@ -2493,6 +2538,103 @@ class PaperPortfolio {
 
   cancelOrder(orderId) {
     this.openOrders.delete(orderId);
+  }
+
+  recordExecutionEvent(type, details = {}, ts = Date.now()) {
+    this.executionEvents.push({
+      type,
+      ts,
+      tokenId: details.tokenId ? String(details.tokenId) : null,
+      side: details.side ? String(details.side).toLowerCase() : null,
+      strategy: details.strategy || null,
+      reason: details.reason || null,
+    });
+    while (this.executionEvents.length > 5000) this.executionEvents.shift();
+
+    if (type === 'order_placed') this.executionTotals.paperOrdersPlaced += 1;
+    if (type === 'order_replacement') this.executionTotals.paperOrderReplacements += 1;
+    if (type === 'duplicate_skip') this.executionTotals.paperDuplicateSkips += 1;
+    if (type === 'fill') this.executionTotals.paperFills += 1;
+  }
+
+  executionHealth(now = Date.now()) {
+    const hourAgo = now - 60 * 60_000;
+    const recent = this.executionEvents.filter((event) => Number(event.ts) >= hourAgo);
+    const countType = (type) => recent.filter((event) => event.type === type).length;
+    const openOrders = [...this.openOrders.values()];
+    const agesSec = openOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
+    const ordersPlacedLastHour = countType('order_placed');
+    const fillsLastHour = countType('fill');
+    const duplicateSkipsLastHour = countType('duplicate_skip');
+    const replacementsLastHour = countType('order_replacement');
+    const maxOpenOrderBlocksLastHour = countType('max_open_orders_block');
+    const oldestOpenOrderAgeSec = agesSec.length ? Math.max(...agesSec) : 0;
+    const avgOpenOrderAgeSec = agesSec.length
+      ? agesSec.reduce((sum, age) => sum + age, 0) / agesSec.length
+      : 0;
+
+    return {
+      ...this.executionTotals,
+      ordersPlacedLastHour,
+      fillsLastHour,
+      duplicateSkipsLastHour,
+      replacementsLastHour,
+      maxOpenOrderBlocksLastHour,
+      oldestOpenOrderAgeSec,
+      avgOpenOrderAgeSec,
+      openOrderExposureUsd: this.openOrderExposureUsd(),
+      fillRateLastHour: ordersPlacedLastHour > 0 ? (fillsLastHour / ordersPlacedLastHour) * 100 : 0,
+      fillStarvationReason: openOrders.length > 0 && fillsLastHour === 0 ? 'no_recent_fills' : null,
+    };
+  }
+
+  executionStatsFor(signal, windowMs = 60 * 60_000, now = Date.now()) {
+    const tokenId = String(signal?.tokenId || '');
+    const side = String(signal?.side || '').toLowerCase();
+    const strategy = signal?.strategy || null;
+    const since = now - windowMs;
+    const matchingEvents = this.executionEvents.filter((event) => (
+      Number(event.ts) >= since &&
+      String(event.tokenId || '') === tokenId &&
+      String(event.side || '').toLowerCase() === side &&
+      (!strategy || event.strategy === strategy)
+    ));
+    const strategyEvents = this.executionEvents.filter((event) => (
+      Number(event.ts) >= since &&
+      (!strategy || event.strategy === strategy)
+    ));
+    const count = (events, type) => events.filter((event) => event.type === type).length;
+    const comparableOpenOrders = [...this.openOrders.values()].filter((order) => (
+      String(order.tokenId || '') === tokenId &&
+      String(order.side || '').toLowerCase() === side &&
+      (!strategy || order.strategy === strategy)
+    ));
+    const agesSec = comparableOpenOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
+    const fillsLastHour = count(matchingEvents, 'fill');
+    const freshOrdersLastHour = count(matchingEvents, 'order_placed');
+    const replacementsLastHour = count(matchingEvents, 'order_replacement');
+    const duplicateSkipsLastHour = count(matchingEvents, 'duplicate_skip');
+    const attemptsLastHour = freshOrdersLastHour + replacementsLastHour + duplicateSkipsLastHour + count(matchingEvents, 'quality_block') + count(matchingEvents, 'quality_throttle');
+    const strategyFills = count(strategyEvents, 'fill');
+    const strategyAttempts = count(strategyEvents, 'order_placed') + count(strategyEvents, 'order_replacement') + count(strategyEvents, 'duplicate_skip');
+    const fillEvents = matchingEvents.filter((event) => event.type === 'fill').sort((a, b) => b.ts - a.ts);
+    const orderEvents = matchingEvents.filter((event) => event.type === 'order_placed').sort((a, b) => b.ts - a.ts);
+
+    return {
+      attemptsLastHour,
+      freshOrdersLastHour,
+      replacementsLastHour,
+      duplicateSkipsLastHour,
+      fillsLastHour,
+      fillRateLastHour: attemptsLastHour > 0 ? fillsLastHour / attemptsLastHour : 0,
+      strategyFillRateLastHour: strategyAttempts > 0 ? strategyFills / strategyAttempts : 0,
+      noFillStreak: fillsLastHour === 0 ? attemptsLastHour : 0,
+      lastFillTs: fillEvents[0]?.ts || null,
+      lastOrderTs: orderEvents[0]?.ts || null,
+      oldestOpenOrderAgeSec: agesSec.length ? Math.max(...agesSec) : 0,
+      avgOpenOrderAgeSec: agesSec.length ? agesSec.reduce((sum, age) => sum + age, 0) / agesSec.length : 0,
+      maxOpenOrderBlocksLastHour: count(matchingEvents, 'max_open_orders_block'),
+    };
   }
 
   recordGhostOrder(signal, book) {
@@ -2617,6 +2759,8 @@ class PaperPortfolio {
         strategyPnl: Object.fromEntries(this.strategyPnl),
         ghostStats: this.ghostStats,
         fills: this.fills.slice(-500),
+        executionTotals: this.executionTotals,
+        executionEvents: this.executionEvents.slice(-1000),
       };
 
       fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
@@ -2643,6 +2787,11 @@ class PaperPortfolio {
       this.strategyPnl = new Map(Object.entries(data.strategyPnl || {}).map(([k, v]) => [k, Number(v)]));
       this.ghostStats = data.ghostStats || this.ghostStats;
       this.fills = Array.isArray(data.fills) ? data.fills : [];
+      this.executionTotals = {
+        ...this.executionTotals,
+        ...(data.executionTotals || {}),
+      };
+      this.executionEvents = Array.isArray(data.executionEvents) ? data.executionEvents : [];
 
       info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity().toFixed(2)}`);
     } catch (e) {
@@ -2866,6 +3015,12 @@ class PaperExecutionEngine {
     this.portfolio = portfolio;
     this.cache = cache;
     this.diagnostics = diagnostics;
+    this.replaceSkipBatch = {
+      windowStartedAt: Date.now(),
+      ageSkips: 0,
+      samePriceSkips: 0,
+      tokenIds: new Set(),
+    };
   }
 
   findComparableOpenOrders(signal) {
@@ -2874,15 +3029,86 @@ class PaperExecutionEngine {
   }
 
   shouldReplaceOpenOrder(existingOrder, signal, book) {
-    if (!this.config.openOrderReplaceEnabled) return false;
+    if (!this.config.openOrderReplaceEnabled) return { replace: false, reason: 'disabled' };
 
     const tick = book?.tickSize || signal.metadata?.tickSize || 0.01;
     const minTicks = Math.max(1, this.config.openOrderReplaceMinPriceDeltaTicks || 1);
     const minPriceDelta = tick * minTicks;
     const priceDelta = Math.abs(Number(signal.price) - Number(existingOrder.price));
     const ageMs = Date.now() - existingOrder.createdAt;
+    const epsilon = this.replacementEpsilon(signal, book);
+    const samePrice = priceDelta < epsilon;
+    const minAgeMs = Math.max(0, this.config.openOrderReplaceMinAgeMs || 0);
+    const forceRefreshMs = Math.max(minAgeMs, this.config.openOrderReplaceForceRefreshMs || 0);
 
-    return priceDelta >= minPriceDelta || ageMs >= this.config.openOrderReplaceAfterMs;
+    if (ageMs < minAgeMs) {
+      return { replace: false, reason: 'age', ageMs, minAgeMs, priceDelta, epsilon, samePrice };
+    }
+
+    if (samePrice && !this.config.openOrderReplaceAllowSamePrice && ageMs < forceRefreshMs) {
+      return { replace: false, reason: 'same_price', ageMs, minAgeMs, forceRefreshMs, priceDelta, epsilon, samePrice };
+    }
+
+    const legacyReplace = priceDelta >= minPriceDelta || ageMs >= this.config.openOrderReplaceAfterMs;
+    const forceRefresh = samePrice && ageMs >= forceRefreshMs;
+    const meaningfulPriceChange = !samePrice && priceDelta >= Math.max(epsilon, minPriceDelta);
+
+    return {
+      replace: forceRefresh || meaningfulPriceChange || legacyReplace,
+      reason: forceRefresh ? 'force_refresh' : meaningfulPriceChange ? 'price_change' : legacyReplace ? 'legacy' : 'duplicate',
+      ageMs,
+      minAgeMs,
+      forceRefreshMs,
+      priceDelta,
+      epsilon,
+      samePrice,
+    };
+  }
+
+  replacementEpsilon(signal, book) {
+    const base = Math.max(0, Number(this.config.openOrderReplacePriceEpsilon) || 0);
+    if (!this.config.orderReplaceDynamicEpsilonEnabled || !book) return base;
+
+    const tick = Number(book.tickSize || signal.metadata?.tickSize || 0.01);
+    const spread = Number(book.spread);
+    const spreadComponent = Number.isFinite(spread) ? spread * 0.05 : 0;
+    const tickComponent = Number.isFinite(tick) && tick > 0 ? tick * 0.5 : 0;
+    return Math.max(base, spreadComponent, tickComponent);
+  }
+
+  recordReplaceSkip(reason, signal, decision, existingOrder = null) {
+    const now = Date.now();
+    const batchMs = Math.max(0, this.config.orderReplaceSkipLogBatchMs || 0);
+
+    if (batchMs <= 0 || now - this.replaceSkipBatch.windowStartedAt >= batchMs) {
+      if (this.replaceSkipBatch.ageSkips || this.replaceSkipBatch.samePriceSkips) {
+        info(
+          `[ORDER REPLACE SKIP SUMMARY] ageSkips=${this.replaceSkipBatch.ageSkips} ` +
+          `samePriceSkips=${this.replaceSkipBatch.samePriceSkips} tokenCount=${this.replaceSkipBatch.tokenIds.size} ` +
+          `windowSec=${Math.round(batchMs / 1000)}`
+        );
+      }
+      this.replaceSkipBatch = { windowStartedAt: now, ageSkips: 0, samePriceSkips: 0, tokenIds: new Set() };
+    }
+
+    if (reason === 'age') this.replaceSkipBatch.ageSkips += 1;
+    if (reason === 'same_price') this.replaceSkipBatch.samePriceSkips += 1;
+    if (signal?.tokenId) this.replaceSkipBatch.tokenIds.add(String(signal.tokenId));
+
+    if (!this.config.debugReplaceSkips) return;
+
+    if (reason === 'age') {
+      info(
+        `[ORDER REPLACE SKIP AGE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `age=${Math.round((decision.ageMs || 0) / 1000)}s minAge=${Math.round((decision.minAgeMs || 0) / 1000)}s`
+      );
+    } else if (reason === 'same_price') {
+      info(
+        `[ORDER REPLACE SKIP SAME PRICE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `old=${fmtPrice(existingOrder?.price)} new=${fmtPrice(signal.price)} ` +
+        `age=${Math.round((decision.ageMs || 0) / 1000)}s epsilon=${decision.epsilon}`
+      );
+    }
   }
 
   place(signal, book) {
@@ -2890,10 +3116,23 @@ class PaperExecutionEngine {
     const maxComparable = Math.max(1, this.config.maxOpenOrdersPerTokenSideStrategy || 1);
 
     if (comparableOrders.length >= maxComparable) {
-      const replaceable = comparableOrders.filter(({ order }) => this.shouldReplaceOpenOrder(order, signal, book));
+      const decisions = comparableOrders.map(({ id, order }) => ({
+        id,
+        order,
+        decision: this.shouldReplaceOpenOrder(order, signal, book),
+      }));
+      const replaceable = decisions.filter(({ decision }) => decision.replace);
 
       if (replaceable.length === 0) {
-        info(`[ORDER SKIP DUPLICATE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} [${signal.strategy}] active=${comparableOrders.length}`);
+        const decision = decisions[0]?.decision || {};
+        if (decision.reason === 'age') {
+          this.recordReplaceSkip('age', signal, decision, decisions[0]?.order);
+        } else if (decision.reason === 'same_price') {
+          this.recordReplaceSkip('same_price', signal, decision, decisions[0]?.order);
+        } else {
+          info(`[ORDER SKIP DUPLICATE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} [${signal.strategy}] active=${comparableOrders.length}`);
+        }
+        this.portfolio.recordExecutionEvent('duplicate_skip', signal);
         this.diagnostics?.record({
           strategy: signal.strategy,
           scorePassed: true,
@@ -2904,12 +3143,14 @@ class PaperExecutionEngine {
 
       for (const { id, order } of comparableOrders) {
         this.portfolio.cancelOrder(id);
+        this.portfolio.recordExecutionEvent('order_replacement', signal);
         info(`[ORDER REPLACE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} old=${fmtPrice(order.price)} new=${fmtPrice(signal.price)} age=${Math.round((Date.now() - order.createdAt) / 1000)}s [${signal.strategy}]`);
       }
     }
 
     const order = new PaperOrder(signal);
     this.portfolio.addOrder(order);
+    this.portfolio.recordExecutionEvent('order_placed', signal);
     this.portfolio.recordGhostOrder(signal, book);
     info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
     this.diagnostics?.record({
@@ -2945,6 +3186,7 @@ class PaperExecutionEngine {
         size: fillSize,
         strategy: order.strategy,
       });
+      this.portfolio.recordExecutionEvent('fill', order);
 
       order.filledUsd += fill.fillUsd;
 
@@ -3077,6 +3319,11 @@ class BotEngine {
     this.wsClient = null;
     this.researchInFlight = null;
     this.autoLiveCandidateLastWritten = new Map();
+    this.dustExitLastLogged = new Map();
+    this.lastDustExitSuppressed = null;
+    this.lastFillStarvationWarningAt = 0;
+    this.sophieNoFillCooldownUntil = new Map();
+    this.lastSophieQualityDecision = null;
 
     this.strategies = [
       new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
@@ -3090,6 +3337,11 @@ class BotEngine {
   async start() {
     banner();
     info('Starting Polymarket MoneyMaker V3 (Paper)...');
+    info(
+      `[CONFIDENCE CONFIG] profile=${this.risk.paperConfidenceProfile()} ` +
+      `minConfidence=${this.config.minConfidence} ` +
+      `spreadHunterPaperMin=${this.config.spreadHunterMinConfidencePaper}`
+    );
 
     await this.refreshResearch();
 
@@ -3235,6 +3487,21 @@ class BotEngine {
       if (!signal) return;
     }
 
+    if (this.shouldSuppressDustExit(signal)) {
+      this.suppressDustExit(signal);
+      return;
+    }
+
+    const quality = this.evaluateSophieExecutionQuality(signal, book);
+    signal.metadata = {
+      ...(signal.metadata || {}),
+      sophieExecution: quality,
+    };
+
+    if (!this.applySophieExecutionGate(signal, book, quality)) {
+      return;
+    }
+
     signal = this.risk.evaluate(signal);
     if (!signal) {
       if (this.config.consensusLogRejected && rawSignal) {
@@ -3250,6 +3517,244 @@ class BotEngine {
     const placed = this.execution.place(signal, book);
     if (placed) {
       this.maybeWriteLiveCandidate(signal, asset, book);
+    }
+  }
+
+  sophieExecutionKey(signal) {
+    return `${signal.tokenId}:${String(signal.side || '').toLowerCase()}:${signal.strategy}`;
+  }
+
+  quoteDistanceFromTouch(signal, book) {
+    if (!signal || !book) return 0.5;
+    if (signal.side === 'buy' && Number.isFinite(book.bestBid)) {
+      return Math.max(0, Number(book.bestBid) - Number(signal.price));
+    }
+    if (signal.side === 'sell' && Number.isFinite(book.bestAsk)) {
+      return Math.max(0, Number(signal.price) - Number(book.bestAsk));
+    }
+    return 0.5;
+  }
+
+  evaluateSophieExecutionQuality(signal, book, existingOrder = null) {
+    const stats = this.portfolio.executionStatsFor(signal, 60 * 60_000);
+    const consensus = signal.metadata?.consensus || {};
+    const signalScore = clamp(firstFinite(consensus.score, signal.confidence, 0.5), 0, 1);
+    const edgeScore = clamp((Number(signal.expectedEdge) || 0) / 0.04, 0, 1);
+    const confidenceScore = clamp(Number(signal.confidence) || 0, 0, 1);
+    const spread = Number(book?.spread);
+    const spreadQuality = Number.isFinite(spread)
+      ? clamp(1 - (spread / Math.max(0.01, this.config.hunterMaxSpread || 0.22)), 0, 1)
+      : 0.5;
+    const topDepth = book ? Math.min(topDepthUsd(book.bids || [], 1), topDepthUsd(book.asks || [], 1)) : NaN;
+    const depthQuality = Number.isFinite(topDepth)
+      ? clamp(topDepth / Math.max(1, this.config.hunterMinTopDepthUsd * 4), 0, 1)
+      : 0.5;
+    const distanceFromTouch = this.quoteDistanceFromTouch(signal, book);
+    const quoteDistanceQuality = clamp(1 - (distanceFromTouch / Math.max(0.01, spread || this.config.hunterMaxSpread || 0.22)), 0, 1);
+    const ghostTotal = this.portfolio.ghostStats?.total || 0;
+    const ghostRate = ghostTotal > 0 ? this.portfolio.ghostStats.favorable / ghostTotal : 0.5;
+    const historicalFillRate = stats.attemptsLastHour > 0 ? stats.fillRateLastHour : 0.005;
+    const strategyFillRate = stats.strategyFillRateLastHour || 0.005;
+    const duplicatePressure = clamp(stats.duplicateSkipsLastHour / Math.max(1, this.config.sophieMaxDuplicateSkipsPerTokenWindow), 0, 1);
+    const noFillPressure = clamp(stats.noFillStreak / Math.max(1, this.config.sophieMaxAttemptsPerTokenWindow), 0, 1);
+    const churnPressure = clamp(stats.replacementsLastHour / Math.max(1, this.config.sophieMaxAttemptsPerTokenWindow), 0, 1);
+    const slotPressure = clamp(this.portfolio.openOrders.size / Math.max(1, this.config.maxOpenOrders), 0, 1);
+    const agePressure = existingOrder
+      ? clamp((Date.now() - existingOrder.createdAt) / Math.max(1, this.config.orderTtlMs), 0, 1)
+      : clamp(stats.avgOpenOrderAgeSec / Math.max(1, this.config.orderTtlMs / 1000), 0, 1);
+    const fillProbDefaultsUsed = stats.attemptsLastHour === 0 && stats.strategyFillRateLastHour === 0;
+    const predictedFillProbability = clamp(
+      (historicalFillRate * 0.20) +
+      (strategyFillRate * 0.15) +
+      (quoteDistanceQuality * 0.20) +
+      (spreadQuality * 0.10) +
+      (depthQuality * 0.15) +
+      (ghostRate * 0.10) +
+      ((1 - duplicatePressure) * 0.05) +
+      ((1 - noFillPressure) * 0.05),
+      0,
+      1
+    );
+    const executionQuality = clamp(
+      (signalScore * 0.20) +
+      (edgeScore * 0.15) +
+      (confidenceScore * 0.10) +
+      (predictedFillProbability * 0.30) +
+      (depthQuality * 0.08) +
+      (spreadQuality * 0.07) +
+      (ghostRate * 0.05) -
+      (duplicatePressure * 0.08) -
+      (noFillPressure * 0.10) -
+      (churnPressure * 0.05) -
+      (slotPressure * 0.04) -
+      (agePressure * 0.03) +
+      0.03,
+      0,
+      1
+    );
+    const quoteMode = distanceFromTouch <= 0.001 ? 'AT_TOUCH' : 'PASSIVE';
+
+    return {
+      sophieSignalScore: Number(signalScore.toFixed(4)),
+      sophieExecutionQuality: Number(executionQuality.toFixed(4)),
+      predictedFillProbability: Number(predictedFillProbability.toFixed(4)),
+      slotPressure: Number(slotPressure.toFixed(4)),
+      duplicatePressure: Number(duplicatePressure.toFixed(4)),
+      noFillPressure: Number(noFillPressure.toFixed(4)),
+      churnPressure: Number(churnPressure.toFixed(4)),
+      quoteMode,
+      distanceFromTouch: Number(distanceFromTouch.toFixed(6)),
+      spreadQuality: Number(spreadQuality.toFixed(4)),
+      depthQuality: Number(depthQuality.toFixed(4)),
+      ghostQuality: Number(ghostRate.toFixed(4)),
+      fillProbDefaultsUsed,
+      stats,
+      qualityDecision: 'PENDING',
+    };
+  }
+
+  applySophieExecutionGate(signal, book, quality) {
+    if (!this.config.sophieExecutionQualityEnabled || isProtectiveExitStrategy(signal.strategy)) {
+      return true;
+    }
+
+    const key = this.sophieExecutionKey(signal);
+    const now = Date.now();
+    const cooldownUntil = this.sophieNoFillCooldownUntil.get(key) || 0;
+    if (cooldownUntil > now) {
+      quality.qualityDecision = 'THROTTLE';
+      this.lastSophieQualityDecision = quality;
+      this.portfolio.recordExecutionEvent('quality_throttle', signal);
+      return false;
+    }
+
+    const windowStats = this.portfolio.executionStatsFor(signal, this.config.sophieDuplicatePressureWindowMs);
+    if (
+      windowStats.attemptsLastHour >= this.config.sophieMaxAttemptsPerTokenWindow &&
+      windowStats.duplicateSkipsLastHour >= this.config.sophieMaxDuplicateSkipsPerTokenWindow &&
+      windowStats.fillsLastHour === 0 &&
+      windowStats.fillRateLastHour < this.config.sophieMinFillRateTarget
+    ) {
+      this.sophieNoFillCooldownUntil.set(key, now + this.config.sophieNoFillCooldownMs);
+      quality.qualityDecision = 'THROTTLE';
+      this.lastSophieQualityDecision = quality;
+      this.portfolio.recordExecutionEvent('quality_throttle', signal);
+      warn(
+        `[SOPHIE EXECUTION THROTTLE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} strategy=${signal.strategy} ` +
+        `reason=no_fills attemptsWindow=${windowStats.attemptsLastHour} duplicateSkipsWindow=${windowStats.duplicateSkipsLastHour} ` +
+        `fillsWindow=${windowStats.fillsLastHour} cooldownSec=${Math.round(this.config.sophieNoFillCooldownMs / 1000)}`
+      );
+      return false;
+    }
+
+    if (quality.sophieExecutionQuality < this.config.sophieMinExecutionQuality) {
+      quality.qualityDecision = 'BLOCK_LOW_QUALITY';
+      this.lastSophieQualityDecision = quality;
+      this.portfolio.recordExecutionEvent('quality_block', signal);
+      warn(
+        `[SOPHIE ORDER QUALITY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `signalScore=${quality.sophieSignalScore} executionQuality=${quality.sophieExecutionQuality} ` +
+        `fillProb=${quality.predictedFillProbability} edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
+        `quoteMode=${quality.quoteMode} distanceFromTouch=${quality.distanceFromTouch} decision=BLOCK_LOW_QUALITY`
+      );
+      return false;
+    }
+
+    if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) {
+      return this.applySophieSlotManagement(signal, book, quality);
+    }
+
+    quality.qualityDecision = 'ADMIT';
+    this.lastSophieQualityDecision = quality;
+    info(
+      `[SOPHIE ORDER QUALITY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `signalScore=${quality.sophieSignalScore} executionQuality=${quality.sophieExecutionQuality} ` +
+      `fillProb=${quality.predictedFillProbability} edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
+      `quoteMode=${quality.quoteMode} distanceFromTouch=${quality.distanceFromTouch} decision=ADMIT`
+    );
+    return true;
+  }
+
+  applySophieSlotManagement(signal, book, quality) {
+    const now = Date.now();
+    const eligible = [...this.portfolio.openOrders.entries()]
+      .filter(([, order]) => !isProtectiveExitStrategy(order.strategy))
+      .filter(([, order]) => now - order.createdAt >= this.config.sophieSlotEvictionMinOpenOrderAgeMs)
+      .filter(([, order]) => order.remainingUsd() >= signal.sizeUsd)
+      .map(([id, order]) => ({
+        id,
+        order,
+        quality: this.evaluateSophieExecutionQuality(order.signal || order, this.cache.getBook(order.tokenId) || book, order).sophieExecutionQuality,
+      }))
+      .sort((a, b) => a.quality - b.quality);
+
+    const weakest = eligible[0] || null;
+    const weakestQuality = weakest ? weakest.quality : 1;
+    const improvement = quality.sophieExecutionQuality - weakestQuality;
+
+    if (
+      this.config.sophieSlotEvictionEnabled &&
+      weakest &&
+      improvement > this.config.sophieSlotEvictionMinImprovement
+    ) {
+      this.portfolio.cancelOrder(weakest.id);
+      this.portfolio.recordExecutionEvent('slot_evict', signal);
+      quality.qualityDecision = 'EVICT_ADMIT';
+      this.lastSophieQualityDecision = quality;
+      warn(
+        `[SOPHIE SLOT EVICT] evict=${weakest.order.side.toUpperCase()} ${shortId(weakest.order.tokenId)} ` +
+        `quality=${weakestQuality.toFixed(2)} admit=${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `quality=${quality.sophieExecutionQuality.toFixed(2)} improvement=${improvement.toFixed(2)}`
+      );
+      return true;
+    }
+
+    quality.qualityDecision = 'BLOCK_SLOT';
+    this.lastSophieQualityDecision = quality;
+    this.portfolio.recordExecutionEvent('max_open_orders_block', signal);
+    warn(
+      `[SOPHIE SLOT BLOCK] reason=max_open_orders candidateQuality=${quality.sophieExecutionQuality.toFixed(2)} ` +
+      `weakestOpenQuality=${weakestQuality.toFixed(2)}`
+    );
+    return false;
+  }
+
+  shouldSuppressDustExit(signal) {
+    if (!this.config.dustExitSuppressEnabled) return false;
+    if (!signal || signal.side !== 'sell') return false;
+    if (!Number.isFinite(signal.price) || signal.price <= 0) return false;
+
+    const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId);
+    const availableSellUsd = availableSellQty * signal.price;
+    return availableSellUsd > 0 && availableSellUsd < this.config.minOrderUsd;
+  }
+
+  suppressDustExit(signal) {
+    const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId);
+    const availableSellUsd = availableSellQty * signal.price;
+    const cooldownMs = Math.max(0, this.config.dustExitLogCooldownMs || 0);
+    const cooldownSec = Math.round(cooldownMs / 1000);
+    const key = `${signal.strategy}:${signal.side}:${signal.tokenId}`;
+    const now = Date.now();
+    const last = this.dustExitLastLogged.get(key) || 0;
+
+    this.lastDustExitSuppressed = {
+      reason: 'DUST_EXIT_SUPPRESSED',
+      strategy: signal.strategy,
+      side: signal.side,
+      tokenId: signal.tokenId,
+      availableSellQty,
+      availableSellUsd,
+      minOrderUsd: this.config.minOrderUsd,
+      cooldownSec,
+    };
+
+    if (now - last >= cooldownMs) {
+      this.dustExitLastLogged.set(key, now);
+      warn(
+        `[DUST EXIT SUPPRESSED] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `availableSellUsd=${availableSellUsd.toFixed(3)} minOrderUsd=${this.config.minOrderUsd} cooldownSec=${cooldownSec}`
+      );
     }
   }
 
@@ -3352,6 +3857,32 @@ class BotEngine {
     info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd().toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
     info(`Position Exposure: $${this.portfolio.positionExposureUsd(markPrices).toFixed(2)} | Open Order Exposure: $${this.portfolio.openOrderExposureUsd().toFixed(2)} | Available Cash: $${this.portfolio.availableCash().toFixed(2)}`);
 
+    const dust = this.portfolio.dustSummary(markPrices);
+    info(`Dust Positions: count=${dust.count} value=$${dust.valueUsd.toFixed(2)}`);
+
+    const health = this.portfolio.executionHealth();
+    info(
+      `Execution Health: ordersPlacedLastHour=${health.ordersPlacedLastHour} ` +
+      `fillsLastHour=${health.fillsLastHour} duplicateSkipsLastHour=${health.duplicateSkipsLastHour} ` +
+      `replacementsLastHour=${health.replacementsLastHour} ` +
+      `oldestOpenOrderAgeSec=${Math.round(health.oldestOpenOrderAgeSec)} ` +
+      `maxOpenOrderBlocksLastHour=${health.maxOpenOrderBlocksLastHour} ` +
+      `fillRateLastHour=${health.fillRateLastHour.toFixed(1)}%`
+    );
+
+    if (
+      this.portfolio.openOrders.size > 0 &&
+      health.fillsLastHour === 0 &&
+      health.oldestOpenOrderAgeSec >= this.config.fillStarvationWarnMs / 1000 &&
+      Date.now() - this.lastFillStarvationWarningAt >= this.config.fillStarvationWarnMs
+    ) {
+      this.lastFillStarvationWarningAt = Date.now();
+      warn(
+        `[ENGINE STARVATION WARNING] openOrders=${this.portfolio.openOrders.size} ` +
+        `oldestOpenOrderAgeSec=${Math.round(health.oldestOpenOrderAgeSec)} fillsLastHour=0 reason=no_recent_fills`
+      );
+    }
+
     if (this.portfolio.ghostStats.total > 0) {
       const favorableRate = (this.portfolio.ghostStats.favorable / this.portfolio.ghostStats.total) * 100;
       info(`Ghost calibration: total=${this.portfolio.ghostStats.total} favorable=${favorableRate.toFixed(1)}% unfavorable=${this.portfolio.ghostStats.unfavorable}`);
@@ -3405,6 +3936,10 @@ function firstFinite(...values) {
   return 0;
 }
 
+function isProtectiveExitStrategy(strategy) {
+  return ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(strategy);
+}
+
 function shortId(value) {
   const s = String(value || '');
   if (s.length <= 10) return s;
@@ -3430,6 +3965,7 @@ function formatRiskBlockDetails(details = {}) {
     'minConfidence',
     'confidenceProfile',
     'thresholdSource',
+    'paperConfidenceOverrideEligible',
     'sizeUsd',
     'minOrderUsd',
     'availableCash',
@@ -3514,6 +4050,7 @@ if (require.main === module) {
 
 module.exports = {
   CONFIG,
+  BotEngine,
   EngineDiagnostics,
   MultiConsensusEngine,
   RiskEngine,

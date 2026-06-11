@@ -86,6 +86,46 @@ MIN_CONFIDENCE=0.45
 
 Do not change live trading flags for this paper calibration. Live submission remains disabled unless explicitly enabled in the separate live adapter flow.
 
+## Operational Stabilization Before Live-Readiness Review
+
+Tiny sellable positions below `MIN_ORDER_USD` are now treated as dust. When a SELL or exit signal has `availableSellUsd > 0` and `availableSellUsd < MIN_ORDER_USD`, the engine suppresses the paper order instead of repeatedly producing full risk-block logs. The position remains in portfolio state and reports; it is not deleted, force-sold, or marked as filled. Suppression is controlled by `DUST_EXIT_SUPPRESS_ENABLED` and `DUST_EXIT_LOG_COOLDOWN_SEC`, and emits concise `[DUST EXIT SUPPRESSED]` logs.
+
+Paper order replacement now has churn guards. Same-price replacements are skipped unless the order reaches `ORDER_REPLACE_FORCE_REFRESH_SEC`, orders younger than `ORDER_REPLACE_MIN_AGE_SEC` are not replaced, and price changes smaller than `ORDER_REPLACE_PRICE_EPSILON` are treated as same-price. Duplicate protection remains active and replacements do not double-count open-order exposure.
+
+Portfolio reports now include dust and execution-health summaries:
+
+```text
+Dust Positions: count=N value=$X.XX
+Execution Health: ordersPlacedLastHour=N fillsLastHour=N duplicateSkipsLastHour=N replacementsLastHour=N oldestOpenOrderAgeSec=N fillRateLastHour=X%
+```
+
+If open orders age beyond `FILL_STARVATION_WARN_SEC` with no fills in the last hour, the engine logs `[ENGINE STARVATION WARNING] ... reason=no_recent_fills`. This is diagnostic only; it does not loosen strategy, risk, routing, duplicate, stale-book, volatility, exposure, drawdown, or ghost controls.
+
+`npm run live:readiness` is a read-only operator report. It does not place orders, read live private keys, send Telegram messages, or enable live flags. It checks PM2 process presence, recent paper health, safety flags, Telegram token/chat-id presence with redaction, and dashboard syntax. `READY_FOR_MICRO_LIVE=false` is expected until paper health and process checks are clean; even a passing report is only for dry-run review, not automatic live execution.
+
+## Sophie Execution Quality
+
+The current paper problem is no longer starvation from confidence blocks. The engine is active but inefficient: recent operations showed roughly 1 fill from about 580 paper order placements, or about `1 / 580 = 0.17%`, with duplicate skips and max-open-order pressure dominating the loop. Raising `MAX_OPEN_ORDERS` would hide the symptom by letting more low-fill orders rest; it would not improve fill probability, order-slot quality, or churn. Force-selling dust is also unsafe because sub-`MIN_ORDER_USD` positions cannot be assumed executable; dust remains suppression-only and tracked in reports/state.
+
+Sophie now scores paper execution quality separately from theoretical signal quality. The signal score still answers whether the strategy signal is attractive. The execution-quality score asks whether the order is likely to fill efficiently without wasting a scarce paper order slot.
+
+The implemented formula blends:
+
+- `sophieSignalScore`: consensus score when available, otherwise signal confidence.
+- Edge and confidence quality.
+- `predictedFillProbability`, estimated from token/side/strategy fill history, strategy fill history, quote distance from touch, spread quality, top-depth quality, ghost favorable rate, duplicate pressure, and no-fill pressure.
+- Slot, duplicate, no-fill, churn, and open-order age penalties.
+
+The paper gate uses `SOPHIE_MIN_EXECUTION_QUALITY` for non-protective entries. Protective exits bypass the Sophie throttle. Low-fill token/side/strategy combinations can enter a cooldown when attempts and duplicate skips are high with no fills. When order slots are saturated, the slot manager uses:
+
+```text
+candidateUtility > weakestOpenOrderUtility + replacementFriction
+```
+
+where `replacementFriction` is `SOPHIE_SLOT_EVICTION_MIN_IMPROVEMENT`. Eviction is paper-only, never targets protective exits, requires the open order to be older than `SOPHIE_SLOT_EVICTION_MIN_OPEN_ORDER_AGE_SEC`, and only admits candidates that do not increase open-order exposure relative to the evicted order.
+
+`npm run live:readiness` now keeps `READY_FOR_MICRO_LIVE=false` unless all safety and efficiency checks pass: expected PM2 processes online, safe live flags, recent portfolio report, `fillsLastHour >= 3`, `fillRateLastHour >= 1.0%`, `ordersPlacedLastHour <= 150`, `duplicateSkipsLastHour <= 500`, `maxOpenOrderBlocksLastHour <= 50`, and no recent engine starvation warning. Passing readiness still means dry-run review only, not automatic live execution.
+
 ## Live Dependency Audit Caution
 
 `npm audit fix` without `--force` leaves known transitive vulnerabilities under the live adapter dependency chain. The remaining advisories are not caused by the paper engine and are not fixed safely by npm without a breaking downgrade:
