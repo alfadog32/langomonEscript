@@ -121,6 +121,41 @@ function seedLowFillPressure(bot, signal) {
   }
 }
 
+function makeCalibratedSignal(overrides = {}) {
+  return makeSignal({
+    side: 'buy',
+    price: 0.47,
+    expectedEdge: 0.021,
+    confidence: 0.43,
+    metadata: {
+      consensus: { score: 0.55, authorized: true },
+    },
+    ...overrides,
+  });
+}
+
+function makeCalibratedBook(overrides = {}) {
+  return makeBook({
+    bestBid: 0.50,
+    bestAsk: 0.53,
+    midpoint: 0.515,
+    spread: 0.03,
+    ...overrides,
+  });
+}
+
+function captureLogs(fn) {
+  const original = console.log;
+  const lines = [];
+  console.log = (line) => lines.push(String(line));
+  try {
+    fn();
+  } finally {
+    console.log = original;
+  }
+  return lines;
+}
+
 function run() {
   {
     const bot = makeBot();
@@ -139,6 +174,88 @@ function run() {
     bot.trySignal(signal, asset, makeBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'ADMIT', 'high-quality candidate should pass when slots are available');
     assert.strictEqual(bot.portfolio.openOrders.size, 1);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const asset = makeAsset('calibrated-pass-token');
+    const signal = makeCalibratedSignal({ tokenId: asset.tokenId });
+    bot.trySignal(signal, asset, makeCalibratedBook());
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'CALIBRATED_ADMIT', 'near-threshold candidate should pass calibrated floors');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const asset = makeAsset('calibrated-low-edge');
+    bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId, expectedEdge: 0.019 }), asset, makeCalibratedBook());
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if edge is too low');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const asset = makeAsset('calibrated-low-confidence');
+    bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId, confidence: 0.41 }), asset, makeCalibratedBook());
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if confidence is too low');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieCalibratedMinFillProb: 0.80 });
+    const asset = makeAsset('calibrated-low-fill-prob');
+    bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId }), asset, makeCalibratedBook());
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if fill probability is too low');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const asset = makeAsset('calibrated-far-touch');
+    bot.trySignal(makeCalibratedSignal({ tokenId: asset.tokenId, price: 0.46 }), asset, makeCalibratedBook());
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'calibrated candidate should fail if distance from touch is too large');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieCalibratedMaxAdmissionsPerScan: 1 });
+    const first = makeCalibratedSignal({ tokenId: 'calibrated-cap-1' });
+    const second = makeCalibratedSignal({ tokenId: 'calibrated-cap-2' });
+    bot.trySignal(first, makeAsset(first.tokenId), makeCalibratedBook());
+    bot.trySignal(second, makeAsset(second.tokenId), makeCalibratedBook());
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'calibrated admissions should be capped per scan');
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const asset = makeAsset('low-quality-log-token');
+    const bad = makeSignal({
+      tokenId: asset.tokenId,
+      expectedEdge: 0.002,
+      confidence: 0.20,
+      metadata: { consensus: { score: 0.20, authorized: true } },
+    });
+    const logs = captureLogs(() => {
+      bot.trySignal(bad, asset, makeBook());
+      bot.trySignal(bad, asset, makeBook());
+    });
+    assert.strictEqual(logs.filter((line) => line.includes('decision=BLOCK_LOW_QUALITY')).length, 1, 'low-quality block logs should be cooldown-limited');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const asset = makeAsset('bad-target-token');
+    const bad = makeSignal({
+      tokenId: asset.tokenId,
+      expectedEdge: 0.002,
+      confidence: 0.20,
+      metadata: { consensus: { score: 0.20, authorized: true } },
+    });
+    bot.trySignal(bad, asset, makeBook());
+    assert.strictEqual(bot.portfolio.openOrders.size, 0, 'active order target must not force bad orders');
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY');
   }
 
   {

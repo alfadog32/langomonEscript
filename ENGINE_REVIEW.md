@@ -124,6 +124,12 @@ candidateUtility > weakestOpenOrderUtility + replacementFriction
 
 where `replacementFriction` is `SOPHIE_SLOT_EVICTION_MIN_IMPROVEMENT`. Eviction is paper-only, never targets protective exits, requires the open order to be older than `SOPHIE_SLOT_EVICTION_MIN_OPEN_ORDER_AGE_SEC`, and only admits candidates that do not increase open-order exposure relative to the evicted order.
 
+After the first Sophie gate pass, observed paper quality improved to `fillsLastHour=3` and `fillRateLastHour=1.2%`, but order flow was still too noisy (`ordersPlacedLastHour=257`, `duplicateSkipsLastHour=740`) and active paper orders could fall to zero. Runtime logs showed many candidates clustered around `sophieExecutionQuality=0.39-0.48`, including some with strong edge, confidence, fill probability, and near-touch pricing. That indicates the execution-quality scale is compressed for current market conditions, not that confidence should be lowered or order capacity should be raised.
+
+Sophie now has a calibrated paper-only admission band below the strict `SOPHIE_MIN_EXECUTION_QUALITY` threshold. A near-threshold candidate may be admitted only when all hard floors pass: minimum calibrated quality, edge, confidence, predicted fill probability, maximum distance from touch, active SpreadHunter order cap, and per-scan admission cap. These candidates still run through RiskEngine afterward. This is safer than lowering confidence or raising `MAX_OPEN_ORDERS` because it admits only bounded, near-touch, high-edge paper candidates while keeping cash, exposure, drawdown, stale-book, volatility, duplicate, dust, and ghost safety intact.
+
+Repeated low-quality blocks are cooldown-limited and summarized so the same token/side/strategy does not flood logs every scan. Repeated unchanged candidates can also enter a short cooldown after low-quality blocks, reducing duplicate pressure without deleting existing orders or pretending fills happened.
+
 `npm run live:readiness` now keeps `READY_FOR_MICRO_LIVE=false` unless all safety and efficiency checks pass: expected PM2 processes online, safe live flags, recent portfolio report, `fillsLastHour >= 3`, `fillRateLastHour >= 1.0%`, `ordersPlacedLastHour <= 150`, `duplicateSkipsLastHour <= 500`, `maxOpenOrderBlocksLastHour <= 50`, and no recent engine starvation warning. Passing readiness still means dry-run review only, not automatic live execution.
 
 ## Live Dependency Audit Caution

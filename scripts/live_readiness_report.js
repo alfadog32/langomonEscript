@@ -172,7 +172,7 @@ function main() {
   const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
-  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push('open orders > 0 not found in recent paper logs');
+  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push('no active paper orders; Sophie quality gate may be over-filtering');
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);
   if (Number.isFinite(totalExposureUsd) && totalExposureUsd > CONFIG.maxTotalExposureUsd) reasons.push(`exposure $${totalExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);

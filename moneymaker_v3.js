@@ -123,6 +123,20 @@ const CONFIG = {
   sophieDuplicatePressureWindowMs: envInt('SOPHIE_DUPLICATE_PRESSURE_WINDOW_SEC', 900) * 1000,
   sophieMaxDuplicateSkipsPerTokenWindow: envInt('SOPHIE_MAX_DUPLICATE_SKIPS_PER_TOKEN_WINDOW', 20),
   sophieMaxAttemptsPerTokenWindow: envInt('SOPHIE_MAX_ATTEMPTS_PER_TOKEN_WINDOW', 12),
+  sophieCalibratedAdmissionEnabled: envBool('SOPHIE_CALIBRATED_ADMISSION_ENABLED', true),
+  sophieCalibratedMinQuality: envNum('SOPHIE_CALIBRATED_MIN_QUALITY', 0.47),
+  sophieCalibratedMinEdge: envNum('SOPHIE_CALIBRATED_MIN_EDGE', 0.02),
+  sophieCalibratedMinConfidence: envNum('SOPHIE_CALIBRATED_MIN_CONFIDENCE', 0.42),
+  sophieCalibratedMinFillProb: envNum('SOPHIE_CALIBRATED_MIN_FILL_PROB', 0.38),
+  sophieCalibratedMaxDistanceFromTouch: envNum('SOPHIE_CALIBRATED_MAX_DISTANCE_FROM_TOUCH', 0.03),
+  sophieCalibratedMaxAdmissionsPerScan: envInt('SOPHIE_CALIBRATED_MAX_ADMISSIONS_PER_SCAN', 2),
+  sophieCalibratedMaxActiveOrders: envInt('SOPHIE_CALIBRATED_MAX_ACTIVE_ORDERS', 4),
+  sophieTargetActivePaperOrders: envInt('SOPHIE_TARGET_ACTIVE_PAPER_ORDERS', 2),
+  sophieTargetActiveMaxPaperOrders: envInt('SOPHIE_TARGET_ACTIVE_MAX_PAPER_ORDERS', 4),
+  sophieLowQualityBlockCooldownMs: envInt('SOPHIE_LOW_QUALITY_BLOCK_COOLDOWN_SEC', 120) * 1000,
+  sophieLowQualityBlockSummaryMs: envInt('SOPHIE_LOW_QUALITY_BLOCK_SUMMARY_SEC', 300) * 1000,
+  sophieRepeatCandidateCooldownMs: envInt('SOPHIE_REPEAT_CANDIDATE_COOLDOWN_SEC', 90) * 1000,
+  sophieMaxRepeatCandidateLogsPerWindow: envInt('SOPHIE_MAX_REPEAT_CANDIDATE_LOGS_PER_WINDOW', 3),
   maxDrawdownPct: envNum('MAX_DRAWDOWN_PCT', 12),
 
   // Practical revenue/risk optimization controls.
@@ -3324,6 +3338,11 @@ class BotEngine {
     this.lastFillStarvationWarningAt = 0;
     this.sophieNoFillCooldownUntil = new Map();
     this.lastSophieQualityDecision = null;
+    this.sophieCalibratedAdmissionsThisScan = 0;
+    this.sophieLowQualityLastLogged = new Map();
+    this.sophieLowQualitySummary = { windowStartedAt: Date.now(), blocked: 0, qualities: [], tokenIds: new Set() };
+    this.sophieRepeatCandidateCooldownUntil = new Map();
+    this.sophieRepeatCandidateLogs = new Map();
 
     this.strategies = [
       new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
@@ -3429,6 +3448,7 @@ class BotEngine {
 
   async tick() {
     this.cycle += 1;
+    this.sophieCalibratedAdmissionsThisScan = 0;
     this.whaleTracker?.tick?.();
 
     if (this.cycle === 1 || this.cycle % this.config.marketRefreshEveryCycles === 0) {
@@ -3522,6 +3542,23 @@ class BotEngine {
 
   sophieExecutionKey(signal) {
     return `${signal.tokenId}:${String(signal.side || '').toLowerCase()}:${signal.strategy}`;
+  }
+
+  spreadHunterOpenOrderCount() {
+    return [...this.portfolio.openOrders.values()]
+      .filter((order) => order.strategy === 'SpreadHunter')
+      .length;
+  }
+
+  repeatCandidateKey(signal) {
+    return [
+      signal.tokenId,
+      String(signal.side || '').toLowerCase(),
+      signal.strategy,
+      Number(signal.price).toFixed(4),
+      Number(signal.expectedEdge || 0).toFixed(4),
+      Number(signal.confidence || 0).toFixed(4),
+    ].join(':');
   }
 
   quoteDistanceFromTouch(signal, book) {
@@ -3619,7 +3656,17 @@ class BotEngine {
     }
 
     const key = this.sophieExecutionKey(signal);
+    const repeatKey = this.repeatCandidateKey(signal);
     const now = Date.now();
+    const repeatCooldownUntil = this.sophieRepeatCandidateCooldownUntil.get(repeatKey) || 0;
+    if (repeatCooldownUntil > now) {
+      quality.qualityDecision = 'REPEAT_COOLDOWN';
+      this.lastSophieQualityDecision = quality;
+      this.recordRepeatCandidateSuppression(signal, repeatKey);
+      this.portfolio.recordExecutionEvent('quality_block', signal);
+      return false;
+    }
+
     const cooldownUntil = this.sophieNoFillCooldownUntil.get(key) || 0;
     if (cooldownUntil > now) {
       quality.qualityDecision = 'THROTTLE';
@@ -3648,15 +3695,27 @@ class BotEngine {
     }
 
     if (quality.sophieExecutionQuality < this.config.sophieMinExecutionQuality) {
+      if (this.shouldCalibratedAdmit(signal, quality)) {
+        this.sophieCalibratedAdmissionsThisScan += 1;
+        quality.qualityDecision = 'CALIBRATED_ADMIT';
+        this.lastSophieQualityDecision = quality;
+        info(
+          `[SOPHIE CALIBRATED ADMIT] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+          `quality=${quality.sophieExecutionQuality} minQuality=${this.config.sophieCalibratedMinQuality} ` +
+          `edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
+          `fillProb=${quality.predictedFillProbability} distanceFromTouch=${quality.distanceFromTouch}`
+        );
+        if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) {
+          return this.applySophieSlotManagement(signal, book, quality);
+        }
+        return true;
+      }
+
+      this.recordLowQualityBlock(signal, quality);
+      this.sophieRepeatCandidateCooldownUntil.set(repeatKey, now + this.config.sophieRepeatCandidateCooldownMs);
       quality.qualityDecision = 'BLOCK_LOW_QUALITY';
       this.lastSophieQualityDecision = quality;
       this.portfolio.recordExecutionEvent('quality_block', signal);
-      warn(
-        `[SOPHIE ORDER QUALITY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
-        `signalScore=${quality.sophieSignalScore} executionQuality=${quality.sophieExecutionQuality} ` +
-        `fillProb=${quality.predictedFillProbability} edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
-        `quoteMode=${quality.quoteMode} distanceFromTouch=${quality.distanceFromTouch} decision=BLOCK_LOW_QUALITY`
-      );
       return false;
     }
 
@@ -3673,6 +3732,88 @@ class BotEngine {
       `quoteMode=${quality.quoteMode} distanceFromTouch=${quality.distanceFromTouch} decision=ADMIT`
     );
     return true;
+  }
+
+  shouldCalibratedAdmit(signal, quality) {
+    if (!this.config.sophieCalibratedAdmissionEnabled) return false;
+    if (signal.strategy !== 'SpreadHunter') return false;
+    if (this.sophieCalibratedAdmissionsThisScan >= this.config.sophieCalibratedMaxAdmissionsPerScan) return false;
+    if (this.spreadHunterOpenOrderCount() >= this.config.sophieCalibratedMaxActiveOrders) return false;
+    if (this.spreadHunterOpenOrderCount() >= this.config.sophieTargetActiveMaxPaperOrders) return false;
+
+    return (
+      quality.sophieExecutionQuality >= this.config.sophieCalibratedMinQuality &&
+      Number(signal.expectedEdge) >= this.config.sophieCalibratedMinEdge &&
+      Number(signal.confidence) >= this.config.sophieCalibratedMinConfidence &&
+      quality.predictedFillProbability >= this.config.sophieCalibratedMinFillProb &&
+      quality.distanceFromTouch <= this.config.sophieCalibratedMaxDistanceFromTouch
+    );
+  }
+
+  calibratedAdmissionFailures(signal, quality) {
+    const failures = [];
+    if (quality.sophieExecutionQuality < this.config.sophieCalibratedMinQuality) failures.push('quality');
+    if (Number(signal.expectedEdge) < this.config.sophieCalibratedMinEdge) failures.push('edge');
+    if (Number(signal.confidence) < this.config.sophieCalibratedMinConfidence) failures.push('confidence');
+    if (quality.predictedFillProbability < this.config.sophieCalibratedMinFillProb) failures.push('fill_probability');
+    if (quality.distanceFromTouch > this.config.sophieCalibratedMaxDistanceFromTouch) failures.push('distance_from_touch');
+    if (this.spreadHunterOpenOrderCount() >= this.config.sophieCalibratedMaxActiveOrders) failures.push('active_order_cap');
+    if (this.sophieCalibratedAdmissionsThisScan >= this.config.sophieCalibratedMaxAdmissionsPerScan) failures.push('scan_cap');
+    return failures;
+  }
+
+  recordLowQualityBlock(signal, quality) {
+    const now = Date.now();
+    const summaryMs = Math.max(1, this.config.sophieLowQualityBlockSummaryMs || 300_000);
+    if (now - this.sophieLowQualitySummary.windowStartedAt >= summaryMs) {
+      const qualities = this.sophieLowQualitySummary.qualities;
+      if (this.sophieLowQualitySummary.blocked > 0 && qualities.length > 0) {
+        const avg = qualities.reduce((sum, value) => sum + value, 0) / qualities.length;
+        const max = Math.max(...qualities);
+        warn(
+          `[SOPHIE LOW QUALITY SUMMARY] blocked=${this.sophieLowQualitySummary.blocked} ` +
+          `uniqueTokens=${this.sophieLowQualitySummary.tokenIds.size} avgQuality=${avg.toFixed(3)} ` +
+          `maxQuality=${max.toFixed(3)} windowSec=${Math.round(summaryMs / 1000)}`
+        );
+      }
+      this.sophieLowQualitySummary = { windowStartedAt: now, blocked: 0, qualities: [], tokenIds: new Set() };
+    }
+
+    this.sophieLowQualitySummary.blocked += 1;
+    this.sophieLowQualitySummary.qualities.push(quality.sophieExecutionQuality);
+    this.sophieLowQualitySummary.tokenIds.add(String(signal.tokenId));
+
+    const key = this.sophieExecutionKey(signal);
+    const last = this.sophieLowQualityLastLogged.get(key) || 0;
+    if (now - last < this.config.sophieLowQualityBlockCooldownMs) return;
+    this.sophieLowQualityLastLogged.set(key, now);
+
+    const failed = this.calibratedAdmissionFailures(signal, quality);
+    warn(
+      `[SOPHIE ORDER QUALITY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `signalScore=${quality.sophieSignalScore} executionQuality=${quality.sophieExecutionQuality} ` +
+      `fillProb=${quality.predictedFillProbability} edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
+      `quoteMode=${quality.quoteMode} distanceFromTouch=${quality.distanceFromTouch} decision=BLOCK_LOW_QUALITY ` +
+      `calibratedFailed=${failed.join(',') || 'none'}`
+    );
+  }
+
+  recordRepeatCandidateSuppression(signal, repeatKey) {
+    const now = Date.now();
+    const state = this.sophieRepeatCandidateLogs.get(repeatKey) || { windowStartedAt: now, count: 0 };
+    if (now - state.windowStartedAt >= this.config.sophieRepeatCandidateCooldownMs) {
+      state.windowStartedAt = now;
+      state.count = 0;
+    }
+    state.count += 1;
+    this.sophieRepeatCandidateLogs.set(repeatKey, state);
+
+    if (state.count <= this.config.sophieMaxRepeatCandidateLogsPerWindow) {
+      info(
+        `[SOPHIE REPEAT CANDIDATE COOLDOWN] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `strategy=${signal.strategy} cooldownSec=${Math.round(this.config.sophieRepeatCandidateCooldownMs / 1000)}`
+      );
+    }
   }
 
   applySophieSlotManagement(signal, book, quality) {
