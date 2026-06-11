@@ -194,13 +194,26 @@ function formatIntentMessage(intent) {
 
 async function telegramApi(config, method, payload) {
   const url = `https://api.telegram.org/bot${config.telegramBotToken}/${method}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload || {})
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    });
+  } catch (err) {
+    err.telegramMethod = method;
+    err.transientTelegramPollingError = method === 'getUpdates';
+    throw err;
+  }
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) throw new Error(`${method} failed: HTTP ${res.status} ${JSON.stringify(data)}`);
+  if (!res.ok || data.ok === false) {
+    const err = new Error(`${method} failed: HTTP ${res.status} ${JSON.stringify(data)}`);
+    err.telegramMethod = method;
+    err.telegramStatus = res.status;
+    err.transientTelegramPollingError = method === 'getUpdates' && (res.status === 502 || res.status === 503 || res.status === 504 || res.status === 429);
+    throw err;
+  }
   return data;
 }
 
@@ -326,6 +339,59 @@ async function pollTelegramCallbacks(config, state) {
   saveState(config, state);
 }
 
+function makeTelegramPollingBackoff(config) {
+  return {
+    failures: 0,
+    delayedUntil: 0,
+    lastLoggedRecovery: 0,
+    baseMs: Math.max(1_000, config.telegramBackoffBaseMs ?? 3_000),
+    maxMs: Math.max(1_000, config.telegramBackoffMaxMs ?? 60_000),
+    jitterMs: Math.max(0, config.telegramBackoffJitterMs ?? 2_000),
+  };
+}
+
+function pollingBackoffDelay(state) {
+  const exponent = Math.min(8, Math.max(0, state.failures - 1));
+  const jitter = Math.floor(Math.random() * state.jitterMs);
+  return Math.min(state.maxMs, state.baseMs * (2 ** exponent)) + jitter;
+}
+
+function isTransientTelegramPollingError(err) {
+  if (err?.transientTelegramPollingError) return true;
+  const message = String(err?.message || '').toLowerCase();
+  return message.includes('fetch failed') || message.includes('getupdates failed: http 502');
+}
+
+function recordTelegramPollingFailure(config, backoff, err) {
+  backoff.failures += 1;
+  const delayMs = pollingBackoffDelay(backoff);
+  backoff.delayedUntil = Date.now() + delayMs;
+  const status = err?.telegramStatus || 'network';
+  const message = String(err?.message || err || 'unknown').replace(/\s+/g, ' ').slice(0, 240);
+  console.warn(`[telegram-approval] POLL_BACKOFF transient=true failures=${backoff.failures} status=${status} delayMs=${delayMs} error=${message}`);
+  appendNdjson(config.eventsPath, {
+    timestamp: nowIso(),
+    type: 'TELEGRAM_POLL_BACKOFF',
+    failures: backoff.failures,
+    status,
+    delayMs,
+    error: message,
+  });
+  return delayMs;
+}
+
+function recordTelegramPollingRecovery(config, backoff) {
+  if (backoff.failures <= 0) return;
+  const failures = backoff.failures;
+  backoff.failures = 0;
+  backoff.delayedUntil = 0;
+  const now = Date.now();
+  if (now - backoff.lastLoggedRecovery < 10_000) return;
+  backoff.lastLoggedRecovery = now;
+  console.log(`[telegram-approval] POLL_RECOVERED previousFailures=${failures}`);
+  appendNdjson(config.eventsPath, { timestamp: nowIso(), type: 'TELEGRAM_POLL_RECOVERED', previousFailures: failures });
+}
+
 function scanIntentFiles(config, state) {
   const intents = [];
   for (const filePath of config.watchPaths) {
@@ -361,6 +427,9 @@ function readConfig(baseDir) {
     eventsPath: path.resolve(baseDir, process.env.TELEGRAM_APPROVAL_EVENTS_PATH || './telegram_approval_events.ndjson'),
     statePath: path.resolve(baseDir, process.env.TELEGRAM_APPROVAL_STATE_PATH || './telegram_approval_state.json'),
     pollMs: num(process.env.TELEGRAM_APPROVAL_FILE_POLL_MS, 3000),
+    telegramBackoffBaseMs: num(process.env.TELEGRAM_APPROVAL_BACKOFF_BASE_MS, 3000),
+    telegramBackoffMaxMs: num(process.env.TELEGRAM_APPROVAL_BACKOFF_MAX_MS, 60000),
+    telegramBackoffJitterMs: num(process.env.TELEGRAM_APPROVAL_BACKOFF_JITTER_MS, 2000),
     requireTokenId: boolish(process.env.TELEGRAM_APPROVAL_REQUIRE_TOKEN_ID, false),
     alertAll: boolish(process.env.TELEGRAM_APPROVAL_ALERT_ALL, false),
     maxBurst: Math.max(1, num(process.env.TELEGRAM_APPROVAL_MAX_BURST, 5)),
@@ -476,6 +545,7 @@ async function run(config) {
   ensureFile(config.decisionsPath);
   ensureFile(config.eventsPath);
   const state = loadState(config);
+  const pollingBackoff = makeTelegramPollingBackoff(config);
   appendNdjson(config.eventsPath, { timestamp: nowIso(), type: 'TELEGRAM_APPROVAL_RELAY_STARTED', version: VERSION, watchPaths: config.watchPaths, safety: { paper_only: true, submitted: false, reads_live_secrets: false } });
   console.log(`[telegram-approval] online version=${VERSION}`);
   console.log(`[telegram-approval] watching ${config.watchPaths.join(', ')}`);
@@ -486,7 +556,18 @@ async function run(config) {
         console.log(`[telegram-approval] sending ${intent.intent_id} ${intent.source} ${intent.side} ${shortId(intent.token_id)}`);
         await sendApprovalMessage(config, state, intent);
       }
-      await pollTelegramCallbacks(config, state);
+      if (Date.now() >= pollingBackoff.delayedUntil) {
+        try {
+          await pollTelegramCallbacks(config, state);
+          recordTelegramPollingRecovery(config, pollingBackoff);
+        } catch (e) {
+          if (isTransientTelegramPollingError(e)) {
+            recordTelegramPollingFailure(config, pollingBackoff, e);
+          } else {
+            throw e;
+          }
+        }
+      }
     } catch (e) {
       console.error(`[telegram-approval] ERROR ${e.stack || e.message}`);
       appendNdjson(config.eventsPath, { timestamp: nowIso(), type: 'TELEGRAM_APPROVAL_RELAY_ERROR', error: e.message });
@@ -515,4 +596,12 @@ if (require.main === module) {
   main().catch(e => { console.error(`[telegram-approval] FATAL ${e.stack || e.message}`); process.exit(1); });
 }
 
-module.exports = { readConfig, toIntent, isActionableIntent, formatIntentMessage };
+module.exports = {
+  readConfig,
+  toIntent,
+  isActionableIntent,
+  formatIntentMessage,
+  makeTelegramPollingBackoff,
+  pollingBackoffDelay,
+  isTransientTelegramPollingError,
+};

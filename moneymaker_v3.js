@@ -161,6 +161,9 @@ const CONFIG = {
   sophieLowQualityBlockSummaryMs: envInt('SOPHIE_LOW_QUALITY_BLOCK_SUMMARY_SEC', 300) * 1000,
   sophieRepeatCandidateCooldownMs: envInt('SOPHIE_REPEAT_CANDIDATE_COOLDOWN_SEC', 90) * 1000,
   sophieMaxRepeatCandidateLogsPerWindow: envInt('SOPHIE_MAX_REPEAT_CANDIDATE_LOGS_PER_WINDOW', 3),
+  paperMakerOptimizerEnabled: envBool('PAPER_MAKER_OPTIMIZER_ENABLED', true),
+  paperMakerOptimizerMinEdgeAfterMove: envNum('PAPER_MAKER_OPTIMIZER_MIN_EDGE_AFTER_MOVE', 0.012),
+  paperMakerOptimizerMaxTicks: envInt('PAPER_MAKER_OPTIMIZER_MAX_TICKS', 1),
   paperMakerNudgeEnabled: envBool('PAPER_MAKER_NUDGE_ENABLED', false),
   paperMakerNudgeMaxTicks: envInt('PAPER_MAKER_NUDGE_MAX_TICKS', 1),
   paperMakerNudgeMinEdgeAfterNudge: envNum('PAPER_MAKER_NUDGE_MIN_EDGE_AFTER_NUDGE', 0.012),
@@ -2635,6 +2638,7 @@ class PaperPortfolio {
 
     return {
       ...this.executionTotals,
+      activePaperOrders: openOrders.length,
       candidateEvaluationsLastHour,
       paperOrdersPlacedLastHour,
       paperOrdersFilledLastHour,
@@ -2648,6 +2652,7 @@ class PaperPortfolio {
       maxOpenOrderBlocksLastHour,
       oldestOpenOrderAgeSec,
       avgOpenOrderAgeSec,
+      avgActiveOrderAgeSec: avgOpenOrderAgeSec,
       noFillStreakMax,
       avgTimeToFillSec,
       openOrderExposureUsd: this.openOrderExposureUsd(),
@@ -3497,7 +3502,11 @@ class BotEngine {
       `spreadHunterPaperMin=${this.config.spreadHunterMinConfidencePaper}`
     );
 
-    await this.refreshResearch();
+    if (this.config.nonBlockingResearchRefresh) {
+      this.requestResearchRefresh();
+    } else {
+      await this.refreshResearch();
+    }
 
     if (this.config.enableWs) {
       this.startWebSocket();
@@ -3589,7 +3598,7 @@ class BotEngine {
     this.whaleTracker?.tick?.();
 
     if (this.cycle === 1 || this.cycle % this.config.marketRefreshEveryCycles === 0) {
-      if (this.config.nonBlockingResearchRefresh && this.assets.length > 0) {
+      if (this.config.nonBlockingResearchRefresh) {
         this.requestResearchRefresh();
       } else {
         await this.refreshResearch();
@@ -3958,6 +3967,91 @@ class BotEngine {
     return signal;
   }
 
+  optimizeStarvedPaperMakerQuote(signal, book, quality, reason = 'low_quality') {
+    if (!this.config.paperMakerOptimizerEnabled) return null;
+    if (!signal || signal.strategy !== 'SpreadHunter') return null;
+    if (isProtectiveExitStrategy(signal.strategy) || !isBookComplete(book)) return null;
+    if (this.portfolio.openOrders.size > 0 || this.spreadHunterOpenOrderCount() > 0) return null;
+    if (!['buy', 'sell'].includes(String(signal.side || '').toLowerCase())) return null;
+    if (!Number.isFinite(signal.price) || !Number.isFinite(signal.expectedEdge)) return null;
+
+    const tick = Number(book.tickSize || signal.metadata?.tickSize || 0.01);
+    if (!Number.isFinite(tick) || tick <= 0) return null;
+
+    const maxTicks = Math.max(1, this.config.paperMakerOptimizerMaxTicks || 1);
+    const oldPrice = Number(signal.price);
+    let optimizedPrice = oldPrice;
+
+    if (signal.side === 'buy') {
+      optimizedPrice = Math.min(oldPrice + tick * maxTicks, Number(book.bestBid));
+    } else {
+      optimizedPrice = Math.max(oldPrice - tick * maxTicks, Number(book.bestAsk));
+    }
+
+    optimizedPrice = roundToTick(clamp(optimizedPrice, 0.01, 0.99), tick);
+    if (!Number.isFinite(optimizedPrice) || Math.abs(optimizedPrice - oldPrice) < 1e-9) {
+      this.logStarvedOptimizerBlock(signal, quality, 'no_safe_tick_available', oldPrice, optimizedPrice);
+      return null;
+    }
+
+    if (signal.side === 'buy' && optimizedPrice >= Number(book.bestAsk)) {
+      this.logStarvedOptimizerBlock(signal, quality, 'would_cross_spread', oldPrice, optimizedPrice);
+      return null;
+    }
+    if (signal.side === 'sell' && optimizedPrice <= Number(book.bestBid)) {
+      this.logStarvedOptimizerBlock(signal, quality, 'would_cross_spread', oldPrice, optimizedPrice);
+      return null;
+    }
+
+    const priceDelta = Math.abs(optimizedPrice - oldPrice);
+    const edgeAfterMove = Number(signal.expectedEdge) - priceDelta;
+    if (edgeAfterMove < this.config.paperMakerOptimizerMinEdgeAfterMove) {
+      this.logStarvedOptimizerBlock(signal, quality, 'edge_after_move_too_low', oldPrice, optimizedPrice, edgeAfterMove);
+      return null;
+    }
+
+    const optimized = new Signal({
+      ...signal,
+      price: optimizedPrice,
+      expectedEdge: edgeAfterMove,
+      metadata: {
+        ...(signal.metadata || {}),
+        paperMakerOptimizer: {
+          applied: true,
+          reason,
+          oldPrice,
+          optimizedPrice,
+          edgeBeforeMove: Number(signal.expectedEdge),
+          edgeAfterMove,
+          ticksMoved: Math.round(priceDelta / tick),
+          neverCrossSpread: true,
+          paperOnly: true,
+        },
+      },
+    });
+    const optimizedQuality = this.evaluateSophieExecutionQuality(optimized, book);
+    optimized.metadata.sophieExecution = optimizedQuality;
+    optimizedQuality.qualityDecision = 'OPTIMIZED_MAKER_ADMIT';
+
+    info(
+      `[SOPHIE MAKER OPTIMIZER ADMIT] ${optimized.side.toUpperCase()} ${shortId(optimized.tokenId)} ` +
+      `oldPrice=${fmtPrice(oldPrice)} optimizedPrice=${fmtPrice(optimizedPrice)} ticksMoved=${Math.round(priceDelta / tick)} ` +
+      `edgeBefore=${cleanLogValue(signal.expectedEdge)} edgeAfter=${cleanLogValue(edgeAfterMove)} ` +
+      `oldDistance=${quality.distanceFromTouch} newDistance=${optimizedQuality.distanceFromTouch} reason=${reason} paperOnly=true riskEngine=required`
+    );
+    return { signal: optimized, quality: optimizedQuality };
+  }
+
+  logStarvedOptimizerBlock(signal, quality, reason, oldPrice = null, optimizedPrice = null, edgeAfterMove = null) {
+    warn(
+      `[SOPHIE MAKER OPTIMIZER BLOCK] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `reason=${reason} openOrders=${this.portfolio.openOrders.size} oldPrice=${Number.isFinite(oldPrice) ? fmtPrice(oldPrice) : 'NA'} ` +
+      `optimizedPrice=${Number.isFinite(optimizedPrice) ? fmtPrice(optimizedPrice) : 'NA'} ` +
+      `edgeBefore=${cleanLogValue(signal.expectedEdge)} edgeAfter=${Number.isFinite(edgeAfterMove) ? cleanLogValue(edgeAfterMove) : 'NA'} ` +
+      `fillProb=${quality.predictedFillProbability} distanceFromTouch=${quality.distanceFromTouch} paperOnly=true`
+    );
+  }
+
   applySophieExecutionGate(signal, asset, book, quality) {
     if (!this.config.sophieExecutionQualityEnabled || isProtectiveExitStrategy(signal.strategy)) {
       return true;
@@ -3968,6 +4062,16 @@ class BotEngine {
     const now = Date.now();
     const repeatCooldownUntil = this.sophieRepeatCandidateCooldownUntil.get(repeatKey) || 0;
     if (repeatCooldownUntil > now) {
+      const optimized = this.optimizeStarvedPaperMakerQuote(signal, book, quality, 'repeat_cooldown_starvation');
+      if (optimized) {
+        signal.price = optimized.signal.price;
+        signal.expectedEdge = optimized.signal.expectedEdge;
+        signal.metadata = optimized.signal.metadata;
+        Object.assign(quality, optimized.quality);
+        this.lastSophieQualityDecision = quality;
+        this.recordSophieAdmission(signal, quality);
+        return true;
+      }
       quality.qualityDecision = 'REPEAT_COOLDOWN';
       this.lastSophieQualityDecision = quality;
       this.recordRepeatCandidateSuppression(signal, repeatKey);
@@ -4039,6 +4143,16 @@ class BotEngine {
 
       if (this.config.sophieBootstrapAdmissionEnabled && signal.strategy === 'SpreadHunter') {
         this.recordBootstrapBlock(signal, quality);
+      }
+      const optimized = this.optimizeStarvedPaperMakerQuote(signal, book, quality, 'zero_open_orders_low_quality');
+      if (optimized) {
+        signal.price = optimized.signal.price;
+        signal.expectedEdge = optimized.signal.expectedEdge;
+        signal.metadata = optimized.signal.metadata;
+        Object.assign(quality, optimized.quality);
+        this.lastSophieQualityDecision = quality;
+        this.recordSophieAdmission(signal, quality);
+        return true;
       }
       this.recordLowQualityBlock(signal, quality);
       this.sophieRepeatCandidateCooldownUntil.set(repeatKey, now + this.config.sophieRepeatCandidateCooldownMs);
@@ -4494,11 +4608,13 @@ class BotEngine {
       `paperOrdersExpiredNoFillLastHour=${health.paperOrdersExpiredNoFillLastHour} ` +
       `paperOrdersAdmittedLastHour=${health.paperOrdersAdmittedLastHour} ` +
       `paperOrdersRejectedBySophieLastHour=${health.paperOrdersRejectedBySophieLastHour} ` +
+      `activePaperOrders=${health.activePaperOrders} ` +
       `ordersPlacedLastHour=${health.ordersPlacedLastHour} ` +
       `fillsLastHour=${health.fillsLastHour} duplicateSkipsLastHour=${health.duplicateSkipsLastHour} ` +
       `replacementsLastHour=${health.replacementsLastHour} ` +
       `oldestOpenOrderAgeSec=${Math.round(health.oldestOpenOrderAgeSec)} ` +
       `avgOpenOrderAgeSec=${Math.round(health.avgOpenOrderAgeSec)} ` +
+      `avgActiveOrderAgeSec=${Math.round(health.avgActiveOrderAgeSec)} ` +
       `noFillStreakMax=${health.noFillStreakMax} ` +
       `avgTimeToFillSec=${health.avgTimeToFillSec == null ? 'NA' : Math.round(health.avgTimeToFillSec)} ` +
       `maxOpenOrderBlocksLastHour=${health.maxOpenOrderBlocksLastHour} ` +

@@ -67,6 +67,9 @@ function makeConfig(overrides = {}) {
     paperMakerNudgeMinEdgeAfterNudge: 0.012,
     paperMakerNudgeMaxDistanceFromTouch: 0.05,
     paperMakerNudgeOnlyAfterNoFillMs: 900_000,
+    paperMakerOptimizerEnabled: true,
+    paperMakerOptimizerMinEdgeAfterMove: 0.012,
+    paperMakerOptimizerMaxTicks: 1,
     ...overrides,
   };
 }
@@ -351,7 +354,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, paperMakerNudgeEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, paperMakerNudgeEnabled: false, paperMakerOptimizerEnabled: false });
     const asset = makeAsset('nudge-disabled-token');
     const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.43, expectedEdge: 0.03 });
     seedNoFillOutcomes(bot, signal, 1);
@@ -370,6 +373,63 @@ function run() {
     bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
     assert.strictEqual(signal.price, 0.44, 'enabled paper maker nudge should move one tick closer to touch');
     assert(signal.expectedEdge >= bot.config.paperMakerNudgeMinEdgeAfterNudge, 'nudge must preserve minimum edge');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
+    const asset = makeAsset('maker-optimizer-admit-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.03, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER ADMIT]')), 'starved maker optimizer should log admission');
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'OPTIMIZED_MAKER_ADMIT');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'optimized quote should be placed through RiskEngine');
+    const order = [...bot.portfolio.openOrders.values()][0];
+    assert.strictEqual(order.price, 0.43, 'optimizer should move exactly one tick closer to touch');
+    assert(order.price < 0.54, 'optimizer must not cross the spread');
+    assert(order.signal.metadata.paperMakerOptimizer.paperOnly, 'optimizer metadata should be paper-only');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
+    const asset = makeAsset('maker-optimizer-low-edge-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.015, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]') && line.includes('edge_after_move_too_low')), 'unsafe edge after one-tick move should block clearly');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
+    const asset = makeAsset('maker-optimizer-risk-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, side: 'sell', price: 0.58, expectedEdge: 0.04, confidence: 0.45 });
+    captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+    });
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'OPTIMIZED_MAKER_ADMIT');
+    assert.strictEqual(bot.risk.lastBlockReason, 'no_available_position', 'optimized quote must still pass through RiskEngine');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const signal = makeSignal({ tokenId: 'fillability-metrics-token' });
+    const order = addOpenOrder(bot, signal, 120_000);
+    bot.portfolio.recordExecutionEvent('order_admitted', signal, Date.now() - 50_000);
+    bot.portfolio.recordExecutionEvent('order_placed', signal, Date.now() - 49_000);
+    bot.portfolio.recordExecutionEvent('fill', { ...signal, timeToFillSec: 14, filledUsd: 3 }, Date.now() - 20_000);
+    bot.portfolio.recordExecutionEvent('order_expired_no_fill', signal, Date.now() - 10_000);
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.activePaperOrders, 1, 'execution health should expose active paper orders');
+    assert(health.oldestOpenOrderAgeSec >= 100, 'execution health should expose active order age');
+    assert(health.avgActiveOrderAgeSec >= 100, 'execution health should expose average active age');
+    assert.strictEqual(health.paperOrdersExpiredNoFillLastHour, 1);
+    assert.strictEqual(health.paperOrdersFilledLastHour, 1);
+    assert.strictEqual(health.noFillStreakMax, 1);
+    bot.portfolio.cancelOrder(order.id);
   }
 
   {

@@ -124,6 +124,8 @@ function parseLastExecutionHealth(lines) {
       maxOpenOrderBlocksLastHour: get('maxOpenOrderBlocksLastHour'),
       fillRateLastHour: get('fillRateLastHour'),
       fillRateByPlacedOrdersLastHour: get('fillRateByPlacedOrdersLastHour'),
+      activePaperOrders: get('activePaperOrders'),
+      avgActiveOrderAgeSec: get('avgActiveOrderAgeSec'),
     };
   }
   return {};
@@ -201,12 +203,20 @@ function main() {
   const fillRateByPlacedOrdersLastHour = Number.isFinite(executionHealth.fillRateByPlacedOrdersLastHour)
     ? executionHealth.fillRateByPlacedOrdersLastHour
     : fillRateLastHour;
+  const activePaperOrders = Number.isFinite(executionHealth.activePaperOrders)
+    ? executionHealth.activePaperOrders
+    : (Number.isFinite(openOrders) ? openOrders : 0);
+  const oldestOpenOrderAgeSec = Number.isFinite(executionHealth.oldestOpenOrderAgeSec) ? executionHealth.oldestOpenOrderAgeSec : 0;
+  const avgOpenOrderAgeSec = Number.isFinite(executionHealth.avgOpenOrderAgeSec) ? executionHealth.avgOpenOrderAgeSec : 0;
+  const avgActiveOrderAgeSec = Number.isFinite(executionHealth.avgActiveOrderAgeSec) ? executionHealth.avgActiveOrderAgeSec : avgOpenOrderAgeSec;
   const fillProbabilityOverestimated = countRecent(engineLines, /\[SOPHIE FILL PROB CALIBRATED\].*far_from_touch|\[SOPHIE NO-FILL LEARN\]/) > 0;
   const recentStarvationWarning = countRecent(engineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
+  const makerOptimizerAdmitsLastHour = countRecent(engineLines, /\[SOPHIE MAKER OPTIMIZER ADMIT\]/);
+  const makerOptimizerBlocksLastHour = countRecent(engineLines, /\[SOPHIE MAKER OPTIMIZER BLOCK\]/);
   const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
-  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push('no active paper orders; Sophie bootstrap/calibrated gates admitted no candidates');
+  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push(`no active paper orders; candidateEvaluationsLastHour=${candidateEvaluationsLastHour} paperOrdersAdmittedLastHour=${paperOrdersAdmittedLastHour} paperOrdersPlacedLastHour=${paperOrdersPlacedLastHour} makerOptimizerAdmitsLastHour=${makerOptimizerAdmitsLastHour} makerOptimizerBlocksLastHour=${makerOptimizerBlocksLastHour}`);
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);
   if (Number.isFinite(totalExposureUsd) && totalExposureUsd > CONFIG.maxTotalExposureUsd) reasons.push(`exposure $${totalExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);
@@ -253,6 +263,7 @@ function main() {
     paperEngineHealth: {
       recentPortfolioReportFound,
       openOrders: Number.isFinite(openOrders) ? openOrders : null,
+      activePaperOrders,
       candidateEvaluationsLastHour,
       paperOrdersPlacedLastHour,
       paperOrdersFilledLastHour,
@@ -266,9 +277,14 @@ function main() {
       fillRateLastHour,
       fillRateByPlacedOrdersLastHour,
       noFillStreakMax,
+      oldestOpenOrderAgeSec,
+      avgOpenOrderAgeSec,
+      avgActiveOrderAgeSec,
       avgTimeToFillSec,
       fillProbabilityOverestimated,
       fillsDetected: fillsLastHour > 0,
+      makerOptimizerAdmitsLastHour,
+      makerOptimizerBlocksLastHour,
       recentStarvationWarning,
       crashLoopOk,
       drawdownPct: Number.isFinite(drawdownPct) ? drawdownPct : null,
