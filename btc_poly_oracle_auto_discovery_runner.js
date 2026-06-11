@@ -45,6 +45,7 @@ let activeKey = null;
 let activeTarget = null;
 let child = null;
 let childRestartTimer = null;
+let pendingTargetStart = null;
 let stopping = false;
 let cycleInFlight = false;
 let lastDiscoveryAt = 0;
@@ -391,24 +392,29 @@ function stopChild(reason = 'stopping') {
   clearTimeout(childRestartTimer);
   childRestartTimer = null;
 
-  if (!child || child.killed) return;
+  if (!child || child.exitCode !== null) return false;
 
   const oldChild = child;
-  child = null;
   expectedStops.set(oldChild.pid, { reason, at: Date.now() });
 
   info(`Stopping bridge child pid=${oldChild.pid} reason=${reason}`);
-  oldChild.kill('SIGTERM');
+  try {
+    oldChild.kill('SIGTERM');
+  } catch (err) {
+    warn(`Failed to signal bridge child pid=${oldChild.pid}: ${err.message}`);
+  }
 
   setTimeout(() => {
-    if (!oldChild.killed) {
+    if (oldChild.exitCode === null && oldChild.signalCode === null) {
       try {
         oldChild.kill('SIGKILL');
+        warn(`Force killed bridge child pid=${oldChild.pid} after SIGTERM grace`);
       } catch (_) {
         // ignored
       }
     }
   }, 5_000).unref?.();
+  return true;
 }
 
 function startChildForTarget(targetDoc) {
@@ -428,7 +434,14 @@ function startChildForTarget(targetDoc) {
     return;
   }
 
-  stopChild('new target or restart');
+  if (child && child.exitCode === null) {
+    pendingTargetStart = targetDoc;
+    stopChild('new target or restart');
+    info(`Deferring bridge start until previous child exits nextSlug=${targetDoc.target.slug}`);
+    return;
+  }
+
+  pendingTargetStart = null;
 
   const env = {
     ...process.env,
@@ -458,13 +471,19 @@ function startChildForTarget(targetDoc) {
     const expected = expectedStops.get(pid) || null;
     expectedStops.delete(pid);
     lastBridgeExitAt = Date.now();
-    child = null;
+    if (child?.pid === pid) child = null;
     info(`[BTC-AUTO BRIDGE EXIT] pid=${pid} code=${code ?? 'null'} signal=${signal ?? 'null'} uptimeSec=${uptimeSec} expected=${Boolean(expected)} reason=${expected?.reason || 'unexpected_exit'}`);
     if (code === 0 && uptimeSec < 10) {
       warn(`[BTC-AUTO BRIDGE SHORT EXIT] pid=${pid} code=0 uptimeSec=${uptimeSec} slug=${slug} note=bridge exited too quickly after start`);
     }
 
     if (stopping || !activeTarget || !CONFIG.autoStartChild) return;
+    if (pendingTargetStart) {
+      const nextTarget = pendingTargetStart;
+      pendingTargetStart = null;
+      startChildForTarget(nextTarget);
+      return;
+    }
     if (targetIsStale(activeTarget)) {
       info('Not restarting bridge child because target is stale/expired');
       return;
@@ -586,6 +605,7 @@ function shutdown(signal) {
   stopping = true;
   info(`Received ${signal}; shutting down runner`);
   clearTimeout(childRestartTimer);
+  pendingTargetStart = null;
   stopChild(`runner ${signal}`);
   setTimeout(() => process.exit(0), 500).unref?.();
 }

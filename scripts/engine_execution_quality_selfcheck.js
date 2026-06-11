@@ -410,6 +410,18 @@ function run() {
   }
 
   {
+    const bot = makeBot({ maxOpenOrders: 10, minSignalEdge: 0.008, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-optimizer-risk-edge-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.017, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]') && line.includes('risk_min_edge')), 'edge below RiskEngine floor should block before risk evaluation');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
     const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
     const asset = makeAsset('maker-optimizer-cross-token');
     const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.53, expectedEdge: 0.03, confidence: 0.45 });

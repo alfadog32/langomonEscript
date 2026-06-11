@@ -4052,9 +4052,11 @@ class BotEngine {
       minSignalScore: this.config.paperMakerRecoveryMinSignalScore,
       minConfidence: this.config.paperMakerRecoveryMinConfidence,
       maxActive: this.config.paperMakerRecoveryMaxActive,
+      riskMinEdge: this.config.minSignalEdge,
     };
     const failed = [];
     if (edgeAfterMove < recoveryFloor.minEdgeAfterMove) failed.push('edge_after_move');
+    if (Number.isFinite(recoveryFloor.riskMinEdge) && edgeAfterMove < recoveryFloor.riskMinEdge) failed.push('risk_min_edge');
     if (quality.sophieSignalScore < recoveryFloor.minSignalScore) failed.push('signal_score');
     if (Number(signal.confidence) < recoveryFloor.minConfidence) failed.push('confidence');
     if (this.portfolio.openOrders.size >= recoveryFloor.maxActive) failed.push('active_order_cap');
@@ -4087,10 +4089,11 @@ class BotEngine {
   formatMakerRecoveryFloor(floor = {}) {
     return [
       `edge>=${cleanLogValue(floor.minEdgeAfterMove)}`,
+      Number.isFinite(floor.riskMinEdge) ? `riskEdge>=${cleanLogValue(floor.riskMinEdge)}` : null,
       `signalScore>=${cleanLogValue(floor.minSignalScore)}`,
       `confidence>=${cleanLogValue(floor.minConfidence)}`,
       `maxActive=${floor.maxActive}`,
-    ].join('|');
+    ].filter(Boolean).join('|');
   }
 
   makerRecoveryUtility(signal, quality, edgeAfterMove) {
@@ -4166,6 +4169,7 @@ class BotEngine {
   logStarvedOptimizerBlock(signal, quality, reason, oldPrice = null, optimizedPrice = null, edgeAfterMove = null, optimizedQuality = null, extra = {}) {
     const recoveryFloor = extra.recoveryFloor || this.formatMakerRecoveryFloor({
       minEdgeAfterMove: this.config.paperMakerRecoveryMinEdgeAfterMove,
+      riskMinEdge: this.config.minSignalEdge,
       minSignalScore: this.config.paperMakerRecoveryMinSignalScore,
       minConfidence: this.config.paperMakerRecoveryMinConfidence,
       maxActive: this.config.paperMakerRecoveryMaxActive,
