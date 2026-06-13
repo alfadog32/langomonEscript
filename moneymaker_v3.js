@@ -931,6 +931,27 @@ function isBookComplete(book) {
   );
 }
 
+function incompleteBookCause(book) {
+  if (!book) return 'missing_book';
+  const failures = [];
+  if (!Number.isFinite(book.bestBid)) failures.push('best_bid_not_finite');
+  if (!Number.isFinite(book.bestAsk)) failures.push('best_ask_not_finite');
+  if (!Number.isFinite(book.midpoint)) failures.push('midpoint_not_finite');
+  if (!Number.isFinite(book.spread)) failures.push('spread_not_finite');
+  if (Number.isFinite(book.bestBid) && book.bestBid <= 0) failures.push('best_bid_non_positive');
+  if (Number.isFinite(book.bestAsk) && book.bestAsk <= 0) failures.push('best_ask_non_positive');
+  if (
+    Number.isFinite(book.bestBid) &&
+    Number.isFinite(book.bestAsk) &&
+    book.bestBid >= book.bestAsk
+  ) {
+    failures.push('crossed_or_locked_book');
+  }
+  if (!Array.isArray(book.bids) || book.bids.length === 0) failures.push('missing_bids');
+  if (!Array.isArray(book.asks) || book.asks.length === 0) failures.push('missing_asks');
+  return failures.join(',') || 'unknown_incomplete_book';
+}
+
 function topDepthUsd(levels, n) {
   return (levels || []).slice(0, n).reduce((sum, level) => sum + level.price * level.size, 0);
 }
@@ -1046,10 +1067,59 @@ class Strategy {
     this.cache = cache;
     this.portfolio = portfolio;
     this.volGuard = volGuard;
+    this.lastDiagnosticLog = new Map();
   }
 
   async generate() {
     return [];
+  }
+
+  diagnosticKey(asset, reason) {
+    return `${this.name}:${asset?.tokenId || 'unknown'}:${reason}`;
+  }
+
+  shouldLogDiagnostic(asset, reason, cooldownMs = 60_000) {
+    const key = this.diagnosticKey(asset, reason);
+    const now = Date.now();
+    const last = this.lastDiagnosticLog.get(key) || 0;
+    if (now - last < cooldownMs) return false;
+    this.lastDiagnosticLog.set(key, now);
+    return true;
+  }
+
+  formatGenerateContext(asset, book, extra = {}) {
+    const fields = {
+      strategy: this.name,
+      token: shortId(asset?.tokenId),
+      outcome: asset?.outcome,
+      bid: book?.bestBid,
+      ask: book?.bestAsk,
+      spread: book?.spread,
+      mid: book?.midpoint,
+      topBid1Usd: book ? topDepthUsd(book.bids, 1) : null,
+      topAsk1Usd: book ? topDepthUsd(book.asks, 1) : null,
+      bookComplete: isBookComplete(book),
+      incompleteBookCause: isBookComplete(book) ? null : incompleteBookCause(book),
+      ...extra,
+    };
+
+    return Object.entries(fields)
+      .filter(([, value]) => value !== null && value !== undefined && value !== '')
+      .map(([key, value]) => `${key}=${cleanLogValue(value)}`)
+      .join(' ');
+  }
+
+  skip(asset, book, reason, extra = {}) {
+    if (this.shouldLogDiagnostic(asset, reason)) {
+      info(`[RAW SIGNAL COUNT] count=0 skipReason=${reason} ${this.formatGenerateContext(asset, book, extra)}`);
+    }
+    return [];
+  }
+
+  emit(asset, book, signals, extra = {}) {
+    const count = Array.isArray(signals) ? signals.length : 0;
+    info(`[RAW SIGNAL COUNT] count=${count} ${this.formatGenerateContext(asset, book, extra)}`);
+    return signals;
   }
 }
 
@@ -1059,15 +1129,24 @@ class SpreadHunterStrategy extends Strategy {
   }
 
   async generate(asset, book) {
-    if (!this.config.spreadHunterEnabled) return [];
-    if (!isBookComplete(book)) return [];
+    if (!this.config.spreadHunterEnabled) return this.skip(asset, book, 'strategy_disabled');
+    if (!isBookComplete(book)) return this.skip(asset, book, 'incomplete_book');
 
     const tick = book.tickSize || 0.01;
     const mark = book.midpoint;
     const spread = book.spread;
 
-    if (spread < this.config.spreadHunterMinEdge) return [];
-    if (this.volGuard.isTripped(asset.tokenId) && !this.config.quoteDuringVolatility) return [];
+    if (spread < this.config.spreadHunterMinEdge) {
+      return this.skip(asset, book, 'spread_below_min_edge', {
+        spread,
+        minSpreadEdge: this.config.spreadHunterMinEdge,
+      });
+    }
+    if (this.volGuard.isTripped(asset.tokenId) && !this.config.quoteDuringVolatility) {
+      return this.skip(asset, book, 'volatility_guard', {
+        quoteDuringVolatility: this.config.quoteDuringVolatility,
+      });
+    }
 
     const posUsd = this.portfolio.positionUsd(asset.tokenId, mark);
     const invRatio = clamp(posUsd / this.config.maxPositionUsdPerAsset, -1, 1);
@@ -1091,7 +1170,9 @@ class SpreadHunterStrategy extends Strategy {
       bid = clamp(roundToTick(mark - tick, tick), 0.01, 0.99);
       ask = clamp(roundToTick(mark + tick, tick), 0.01, 0.99);
     }
-    if (!(bid < ask)) return [];
+    if (!(bid < ask)) {
+      return this.skip(asset, book, 'quote_band_collapsed', { bid, ask, tick, mark, spread });
+    }
 
     let baseUsd = this.config.baseOrderUsd;
     if (this.config.hunterMode && spread > 0.08) {
@@ -1126,17 +1207,37 @@ class SpreadHunterStrategy extends Strategy {
     const sellLiquidity = estimateLiquidityConsumption(book, 'sell', sellUsd || this.config.baseOrderUsd, this.config);
     // Lower liquidity penalty is worse, so use the weaker side for edge realism.
     const worstLiquidityPenalty = Math.min(buyLiquidity.penalty, sellLiquidity.penalty);
+    const makerLiquidityPenalty = clamp(Math.sqrt(worstLiquidityPenalty), 0.35, 1);
     const volatilityEdgeMultiplier = this.volGuard.isTripped(asset.tokenId)
       ? this.config.volatilityEdgeMultiplier
       : 1;
 
     const edgeEstimate = Math.max(
       0,
-      ((ask - bid) / 2 - this.config.slippageBuffer - this.config.adverseSelectionBuffer) * worstLiquidityPenalty
+      ((ask - bid) / 2 - this.config.slippageBuffer - this.config.adverseSelectionBuffer) * makerLiquidityPenalty
     );
 
     const requiredEdge = this.config.minSignalEdge * volatilityEdgeMultiplier;
-    if (edgeEstimate < requiredEdge) return [];
+    const edgeDiagnostics = {
+      bid,
+      ask,
+      quoteWidth: ask - bid,
+      grossHalfSpreadEdge: (ask - bid) / 2,
+      slippageBuffer: this.config.slippageBuffer,
+      adverseSelectionBuffer: this.config.adverseSelectionBuffer,
+      buyUsd,
+      sellUsd,
+      buyConsumedPct: buyLiquidity.consumedPct,
+      sellConsumedPct: sellLiquidity.consumedPct,
+      worstLiquidityPenalty,
+      makerLiquidityPenalty,
+      edgeEstimate,
+      requiredEdge,
+      volatilityEdgeMultiplier,
+    };
+    if (edgeEstimate < requiredEdge) {
+      return this.skip(asset, book, 'edge_below_required', edgeDiagnostics);
+    }
 
     let confidence = clamp(0.35 + spread * 2 + Math.log10(1 + asset.market.volume24h) / 20, 0, 0.85);
     if (ghostThrottle) {
@@ -1197,7 +1298,15 @@ class SpreadHunterStrategy extends Strategy {
       }));
     }
 
-    return signals;
+    if (signals.length === 0) {
+      return this.skip(asset, book, 'size_below_min_or_no_sell_inventory', {
+        ...edgeDiagnostics,
+        minOrderUsd: this.config.minOrderUsd,
+        positionQty: this.portfolio.position(asset.tokenId),
+      });
+    }
+
+    return this.emit(asset, book, signals, edgeDiagnostics);
   }
 }
 
@@ -1207,21 +1316,21 @@ class InventoryExitStrategy extends Strategy {
   }
 
   async generate(asset, book) {
-    if (!this.config.inventoryExitEnabled) return [];
-    if (!isBookComplete(book)) return [];
+    if (!this.config.inventoryExitEnabled) return this.skip(asset, book, 'strategy_disabled');
+    if (!isBookComplete(book)) return this.skip(asset, book, 'incomplete_book');
 
     const qty = this.portfolio.position(asset.tokenId);
-    if (qty <= 0) return [];
+    if (qty <= 0) return this.skip(asset, book, 'no_position', { qty });
 
     const tick = book.tickSize || 0.01;
     const posUsd = qty * book.midpoint;
     const invRatio = clamp(posUsd / this.config.maxPositionUsdPerAsset, 0, 1);
-    if (invRatio < 0.2) return [];
+    if (invRatio < 0.2) return this.skip(asset, book, 'inventory_ratio_below_exit_threshold', { qty, posUsd, invRatio });
 
     const ask = clamp(roundToTick(Math.max(book.bestBid + tick, book.bestAsk - tick), tick), 0.01, 0.99);
     const sizeUsd = Math.min(posUsd, this.config.baseOrderUsd * (1 + invRatio));
 
-    return [new Signal({
+    return this.emit(asset, book, [new Signal({
       strategy: this.name,
       tokenId: asset.tokenId,
       marketId: asset.market.marketId,
@@ -1235,7 +1344,7 @@ class InventoryExitStrategy extends Strategy {
       ttlMs: Math.min(this.config.orderTtlMs, 20_000),
       maxHoldMs: this.config.maxHoldMs,
       metadata: { marketQuestion: asset.market.question, outcome: asset.outcome },
-    })];
+    })], { qty, posUsd, invRatio });
   }
 }
 
@@ -1245,15 +1354,15 @@ class ComplementArbStrategy extends Strategy {
   }
 
   async generate(asset, book) {
-    if (!this.config.complementArbEnabled) return [];
-    if (!isBookComplete(book)) return [];
+    if (!this.config.complementArbEnabled) return this.skip(asset, book, 'strategy_disabled');
+    if (!isBookComplete(book)) return this.skip(asset, book, 'incomplete_book');
 
     const siblings = this.cache.getMarketAssets(asset.market.marketId);
-    if (siblings.length < 2) return [];
+    if (siblings.length < 2) return this.skip(asset, book, 'missing_complement_sibling', { siblings: siblings.length });
 
     const a = siblings[0];
     const b = siblings[1];
-    if (asset.tokenId !== a.tokenId) return []; // emit once per market
+    if (asset.tokenId !== a.tokenId) return this.skip(asset, book, 'complement_emit_once_per_market'); // emit once per market
 
     let bookA;
     let bookB;
@@ -1262,23 +1371,34 @@ class ComplementArbStrategy extends Strategy {
       bookA = await this.cache.getFreshBook(a.tokenId);
       bookB = await this.cache.getFreshBook(b.tokenId);
     } catch {
-      return [];
+      return this.skip(asset, book, 'complement_book_fetch_failed');
     }
 
-    if (!isBookComplete(bookA) || !isBookComplete(bookB)) return [];
+    if (!isBookComplete(bookA) || !isBookComplete(bookB)) {
+      return this.skip(asset, book, 'incomplete_complement_book', {
+        legAIncomplete: incompleteBookCause(bookA),
+        legBIncomplete: incompleteBookCause(bookB),
+      });
+    }
 
     const buyBothCost = bookA.bestAsk + bookB.bestAsk;
     const lockedEdge = 1 - buyBothCost;
 
     // In a binary market, buying both outcomes below $1 can be a settlement arbitrage.
     // This still needs both sides filled; paper mode treats them separately and tracks strategy.
-    if (lockedEdge < this.config.complementArbMinEdge) return [];
+    if (lockedEdge < this.config.complementArbMinEdge) {
+      return this.skip(asset, book, 'complement_edge_below_min', {
+        buyBothCost,
+        lockedEdge,
+        minComplementEdge: this.config.complementArbMinEdge,
+      });
+    }
 
     const sizeUsdEach = Math.min(this.config.baseOrderUsd, this.config.maxMarketExposureUsd / 4);
     const confidence = clamp(0.65 + lockedEdge * 8, 0, 0.98);
     const pairId = crypto.randomUUID();
 
-    return [
+    return this.emit(asset, book, [
       new Signal({
         strategy: this.name,
         tokenId: a.tokenId,
@@ -1309,7 +1429,7 @@ class ComplementArbStrategy extends Strategy {
         maxHoldMs: 24 * 60 * 60_000,
         metadata: { pairId, complementKey: `${a.tokenId}:${b.tokenId}`, leg: 2, marketQuestion: b.market.question, outcome: b.outcome },
       }),
-    ];
+    ], { buyBothCost, lockedEdge });
   }
 }
 
@@ -1319,22 +1439,31 @@ class TailEndMispricingStrategy extends Strategy {
   }
 
   async generate(asset, book) {
-    if (!this.config.tailEndEnabled) return [];
-    if (!isBookComplete(book)) return [];
+    if (!this.config.tailEndEnabled) return this.skip(asset, book, 'strategy_disabled');
+    if (!isBookComplete(book)) return this.skip(asset, book, 'incomplete_book');
 
     const until = msUntil(asset.market.endDate);
-    if (!Number.isFinite(until)) return [];
-    if (until <= 0 || until > this.config.tailEndHours * 60 * 60 * 1000) return [];
+    if (!Number.isFinite(until)) return this.skip(asset, book, 'missing_end_date');
+    if (until <= 0 || until > this.config.tailEndHours * 60 * 60 * 1000) {
+      return this.skip(asset, book, 'outside_tail_window', {
+        hoursUntilEnd: until / (60 * 60 * 1000),
+        tailEndHours: this.config.tailEndHours,
+      });
+    }
 
     const mid = book.midpoint;
     const spread = book.spread;
     const confidence = confidenceFromPrice(mid);
 
-    if (confidence < this.config.tailEndMinConfidence) return [];
-    if (spread > 0.08) return [];
+    if (confidence < this.config.tailEndMinConfidence) {
+      return this.skip(asset, book, 'tail_confidence_below_min', { confidence, minConfidence: this.config.tailEndMinConfidence });
+    }
+    if (spread > 0.08) return this.skip(asset, book, 'tail_spread_too_wide', { spread, maxTailSpread: 0.08 });
 
     const side = mid > 0.5 ? 'buy' : 'sell';
-    if (side === 'sell' && this.portfolio.position(asset.tokenId) <= 0) return [];
+    if (side === 'sell' && this.portfolio.position(asset.tokenId) <= 0) {
+      return this.skip(asset, book, 'tail_sell_no_position', { side, position: this.portfolio.position(asset.tokenId) });
+    }
 
     const tick = book.tickSize || 0.01;
     const price = side === 'buy'
@@ -1342,9 +1471,11 @@ class TailEndMispricingStrategy extends Strategy {
       : clamp(roundToTick(Math.max(book.bestBid, book.bestAsk - tick), tick), 0.01, 0.99);
 
     const edge = Math.abs(mid - 0.5) - spread - this.config.slippageBuffer;
-    if (edge < this.config.minSignalEdge) return [];
+    if (edge < this.config.minSignalEdge) {
+      return this.skip(asset, book, 'tail_edge_below_min', { edge, minSignalEdge: this.config.minSignalEdge });
+    }
 
-    return [new Signal({
+    return this.emit(asset, book, [new Signal({
       strategy: this.name,
       tokenId: asset.tokenId,
       marketId: asset.market.marketId,
@@ -1358,7 +1489,7 @@ class TailEndMispricingStrategy extends Strategy {
       ttlMs: Math.min(this.config.orderTtlMs, 20_000),
       maxHoldMs: Math.min(this.config.maxHoldMs, Math.max(15 * 60_000, until / 3)),
       metadata: { marketQuestion: asset.market.question, outcome: asset.outcome },
-    })];
+    })], { edge, confidence, hoursUntilEnd: until / (60 * 60 * 1000) });
   }
 }
 
@@ -1369,8 +1500,13 @@ class WhaleCopyStrategy extends Strategy {
   }
 
   async generate(asset, book) {
-    if (!this.config.enableWhaleTracking || !this.config.enableWhaleCopyStrategy || !this.whaleWatcher) return [];
-    if (!isBookComplete(book)) return [];
+    if (!this.config.enableWhaleTracking || !this.config.enableWhaleCopyStrategy || !this.whaleWatcher) {
+      return this.skip(asset, book, 'strategy_disabled', {
+        enableWhaleTracking: this.config.enableWhaleTracking,
+        enableWhaleCopyStrategy: this.config.enableWhaleCopyStrategy,
+      });
+    }
+    if (!isBookComplete(book)) return this.skip(asset, book, 'incomplete_book');
 
     const recentWhale = this.whaleWatcher.findRecentForSignal({
       tokenId: asset.tokenId,
@@ -1378,8 +1514,10 @@ class WhaleCopyStrategy extends Strategy {
       metadata: { marketQuestion: asset.market.question },
     });
 
-    if (!recentWhale) return [];
-    if (Date.now() - recentWhale.timestamp > this.config.whaleCopyFreshMs) return [];
+    if (!recentWhale) return this.skip(asset, book, 'no_recent_whale');
+    if (Date.now() - recentWhale.timestamp > this.config.whaleCopyFreshMs) {
+      return this.skip(asset, book, 'whale_event_stale', { whaleAgeMs: Date.now() - recentWhale.timestamp });
+    }
 
     // Opposite side: provide liquidity to the whale rather than blindly chasing.
     const oppositeSide = recentWhale.side === 'buy' ? 'sell' : 'buy';
@@ -1398,9 +1536,11 @@ class WhaleCopyStrategy extends Strategy {
       recentWhale.sizeUsd * this.config.whaleCopyWhaleFraction
     );
 
-    if (sizeUsd < this.config.minOrderUsd) return [];
+    if (sizeUsd < this.config.minOrderUsd) {
+      return this.skip(asset, book, 'whale_size_below_min_order', { sizeUsd, minOrderUsd: this.config.minOrderUsd });
+    }
 
-    return [new Signal({
+    return this.emit(asset, book, [new Signal({
       strategy: this.name,
       tokenId: asset.tokenId,
       marketId: asset.market.marketId,
@@ -1422,7 +1562,7 @@ class WhaleCopyStrategy extends Strategy {
         whaleAgeMs: Date.now() - recentWhale.timestamp,
         entryMid: book.midpoint,
       },
-    })];
+    })], { sizeUsd, whaleAgeMs: Date.now() - recentWhale.timestamp });
   }
 }
 
@@ -1684,7 +1824,13 @@ class MultiConsensusEngine {
   }
 
   evaluateSignal(signal, asset, book, cache, portfolio, volGuard, whaleTracker = null) {
-    if (!signal || !asset || !book) return null;
+    if (!signal || !asset || !book) {
+      warn(
+        `[CONSENSUS BLOCK] block=invalid_input signalPresent=${Boolean(signal)} ` +
+        `assetPresent=${Boolean(asset)} bookPresent=${Boolean(book)}`
+      );
+      return null;
+    }
 
     const protectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
     if (protectiveExit) {
@@ -1702,6 +1848,10 @@ class MultiConsensusEngine {
           },
         },
       };
+      info(
+        `[CONSENSUS PASS] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `score=1.000 threshold=${this.config.consensusThreshold} route=RISK_EXIT:${signal.strategy === 'InventoryExit' ? 'INVENTORY_EXIT' : 'PROTECTIVE_EXIT'} reason="protective_exit"`
+      );
       return signal;
     }
 
@@ -1778,18 +1928,17 @@ class MultiConsensusEngine {
         blockReason: routeAuth ? 'score_below_threshold' : (route.blockReason || 'route_not_authorized'),
       });
 
-      if (this.config.consensusLogRejected) {
-        const componentText = Object.entries(components)
-          .map(([name, value]) => `${name}=${Number(value || 0).toFixed(3)}`)
-          .join(' ');
-        const routeReason = route?.reason ? String(route.reason).replace(/\s+/g, ' ') : 'no route reason';
+      const componentText = Object.entries(components)
+        .map(([name, value]) => `${name}=${Number(value || 0).toFixed(3)}`)
+        .join(' ');
+      const routeReason = route?.reason ? String(route.reason).replace(/\s+/g, ' ') : 'no route reason';
 
-        warn(
-          `[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
-          `block=${blockReason} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold} ` +
-          `route=${route.mode}:${route.state} routeAuth=${routeAuth} reason="${routeReason}" ${componentText}`
-        );
-      }
+      warn(
+        `[CONSENSUS BLOCK] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `block=${blockReason} score=${score.toFixed(3)} threshold=${this.config.consensusThreshold} ` +
+        `route=${route.mode}:${route.state} routeAuth=${routeAuth} reason="${routeReason}" ` +
+        `spread=${cleanLogValue(book.spread)} edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ${componentText}`
+      );
       return null;
     }
 
@@ -1799,6 +1948,13 @@ class MultiConsensusEngine {
       scorePassed: true,
       blockReason: 'route_authorized',
     });
+
+    info(
+      `[CONSENSUS PASS] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+      `score=${score.toFixed(3)} threshold=${this.config.consensusThreshold} route=${route.mode}:${route.state} ` +
+      `reason="${String(route.reason || 'authorized').replace(/\s+/g, ' ')}" ` +
+      `spread=${cleanLogValue(book.spread)} edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)}`
+    );
 
     this.applyExecutionRoute(signal, route);
     this.applyWhaleConsensusAdjustment(signal, whaleEvent);
@@ -3496,6 +3652,7 @@ class BotEngine {
     this.sophieLowQualitySummary = { windowStartedAt: Date.now(), blocked: 0, qualities: [], tokenIds: new Set() };
     this.sophieRepeatCandidateCooldownUntil = new Map();
     this.sophieRepeatCandidateLogs = new Map();
+    this.assetBookSkipLastLogged = new Map();
 
     this.strategies = [
       new SpreadHunterStrategy(config, this.cache, this.portfolio, this.volGuard),
@@ -3563,12 +3720,22 @@ class BotEngine {
     info(background ? '[RESEARCH REFRESH START] background=true' : '[RESEARCH REFRESH START]');
     try {
       const selected = await this.research.discoverCandidates();
-      if (token === null || token === this.researchRefreshToken) {
+      const tokenCurrent = token === null || token === this.researchRefreshToken;
+      const canSeedEmptyAssets = !tokenCurrent && this.assets.length === 0 && selected.length > 0;
+      if (tokenCurrent || canSeedEmptyAssets) {
         this.assets = selected;
         if (this.wsClient && this.assets.length > 0) {
           this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
         }
-        info(`[RESEARCH REFRESH COMPLETE] selected=${selected.length}`);
+        info(
+          `[RESEARCH REFRESH COMPLETE] selected=${selected.length} ` +
+          `lateSeed=${canSeedEmptyAssets} tokenCurrent=${tokenCurrent}`
+        );
+      } else {
+        info(
+          `[RESEARCH REFRESH LATE RESULT IGNORED] selected=${selected.length} ` +
+          `token=${token} currentToken=${this.researchRefreshToken} activeAssets=${this.assets.length}`
+        );
       }
       return selected;
     } catch (e) {
@@ -3688,8 +3855,17 @@ class BotEngine {
     this.portfolio.updateGhostOrders(markPrices);
 
     for (const asset of this.assets) {
-      const book = await this.cache.getFreshBook(asset.tokenId, 3_000);
-      if (!isBookComplete(book)) continue;
+      let book;
+      try {
+        book = await this.cache.getFreshBook(asset.tokenId, 3_000);
+      } catch (e) {
+        this.logAssetBookSkip(asset, null, 'book_fetch_failed', { error: e.message });
+        continue;
+      }
+      if (!isBookComplete(book)) {
+        this.logAssetBookSkip(asset, book, 'incomplete_book');
+        continue;
+      }
 
       this.volGuard.update(asset.tokenId, book.midpoint);
       this.consensus.recordMid(asset.tokenId, book.midpoint);
@@ -3718,8 +3894,31 @@ class BotEngine {
     }
   }
 
+  logAssetBookSkip(asset, book, reason, extra = {}) {
+    const key = `${asset?.tokenId || 'unknown'}:${reason}`;
+    const now = Date.now();
+    const last = this.assetBookSkipLastLogged.get(key) || 0;
+    if (now - last < 60_000) return;
+    this.assetBookSkipLastLogged.set(key, now);
+
+    warn(
+      `[ASSET PIPELINE SKIP] reason=${reason} token=${shortId(asset?.tokenId)} outcome=${asset?.outcome || 'unknown'} ` +
+      `bid=${cleanLogValue(book?.bestBid)} ask=${cleanLogValue(book?.bestAsk)} spread=${cleanLogValue(book?.spread)} ` +
+      `incompleteBookCause=${incompleteBookCause(book)} ${Object.entries(extra).map(([k, v]) => `${k}=${cleanLogValue(v)}`).join(' ')}`
+    );
+  }
+
   trySignal(rawSignal, asset, book) {
     let signal = rawSignal;
+
+    if (rawSignal && !isProtectiveExitStrategy(rawSignal.strategy)) {
+      this.portfolio.recordExecutionEvent('candidate_evaluation', rawSignal);
+      info(
+        `[CANDIDATE EVALUATION] stage=raw strategy=${rawSignal.strategy} side=${String(rawSignal.side || '').toUpperCase()} ` +
+        `token=${shortId(rawSignal.tokenId)} price=${fmtPrice(rawSignal.price)} sizeUsd=${cleanLogValue(rawSignal.sizeUsd)} ` +
+        `edge=${cleanLogValue(rawSignal.expectedEdge)} confidence=${cleanLogValue(rawSignal.confidence)}`
+      );
+    }
 
     if (this.config.enableConsensus) {
       signal = this.consensus.evaluateSignal(
@@ -3754,10 +3953,6 @@ class BotEngine {
         sophieExecution: nudgedQuality,
       };
       Object.assign(quality, nudgedQuality);
-    }
-
-    if (!isProtectiveExitStrategy(signal.strategy)) {
-      this.portfolio.recordExecutionEvent('candidate_evaluation', signal);
     }
 
     if (!this.applySophieExecutionGate(signal, asset, book, quality)) {
