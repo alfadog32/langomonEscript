@@ -90,6 +90,20 @@ function tailLines(filePath, maxLines = 500) {
   }
 }
 
+function lineTimestampMs(line) {
+  const match = String(line || '').match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+  if (!match) return NaN;
+  return Date.parse(match[0]);
+}
+
+function linesSince(lines, sinceMs) {
+  if (!Number.isFinite(sinceMs) || sinceMs <= 0) return lines;
+  return lines.filter((line) => {
+    const ts = lineTimestampMs(line);
+    return Number.isFinite(ts) && ts >= sinceMs;
+  });
+}
+
 function parseLastNumber(lines, pattern) {
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     const match = lines[i].match(pattern);
@@ -124,6 +138,8 @@ function parseLastExecutionHealth(lines) {
       maxOpenOrderBlocksLastHour: get('maxOpenOrderBlocksLastHour'),
       fillRateLastHour: get('fillRateLastHour'),
       fillRateByPlacedOrdersLastHour: get('fillRateByPlacedOrdersLastHour'),
+      activePaperOrders: get('activePaperOrders'),
+      avgActiveOrderAgeSec: get('avgActiveOrderAgeSec'),
     };
   }
   return {};
@@ -133,14 +149,37 @@ function countRecent(lines, pattern, now = Date.now(), windowMs = 60 * 60_000) {
   let count = 0;
   for (const line of lines) {
     if (!pattern.test(line)) continue;
-    const ts = Date.parse(line.slice(0, 24));
-    if (!Number.isFinite(ts) || now - ts <= windowMs) count += 1;
+    const ts = lineTimestampMs(line);
+    if (Number.isFinite(ts) && now - ts <= windowMs) count += 1;
   }
   return count;
 }
 
 function boolStatus(value, expected) {
   return { value, expected, ok: value === expected };
+}
+
+function recentMatchingLines(lines, pattern, now = Date.now(), windowMs = 10 * 60_000) {
+  return lines.filter((line) => {
+    if (!pattern.test(line)) return false;
+    const ts = lineTimestampMs(line);
+    return Number.isFinite(ts) && now - ts <= windowMs;
+  });
+}
+
+function lastTimedLine(lines, pattern) {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!pattern.test(line)) continue;
+    const ts = lineTimestampMs(line);
+    if (Number.isFinite(ts)) return { line, ts };
+  }
+  return null;
+}
+
+function latestTs(...events) {
+  const times = events.map((event) => event?.ts).filter(Number.isFinite);
+  return times.length ? Math.max(...times) : 0;
 }
 
 function main() {
@@ -164,49 +203,107 @@ function main() {
 
   const engineProc = byName.get('langomonEscript');
   const engineLogPath = engineProc?.pm2_env?.pm_out_log_path || path.join(process.env.HOME || '', '.pm2/logs/langomonEscript-out.log');
+  const engineErrorLogPath = engineProc?.pm2_env?.pm_err_log_path || path.join(process.env.HOME || '', '.pm2/logs/langomonEscript-error.log');
   const engineLines = tailLines(engineLogPath, 1000);
-  const recentPortfolioReportFound = engineLines.some((line) => line.includes('--- PORTFOLIO REPORT ---'));
-  const openOrders = parseLastNumber(engineLines, /Open Orders:\s+(\d+)/);
-  const drawdownPct = parseLastNumber(engineLines, /Drawdown:\s+([0-9.]+)%/);
-  const openOrderExposureUsd = parseLastNumber(engineLines, /Open Order Exposure:\s+\$([0-9.]+)/);
-  const totalExposureUsd = parseLastNumber(engineLines, /Open Orders:\s+\d+\s+\|\s+Exposure:\s+\$([0-9.]+)/);
-  const executionHealth = parseLastExecutionHealth(engineLines);
-  const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour) ? executionHealth.fillsLastHour : countRecent(engineLines, /\[FILL\]/);
+  const engineErrorLines = tailLines(engineErrorLogPath, 300);
+  const pmUptime = Number(engineProc?.pm2_env?.pm_uptime || 0);
+  const uptimeSec = pmUptime > 0 ? Math.max(0, Math.round((Date.now() - pmUptime) / 1000)) : null;
+  const currentEngineLines = linesSince(engineLines, pmUptime);
+  const currentEngineErrorLines = linesSince(engineErrorLines, pmUptime);
+  const portfolioReportFreshMs = Number.parseInt(process.env.LIVE_READINESS_PORTFOLIO_FRESH_MS || '900000', 10);
+  const lastPortfolioReport = lastTimedLine(currentEngineLines, /--- PORTFOLIO REPORT ---/);
+  const recentPortfolioReportFound = Boolean(
+    lastPortfolioReport && Date.now() - lastPortfolioReport.ts <= (Number.isFinite(portfolioReportFreshMs) ? portfolioReportFreshMs : 900_000)
+  );
+  const openOrders = parseLastNumber(currentEngineLines, /Open Orders:\s+(\d+)/);
+  const drawdownPct = parseLastNumber(currentEngineLines, /Drawdown:\s+([0-9.]+)%/);
+  const openOrderExposureUsd = parseLastNumber(currentEngineLines, /Open Order Exposure:\s+\$([0-9.]+)/);
+  const totalExposureUsd = parseLastNumber(currentEngineLines, /Open Orders:\s+\d+\s+\|\s+Exposure:\s+\$([0-9.]+)/);
+  const executionHealth = parseLastExecutionHealth(currentEngineLines);
+  const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour) ? executionHealth.fillsLastHour : countRecent(currentEngineLines, /\[FILL\]/);
   const candidateEvaluationsLastHour = Number.isFinite(executionHealth.candidateEvaluationsLastHour)
     ? executionHealth.candidateEvaluationsLastHour
-    : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\]|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
+    : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\]|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
   const paperOrdersAdmittedLastHour = Number.isFinite(executionHealth.paperOrdersAdmittedLastHour)
     ? executionHealth.paperOrdersAdmittedLastHour
-    : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\].*decision=ADMIT|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
+    : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\].*decision=ADMIT|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
   const paperOrdersFilledLastHour = Number.isFinite(executionHealth.paperOrdersFilledLastHour)
     ? executionHealth.paperOrdersFilledLastHour
     : fillsLastHour;
   const paperOrdersExpiredNoFillLastHour = Number.isFinite(executionHealth.paperOrdersExpiredNoFillLastHour)
     ? executionHealth.paperOrdersExpiredNoFillLastHour
-    : countRecent(engineLines, /\[ORDER REPLACE\]/);
+    : countRecent(currentEngineLines, /\[ORDER REPLACE\]/);
   const paperOrdersRejectedBySophieLastHour = Number.isFinite(executionHealth.paperOrdersRejectedBySophieLastHour)
     ? executionHealth.paperOrdersRejectedBySophieLastHour
-    : countRecent(engineLines, /\[SOPHIE ORDER QUALITY\].*BLOCK_LOW_QUALITY|\[SOPHIE EXECUTION THROTTLE\]/);
+    : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\].*BLOCK_LOW_QUALITY|\[SOPHIE EXECUTION THROTTLE\]/);
   const paperOrdersPlacedLastHour = Number.isFinite(executionHealth.paperOrdersPlacedLastHour)
     ? executionHealth.paperOrdersPlacedLastHour
-    : (Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(engineLines, /\[ORDER\]/));
+    : (Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(currentEngineLines, /\[ORDER\]/));
   const ordersPlacedLastHour = paperOrdersPlacedLastHour;
-  const duplicateSkipsLastHour = Number.isFinite(executionHealth.duplicateSkipsLastHour) ? executionHealth.duplicateSkipsLastHour : countRecent(engineLines, /\[ORDER SKIP DUPLICATE\]/);
+  const duplicateSkipsLastHour = Number.isFinite(executionHealth.duplicateSkipsLastHour) ? executionHealth.duplicateSkipsLastHour : countRecent(currentEngineLines, /\[ORDER SKIP DUPLICATE\]/);
   const maxOpenOrderBlocksLastHour = Number.isFinite(executionHealth.maxOpenOrderBlocksLastHour)
     ? executionHealth.maxOpenOrderBlocksLastHour
-    : countRecent(engineLines, /\[SOPHIE SLOT BLOCK\]|block=max_open_orders/);
+    : countRecent(currentEngineLines, /\[SOPHIE SLOT BLOCK\]|block=max_open_orders/);
   const fillRateLastHour = Number.isFinite(executionHealth.fillRateLastHour) ? executionHealth.fillRateLastHour : (ordersPlacedLastHour > 0 ? (fillsLastHour / ordersPlacedLastHour) * 100 : 0);
   const noFillStreakMax = Number.isFinite(executionHealth.noFillStreakMax) ? executionHealth.noFillStreakMax : 0;
   const avgTimeToFillSec = Number.isFinite(executionHealth.avgTimeToFillSec) ? executionHealth.avgTimeToFillSec : null;
   const fillRateByPlacedOrdersLastHour = Number.isFinite(executionHealth.fillRateByPlacedOrdersLastHour)
     ? executionHealth.fillRateByPlacedOrdersLastHour
     : fillRateLastHour;
-  const fillProbabilityOverestimated = countRecent(engineLines, /\[SOPHIE FILL PROB CALIBRATED\].*far_from_touch|\[SOPHIE NO-FILL LEARN\]/) > 0;
-  const recentStarvationWarning = countRecent(engineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
-  const crashLoopOk = !engineProc || ((engineProc.pm2_env?.unstable_restarts || 0) === 0 && (engineProc.pm2_env?.restart_time || 0) < 10);
+  const activePaperOrders = Number.isFinite(executionHealth.activePaperOrders)
+    ? executionHealth.activePaperOrders
+    : (Number.isFinite(openOrders) ? openOrders : 0);
+  const oldestOpenOrderAgeSec = Number.isFinite(executionHealth.oldestOpenOrderAgeSec) ? executionHealth.oldestOpenOrderAgeSec : 0;
+  const avgOpenOrderAgeSec = Number.isFinite(executionHealth.avgOpenOrderAgeSec) ? executionHealth.avgOpenOrderAgeSec : 0;
+  const avgActiveOrderAgeSec = Number.isFinite(executionHealth.avgActiveOrderAgeSec) ? executionHealth.avgActiveOrderAgeSec : avgOpenOrderAgeSec;
+  const fillProbabilityOverestimated = countRecent(currentEngineLines, /\[SOPHIE FILL PROB CALIBRATED\].*far_from_touch|\[SOPHIE NO-FILL LEARN\]/) > 0;
+  const recentStarvationWarning = countRecent(currentEngineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
+  const makerOptimizerAdmitsLastHour = countRecent(currentEngineLines, /\[SOPHIE MAKER OPTIMIZER ADMIT\]/);
+  const makerOptimizerBlocksLastHour = countRecent(currentEngineLines, /\[SOPHIE MAKER OPTIMIZER BLOCK\]/);
+  const unstableRestarts = Number(engineProc?.pm2_env?.unstable_restarts || 0);
+  const crashPattern = /Fatal start error|Loop error|uncaughtException|Unhandled|FATAL|SyntaxError|ReferenceError|TypeError|process exited|exited with code/i;
+  const recentErrorLines = recentMatchingLines(currentEngineErrorLines, crashPattern);
+  const recentExitLines = recentMatchingLines(currentEngineLines, /\b(process exited|exited with code|uncaughtException|Unhandled|Fatal start error)\b/i, Date.now(), 5 * 60_000);
+  const recentUnstableRestart = unstableRestarts > 0 && Number.isFinite(uptimeSec) && uptimeSec < 120;
+  const crashLoopOk = !engineProc || (engineProc.pm2_env?.status === 'online' && !recentUnstableRestart && recentErrorLines.length === 0 && recentExitLines.length === 0);
+  const staleCrashEvidenceIgnored = engineErrorLines.some((line) => crashPattern.test(line)) && recentErrorLines.length === 0;
+  const crashLoopEvidence = {
+    status: engineProc?.pm2_env?.status || null,
+    uptimeSec,
+    unstableRestarts,
+    recentErrorLines: recentErrorLines.length,
+    recentExitLines: recentExitLines.length,
+    staleCrashEvidenceIgnored,
+  };
+  const lastResearchStart = lastTimedLine(currentEngineLines, /\[RESEARCH REFRESH START\]/);
+  const lastResearchComplete = lastTimedLine(currentEngineLines, /\[RESEARCH REFRESH COMPLETE\]/);
+  const lastResearchFailed = lastTimedLine(currentEngineLines, /\[RESEARCH REFRESH FAILED\]/);
+  const lastResearchTimeout = lastTimedLine(currentEngineLines, /\[RESEARCH REFRESH TIMEOUT\]/);
+  const lastResearchUnstuck = lastTimedLine(currentEngineLines, /\[RESEARCH REFRESH UNSTUCK\]/);
+  const lastResearchTerminalTs = latestTs(lastResearchComplete, lastResearchFailed, lastResearchUnstuck);
+  const researchInProgress = Boolean(lastResearchStart && lastResearchStart.ts > lastResearchTerminalTs);
+  const researchAgeMs = researchInProgress ? Date.now() - lastResearchStart.ts : 0;
+  const researchStuckMs = Math.max(1, Number(CONFIG.researchStuckResetMs || 90_000));
+  const researchStuck = researchInProgress && researchAgeMs > researchStuckMs;
+  const researchRefresh = {
+    lastStartAt: lastResearchStart ? new Date(lastResearchStart.ts).toISOString() : null,
+    lastCompleteAt: lastResearchComplete ? new Date(lastResearchComplete.ts).toISOString() : null,
+    lastFailedAt: lastResearchFailed ? new Date(lastResearchFailed.ts).toISOString() : null,
+    lastTimeoutAt: lastResearchTimeout ? new Date(lastResearchTimeout.ts).toISOString() : null,
+    lastUnstuckAt: lastResearchUnstuck ? new Date(lastResearchUnstuck.ts).toISOString() : null,
+    inProgress: researchInProgress,
+    ageMs: Math.max(0, Math.round(researchAgeMs)),
+    stuckMs: researchStuckMs,
+    stuck: researchStuck,
+  };
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
-  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push('no active paper orders; Sophie bootstrap/calibrated gates admitted no candidates');
+  if (researchStuck) reasons.push(`research refresh stuck for ${Math.round(researchAgeMs)}ms`);
+  if (lastResearchComplete && candidateEvaluationsLastHour <= 0) reasons.push('candidate evaluations are zero after research completed');
+  if (candidateEvaluationsLastHour <= 0) reasons.push(`candidateEvaluationsLastHour ${candidateEvaluationsLastHour} below required > 0`);
+  if (paperOrdersPlacedLastHour <= 0) reasons.push('no paper orders occurred during burn-in');
+  if (fillsLastHour <= 0) reasons.push('no fills occurred during burn-in');
+  if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push(`no active paper orders; candidateEvaluationsLastHour=${candidateEvaluationsLastHour} paperOrdersAdmittedLastHour=${paperOrdersAdmittedLastHour} paperOrdersPlacedLastHour=${paperOrdersPlacedLastHour} makerOptimizerAdmitsLastHour=${makerOptimizerAdmitsLastHour} makerOptimizerBlocksLastHour=${makerOptimizerBlocksLastHour}`);
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);
   if (Number.isFinite(totalExposureUsd) && totalExposureUsd > CONFIG.maxTotalExposureUsd) reasons.push(`exposure $${totalExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);
@@ -240,6 +337,9 @@ function main() {
   const telegramDoctorExists = fs.readFileSync(path.join(ROOT, 'telegram/telegram_approval_bot.js'), 'utf8').includes("command === 'doctor'");
   if (!telegramDoctorExists) reasons.push('telegram doctor command not found');
 
+  const engineSyntax = runCommand(process.execPath, ['--check', 'moneymaker_v3.js']);
+  if (!engineSyntax.ok) reasons.push('moneymaker_v3.js syntax check failed');
+
   const dashboardSyntax = runCommand(process.execPath, ['--check', 'dashboard_server.js']);
   if (!dashboardSyntax.ok) reasons.push('dashboard_server.js syntax check failed');
 
@@ -252,7 +352,12 @@ function main() {
     },
     paperEngineHealth: {
       recentPortfolioReportFound,
+      lastPortfolioReportAt: lastPortfolioReport ? new Date(lastPortfolioReport.ts).toISOString() : null,
+      portfolioReportFreshMs: Number.isFinite(portfolioReportFreshMs) ? portfolioReportFreshMs : 900_000,
+      currentProcessLogLines: currentEngineLines.length,
+      researchRefresh,
       openOrders: Number.isFinite(openOrders) ? openOrders : null,
+      activePaperOrders,
       candidateEvaluationsLastHour,
       paperOrdersPlacedLastHour,
       paperOrdersFilledLastHour,
@@ -266,11 +371,17 @@ function main() {
       fillRateLastHour,
       fillRateByPlacedOrdersLastHour,
       noFillStreakMax,
+      oldestOpenOrderAgeSec,
+      avgOpenOrderAgeSec,
+      avgActiveOrderAgeSec,
       avgTimeToFillSec,
       fillProbabilityOverestimated,
       fillsDetected: fillsLastHour > 0,
+      makerOptimizerAdmitsLastHour,
+      makerOptimizerBlocksLastHour,
       recentStarvationWarning,
       crashLoopOk,
+      crashLoopEvidence,
       drawdownPct: Number.isFinite(drawdownPct) ? drawdownPct : null,
       maxDrawdownPct: CONFIG.maxDrawdownPct,
       totalExposureUsd: Number.isFinite(totalExposureUsd) ? totalExposureUsd : null,
@@ -291,6 +402,10 @@ function main() {
       syntaxOk: dashboardSyntax.ok,
       processOnline: pm2Checks.moneyMakerDashboard === 'online',
       manualHealthCommand: dashboardHealthCommand(),
+    },
+    syntax: {
+      engineOk: engineSyntax.ok,
+      dashboardOk: dashboardSyntax.ok,
     },
     reasons,
   };

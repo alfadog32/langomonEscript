@@ -67,6 +67,16 @@ function makeConfig(overrides = {}) {
     paperMakerNudgeMinEdgeAfterNudge: 0.012,
     paperMakerNudgeMaxDistanceFromTouch: 0.05,
     paperMakerNudgeOnlyAfterNoFillMs: 900_000,
+    paperMakerOptimizerEnabled: true,
+    paperMakerOptimizerMinEdgeAfterMove: 0.012,
+    paperMakerOptimizerMaxTicks: 1,
+    paperMakerRecoveryMinEdgeAfterMove: 0.006,
+    paperMakerRecoveryMaxActive: 1,
+    paperMakerRecoveryMinSignalScore: 0.70,
+    paperMakerRecoveryMinConfidence: 0.35,
+    paperMakerDistanceDecayPerNoFill: 0.18,
+    paperMakerMinOptimizedDistance: 0.015,
+    paperMakerMaxNoFillDecayStreak: 5,
     ...overrides,
   };
 }
@@ -160,6 +170,10 @@ function seedNoFillOutcomes(bot, signal, count = 3, quality = 0.50, distanceFrom
     }, Date.now() - 60_000 - i);
     bot.portfolio.recordExecutionEvent('order_expired_no_fill', signal, Date.now() - 30_000 - i);
   }
+}
+
+function assertApprox(actual, expected, tolerance, message) {
+  assert(Math.abs(actual - expected) <= tolerance, `${message}: expected ${expected}, got ${actual}`);
 }
 
 function makeCalibratedSignal(overrides = {}) {
@@ -351,7 +365,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, paperMakerNudgeEnabled: false });
+    const bot = makeBot({ maxOpenOrders: 10, paperMakerNudgeEnabled: false, paperMakerOptimizerEnabled: false });
     const asset = makeAsset('nudge-disabled-token');
     const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.43, expectedEdge: 0.03 });
     seedNoFillOutcomes(bot, signal, 1);
@@ -370,6 +384,132 @@ function run() {
     bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
     assert.strictEqual(signal.price, 0.44, 'enabled paper maker nudge should move one tick closer to touch');
     assert(signal.expectedEdge >= bot.config.paperMakerNudgeMinEdgeAfterNudge, 'nudge must preserve minimum edge');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-optimizer-admit-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.02, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.48, bestAsk: 0.52 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER ADMIT]')), 'starved maker optimizer should log admission');
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'OPTIMIZED_MAKER_ADMIT');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'optimized quote should be placed through RiskEngine');
+    const order = [...bot.portfolio.openOrders.values()][0];
+    assert.strictEqual(order.price, 0.43, 'optimizer should move exactly one tick closer to touch');
+    assert.strictEqual(Number(order.signal.expectedEdge.toFixed(3)), 0.010, 'optimizer should preserve expected recovery edge');
+    assert(order.price < 0.52, 'optimizer must not cross the spread');
+    assert(order.signal.metadata.paperMakerOptimizer.paperOnly, 'optimizer metadata should be paper-only');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-decay-zero-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.7495, expectedEdge: 0.04, confidence: 0.45 });
+    bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.800, bestAsk: 0.840, midpoint: 0.820, spread: 0.040, tickSize: 0.001 }));
+    bot.flushSophieMakerRecoveryCandidates();
+    const order = [...bot.portfolio.openOrders.values()][0];
+    assert.strictEqual(order.price, 0.751, 'zero no-fill streak should keep one-tick recovery behavior');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-decay-one-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.742, expectedEdge: 0.04, confidence: 0.45 });
+    seedNoFillOutcomes(bot, signal, 1, 0.50, 0.058);
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.800, bestAsk: 0.840, midpoint: 0.820, spread: 0.040, tickSize: 0.0001 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    const order = [...bot.portfolio.openOrders.values()][0];
+    const distance = Number((0.800 - order.price).toFixed(4));
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER DISTANCE DECAY]') && line.includes('noFillStreak=1')), 'one no-fill should log maker distance decay');
+    assertApprox(distance, 0.0476, 0.0002, 'one no-fill should reduce 0.058 distance by 18%');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-decay-two-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.742, expectedEdge: 0.04, confidence: 0.45 });
+    seedNoFillOutcomes(bot, signal, 2, 0.50, 0.058);
+    bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.800, bestAsk: 0.840, midpoint: 0.820, spread: 0.040, tickSize: 0.0001 }));
+    bot.flushSophieMakerRecoveryCandidates();
+    const order = [...bot.portfolio.openOrders.values()][0];
+    const distance = Number((0.800 - order.price).toFixed(4));
+    assertApprox(distance, 0.0390, 0.0002, 'two no-fills should reduce 0.058 distance by compounded 18% decay');
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-optimizer-low-edge-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.015, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]') && line.includes('edge_after_move')), 'edge below recovery floor should block clearly');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, minSignalEdge: 0.008, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-optimizer-risk-edge-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42, expectedEdge: 0.017, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]') && line.includes('risk_min_edge')), 'edge below RiskEngine floor should block before risk evaluation');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-optimizer-cross-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.53, expectedEdge: 0.03, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.539, bestAsk: 0.54, midpoint: 0.5395, spread: 0.001, tickSize: 0.01 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    assert(
+      logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]')
+        && (line.includes('would_cross_spread') || line.includes('no_safe_tick_available'))),
+      'unsafe spread fixture should block without placing'
+    );
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieCalibratedAdmissionEnabled: false, sophieBootstrapMinFillProb: 0.99 });
+    const asset = makeAsset('maker-optimizer-risk-token');
+    const signal = makeBootstrapSignal({ tokenId: asset.tokenId, side: 'sell', price: 0.58, expectedEdge: 0.04, confidence: 0.45 });
+    const logs = captureLogs(() => {
+      bot.trySignal(signal, asset, makeBootstrapBook({ bestBid: 0.50, bestAsk: 0.54 }));
+      bot.flushSophieMakerRecoveryCandidates();
+    });
+    assert(logs.some((line) => line.includes('[SOPHIE MAKER OPTIMIZER BLOCK]') && line.includes('risk_rejected')), 'RiskEngine rejection should be logged as optimizer block');
+    assert.strictEqual(bot.risk.lastBlockReason, 'no_available_position', 'optimized quote must still pass through RiskEngine');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0);
+  }
+
+  {
+    const bot = makeBot({ maxOpenOrders: 10 });
+    const signal = makeSignal({ tokenId: 'fillability-metrics-token' });
+    const order = addOpenOrder(bot, signal, 120_000);
+    bot.portfolio.recordExecutionEvent('order_admitted', signal, Date.now() - 50_000);
+    bot.portfolio.recordExecutionEvent('order_placed', signal, Date.now() - 49_000);
+    bot.portfolio.recordExecutionEvent('fill', { ...signal, timeToFillSec: 14, filledUsd: 3 }, Date.now() - 20_000);
+    bot.portfolio.recordExecutionEvent('order_expired_no_fill', signal, Date.now() - 10_000);
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.activePaperOrders, 1, 'execution health should expose active paper orders');
+    assert(health.oldestOpenOrderAgeSec >= 100, 'execution health should expose active order age');
+    assert(health.avgActiveOrderAgeSec >= 100, 'execution health should expose average active age');
+    assert.strictEqual(health.paperOrdersExpiredNoFillLastHour, 1);
+    assert.strictEqual(health.paperOrdersFilledLastHour, 1);
+    assert.strictEqual(health.noFillStreakMax, 1);
+    bot.portfolio.cancelOrder(order.id);
   }
 
   {
@@ -399,7 +539,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapMinFillProb: 0.80 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, sophieBootstrapMinFillProb: 0.80, paperMakerOptimizerEnabled: false });
     const asset = makeAsset('bootstrap-low-fill');
     queueAndFlush(bot, makeBootstrapSignal({ tokenId: asset.tokenId }), asset, makeBootstrapBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'bootstrap candidate should fail if fill probability is below floor');
@@ -407,7 +547,7 @@ function run() {
   }
 
   {
-    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70 });
+    const bot = makeBot({ maxOpenOrders: 10, sophieMinExecutionQuality: 0.70, paperMakerOptimizerEnabled: false });
     const asset = makeAsset('bootstrap-far-touch');
     queueAndFlush(bot, makeBootstrapSignal({ tokenId: asset.tokenId, price: 0.42 }), asset, makeBootstrapBook());
     assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'BLOCK_LOW_QUALITY', 'bootstrap candidate should fail if distance from touch is above max');

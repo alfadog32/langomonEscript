@@ -31,15 +31,31 @@ const CONFIG = {
   autoStartChild: envBool('BTC_ORACLE_AUTOSTART_CHILD', true),
   childRestartMs: envInt('BTC_ORACLE_CHILD_RESTART_MS', 5_000),
   staleTargetGraceMs: envInt('BTC_ORACLE_STALE_TARGET_GRACE_MS', 45_000),
+  heartbeatMs: envInt('BTC_ORACLE_RUNNER_HEALTH_MS', 30_000),
   logPrefix: envStr('BTC_ORACLE_RUNNER_LOG_PREFIX', '[BTC-AUTO]'),
+  externalSignalEventsPath: envStr('BTC_ORACLE_EXTERNAL_EVENTS_PATH', './external_signal_events.ndjson'),
+  externalSignalsPath: envStr('BTC_ORACLE_EXTERNAL_SIGNALS_JSON_PATH', './external_signals.json'),
+  tradeIntentPath: envStr('BTC_ORACLE_TRADE_INTENTS_PATH', './trade_intents.ndjson'),
+  sniperRoutePath: envStr('BTC_ORACLE_SNIPER_ROUTE_PATH', './sniper_route_requests.ndjson'),
+  autoLiveCandidatesPath: envStr('AUTO_LIVE_CANDIDATES_PATH', './auto_live_candidates.ndjson'),
+  writeTestEvent: envBool('BTC_ORACLE_WRITE_TEST_EVENT', false),
 };
 
 let activeKey = null;
 let activeTarget = null;
 let child = null;
 let childRestartTimer = null;
+let pendingTargetStart = null;
 let stopping = false;
 let cycleInFlight = false;
+let lastDiscoveryAt = 0;
+let lastPollAt = 0;
+let nextPollAt = 0;
+let lastBridgeStartAt = 0;
+let lastBridgeExitAt = 0;
+let bridgeRestartCount = 0;
+let lastBridgeRestartReason = 'none';
+const expectedStops = new Map();
 
 function loadDotEnvFile(filePath = path.join(process.cwd(), '.env')) {
   try {
@@ -105,6 +121,38 @@ function sleep(ms) {
 
 function safeMkdirForFile(filePath) {
   fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
+}
+
+function pathDiagnostics(filePath) {
+  const resolved = path.resolve(process.cwd(), filePath);
+  const root = path.resolve(process.cwd());
+  const dir = path.dirname(resolved);
+  const underProject = resolved === root || resolved.startsWith(`${root}${path.sep}`);
+  let directoryExists = false;
+  let directoryWritable = false;
+  let error = null;
+
+  try {
+    directoryExists = fs.existsSync(dir);
+    if (directoryExists) {
+      fs.accessSync(dir, fs.constants.W_OK);
+      directoryWritable = true;
+    }
+  } catch (err) {
+    error = err.message;
+  }
+
+  return { path: filePath, resolved, dir, directoryExists, directoryWritable, underProject, error };
+}
+
+function outputPathDiagnostics() {
+  return {
+    externalSignalEventsPath: pathDiagnostics(CONFIG.externalSignalEventsPath),
+    externalSignalsPath: pathDiagnostics(CONFIG.externalSignalsPath),
+    tradeIntentPath: pathDiagnostics(CONFIG.tradeIntentPath),
+    sniperRoutePath: pathDiagnostics(CONFIG.sniperRoutePath),
+    autoLiveCandidatesPath: pathDiagnostics(CONFIG.autoLiveCandidatesPath),
+  };
 }
 
 function atomicWriteJson(filePath, obj) {
@@ -344,23 +392,29 @@ function stopChild(reason = 'stopping') {
   clearTimeout(childRestartTimer);
   childRestartTimer = null;
 
-  if (!child || child.killed) return;
+  if (!child || child.exitCode !== null) return false;
 
   const oldChild = child;
-  child = null;
+  expectedStops.set(oldChild.pid, { reason, at: Date.now() });
 
   info(`Stopping bridge child pid=${oldChild.pid} reason=${reason}`);
-  oldChild.kill('SIGTERM');
+  try {
+    oldChild.kill('SIGTERM');
+  } catch (err) {
+    warn(`Failed to signal bridge child pid=${oldChild.pid}: ${err.message}`);
+  }
 
   setTimeout(() => {
-    if (!oldChild.killed) {
+    if (oldChild.exitCode === null && oldChild.signalCode === null) {
       try {
         oldChild.kill('SIGKILL');
+        warn(`Force killed bridge child pid=${oldChild.pid} after SIGTERM grace`);
       } catch (_) {
         // ignored
       }
     }
   }, 5_000).unref?.();
+  return true;
 }
 
 function startChildForTarget(targetDoc) {
@@ -380,7 +434,14 @@ function startChildForTarget(targetDoc) {
     return;
   }
 
-  stopChild('new target or restart');
+  if (child && child.exitCode === null) {
+    pendingTargetStart = targetDoc;
+    stopChild('new target or restart');
+    info(`Deferring bridge start until previous child exits nextSlug=${targetDoc.target.slug}`);
+    return;
+  }
+
+  pendingTargetStart = null;
 
   const env = {
     ...process.env,
@@ -397,14 +458,32 @@ function startChildForTarget(targetDoc) {
     stdio: 'inherit',
   });
 
+  lastBridgeStartAt = Date.now();
+  bridgeRestartCount += 1;
+  lastBridgeRestartReason = 'new target or restart';
   info(`Started bridge child pid=${child.pid} slug=${targetDoc.target.slug} up=${shortId(targetDoc.target.BTC_UP_TOKEN_ID)} down=${shortId(targetDoc.target.BTC_DOWN_TOKEN_ID)}`);
 
+  const startedAt = lastBridgeStartAt;
+  const slug = targetDoc.target.slug;
+  const pid = child.pid;
   child.on('exit', (code, signal) => {
-    const exitedPid = child?.pid;
-    child = null;
-    info(`Bridge child exited pid=${exitedPid ?? 'unknown'} code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+    const uptimeSec = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+    const expected = expectedStops.get(pid) || null;
+    expectedStops.delete(pid);
+    lastBridgeExitAt = Date.now();
+    if (child?.pid === pid) child = null;
+    info(`[BTC-AUTO BRIDGE EXIT] pid=${pid} code=${code ?? 'null'} signal=${signal ?? 'null'} uptimeSec=${uptimeSec} expected=${Boolean(expected)} reason=${expected?.reason || 'unexpected_exit'}`);
+    if (code === 0 && uptimeSec < 10) {
+      warn(`[BTC-AUTO BRIDGE SHORT EXIT] pid=${pid} code=0 uptimeSec=${uptimeSec} slug=${slug} note=bridge exited too quickly after start`);
+    }
 
     if (stopping || !activeTarget || !CONFIG.autoStartChild) return;
+    if (pendingTargetStart) {
+      const nextTarget = pendingTargetStart;
+      pendingTargetStart = null;
+      startChildForTarget(nextTarget);
+      return;
+    }
     if (targetIsStale(activeTarget)) {
       info('Not restarting bridge child because target is stale/expired');
       return;
@@ -412,6 +491,7 @@ function startChildForTarget(targetDoc) {
 
     clearTimeout(childRestartTimer);
     childRestartTimer = setTimeout(() => {
+      lastBridgeRestartReason = 'unexpected child exit';
       if (!stopping && activeTarget && !child) startChildForTarget(activeTarget);
     }, CONFIG.childRestartMs);
   });
@@ -433,9 +513,12 @@ function targetIsStale(targetDoc) {
 async function cycle() {
   if (cycleInFlight) return;
   cycleInFlight = true;
+  lastPollAt = Date.now();
+  nextPollAt = lastPollAt + Math.max(5_000, CONFIG.pollMs);
 
   try {
     const discovered = await discoverTarget();
+    lastDiscoveryAt = Date.now();
 
     if (discovered.note !== 'target-found') {
       atomicWriteJson(CONFIG.targetPath, discovered);
@@ -470,33 +553,99 @@ async function cycle() {
   }
 }
 
+function bridgeAlive() {
+  return Boolean(child && !child.killed && child.exitCode === null);
+}
+
+function heartbeat() {
+  const now = Date.now();
+  const targetTs = Number(activeTarget?.target?.ts);
+  const targetAgeSec = Number.isFinite(targetTs) ? Math.max(0, Math.round((now - targetTs * 1000) / 1000)) : null;
+  const bridgeUptimeSec = bridgeAlive() && lastBridgeStartAt ? Math.max(0, Math.round((now - lastBridgeStartAt) / 1000)) : 0;
+  info(
+    `[BTC-AUTO HEALTH] currentSlug=${activeTarget?.target?.slug || 'none'} ` +
+    `upToken=${shortId(activeTarget?.target?.BTC_UP_TOKEN_ID)} downToken=${shortId(activeTarget?.target?.BTC_DOWN_TOKEN_ID)} ` +
+    `bridgePid=${child?.pid || 'none'} bridgeAlive=${bridgeAlive()} targetAgeSec=${targetAgeSec ?? 'NA'} ` +
+    `lastDiscoveryAgeSec=${lastDiscoveryAt ? Math.round((now - lastDiscoveryAt) / 1000) : 'NA'} ` +
+    `pollMs=${CONFIG.pollMs} bridgeRestartCount=${bridgeRestartCount} lastBridgeRestartReason=${lastBridgeRestartReason} ` +
+    `lastBridgeExitAgeSec=${lastBridgeExitAt ? Math.round((now - lastBridgeExitAt) / 1000) : 'NA'} ` +
+    `bridgeUptimeSec=${bridgeUptimeSec} nextPollDueSec=${nextPollAt ? Math.max(0, Math.round((nextPollAt - now) / 1000)) : 'NA'}`
+  );
+}
+
+function printDoctor() {
+  const bridge = bridgeAbsPath();
+  const report = {
+    mode: 'doctor',
+    cwd: process.cwd(),
+    config: {
+      gammaBaseUrl: CONFIG.gammaBaseUrl,
+      slugPrefix: CONFIG.slugPrefix,
+      intervalMs: CONFIG.intervalMs,
+      pollMs: CONFIG.pollMs,
+      autoStartChild: CONFIG.autoStartChild,
+      writeTestEvent: CONFIG.writeTestEvent,
+    },
+    bridge: {
+      path: bridge,
+      exists: fs.existsSync(bridge),
+    },
+    target: pathDiagnostics(CONFIG.targetPath),
+    outputPaths: outputPathDiagnostics(),
+    networkConnectionsStarted: false,
+    bridgeStarted: false,
+    filesWritten: false,
+    tradingEnabled: false,
+  };
+  console.log(JSON.stringify(report, null, 2));
+}
+
 function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   info(`Received ${signal}; shutting down runner`);
   clearTimeout(childRestartTimer);
+  pendingTargetStart = null;
   stopChild(`runner ${signal}`);
   setTimeout(() => process.exit(0), 500).unref?.();
 }
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException', (err) => {
-  error(`Uncaught exception: ${err.stack || err.message}`);
-});
-process.on('unhandledRejection', (err) => {
-  error(`Unhandled rejection: ${err?.stack || err?.message || err}`);
-});
-
 async function main() {
+  if (process.argv[2] === 'doctor') {
+    printDoctor();
+    return;
+  }
+
   info('Starting BTC oracle auto-discovery runner');
   info(`cwd=${process.cwd()} bridge=${bridgeAbsPath()} pollMs=${CONFIG.pollMs}`);
+  info(`outputs externalEvents=${path.resolve(CONFIG.externalSignalEventsPath)} externalSignals=${path.resolve(CONFIG.externalSignalsPath)} tradeIntents=${path.resolve(CONFIG.tradeIntentPath)} sniperRoute=${path.resolve(CONFIG.sniperRoutePath)}`);
 
   await cycle();
   setInterval(cycle, Math.max(5_000, CONFIG.pollMs));
+  setInterval(heartbeat, Math.max(5_000, CONFIG.heartbeatMs));
 }
 
-main().catch((err) => {
-  error(`Fatal start error: ${err.stack || err.message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('uncaughtException', (err) => {
+    error(`Uncaught exception: ${err.stack || err.message}`);
+  });
+  process.on('unhandledRejection', (err) => {
+    error(`Unhandled rejection: ${err?.stack || err?.message || err}`);
+  });
+
+  main().catch((err) => {
+    error(`Fatal start error: ${err.stack || err.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = {
+  CONFIG,
+  buildCandidateSlugs,
+  extractTokens,
+  pathDiagnostics,
+  outputPathDiagnostics,
+  printDoctor,
+};

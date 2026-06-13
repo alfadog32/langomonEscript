@@ -60,6 +60,12 @@ function envInt(key, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function envBool(key, fallback) {
+  const raw = process.env[key];
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  return ['1', 'true', 'yes', 'y', 'on'].includes(String(raw).trim().toLowerCase());
+}
+
 const CONFIG = {
   binanceWs: envStr('BTC_ORACLE_BINANCE_WS', 'wss://stream.binance.com:9443/ws/btcusdt@trade'),
   clobWs: envStr('POLYMARKET_CLOB_WS', 'wss://ws-subscriptions-clob.polymarket.com/ws/market'),
@@ -67,8 +73,17 @@ const CONFIG = {
   upTokenId: envStr('BTC_UP_TOKEN_ID', ''),
   downTokenId: envStr('BTC_DOWN_TOKEN_ID', ''),
 
-  signalPath: envStr('BTC_ORACLE_SIGNAL_PATH', './external_signals.json'),
-  signalLogPath: envStr('BTC_ORACLE_SIGNAL_LOG_PATH', './external_signal_events.ndjson'),
+  signalPath: envStr('BTC_ORACLE_EXTERNAL_SIGNALS_JSON_PATH', envStr('BTC_ORACLE_SIGNAL_PATH', './external_signals.json')),
+  signalLogPath: envStr('BTC_ORACLE_EXTERNAL_EVENTS_PATH', envStr('BTC_ORACLE_SIGNAL_LOG_PATH', './external_signal_events.ndjson')),
+  tradeIntentPath: envStr('BTC_ORACLE_TRADE_INTENTS_PATH', './trade_intents.ndjson'),
+  sniperRoutePath: envStr('BTC_ORACLE_SNIPER_ROUTE_PATH', './sniper_route_requests.ndjson'),
+  autoLiveCandidatesPath: envStr('AUTO_LIVE_CANDIDATES_PATH', './auto_live_candidates.ndjson'),
+  writeTestEvent: envBool('BTC_ORACLE_WRITE_TEST_EVENT', false),
+  heartbeatMs: envInt('BTC_ORACLE_HEALTH_MS', 30_000),
+  noSignalLogCooldownMs: envInt('BTC_ORACLE_NO_SIGNAL_LOG_COOLDOWN_MS', 10_000),
+  reconnectBaseMs: envInt('BTC_ORACLE_RECONNECT_BASE_MS', 5_000),
+  reconnectMaxMs: envInt('BTC_ORACLE_RECONNECT_MAX_MS', 60_000),
+  reconnectJitterMs: envInt('BTC_ORACLE_RECONNECT_JITTER_MS', 2_000),
 
   triggerThreshold: envNum('BTC_ORACLE_THRESHOLD', 0.003),
   triggerWindowMs: envInt('BTC_ORACLE_TRIGGER_WINDOW_MS', 1000),
@@ -101,6 +116,21 @@ let lastSignalAt = 0;
 let polyWs = null;
 let binanceWs = null;
 let stopping = false;
+const stats = {
+  btcConnected: false,
+  polyConnected: false,
+  lastBtcTradeAt: 0,
+  lastPolyBookAt: 0,
+  currentBtcPrice: null,
+  signalsGenerated: 0,
+  signalsWritten: 0,
+  signalsDropped: 0,
+  lastSignalAt: 0,
+  lastSignalDirection: 'none',
+  lastNoSignalReason: 'startup',
+  lastNoSignalLoggedAt: new Map(),
+  reconnectAttempts: { poly: 0, binance: 0 },
+};
 
 function nowIso() {
   return new Date().toISOString();
@@ -124,6 +154,36 @@ function shortId(id) {
 function safeMkdirForFile(filePath) {
   const dir = path.dirname(path.resolve(filePath));
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function pathDiagnostics(filePath) {
+  const resolved = path.resolve(process.cwd(), filePath);
+  const root = path.resolve(process.cwd());
+  const dir = path.dirname(resolved);
+  const underProject = resolved === root || resolved.startsWith(`${root}${path.sep}`);
+  let directoryExists = false;
+  let directoryWritable = false;
+  let error = null;
+  try {
+    directoryExists = fs.existsSync(dir);
+    if (directoryExists) {
+      fs.accessSync(dir, fs.constants.W_OK);
+      directoryWritable = true;
+    }
+  } catch (err) {
+    error = err.message;
+  }
+  return { path: filePath, resolved, dir, directoryExists, directoryWritable, underProject, error };
+}
+
+function verifyOutputPaths() {
+  return {
+    externalSignalEventsPath: pathDiagnostics(CONFIG.signalLogPath),
+    externalSignalsPath: pathDiagnostics(CONFIG.signalPath),
+    tradeIntentPath: pathDiagnostics(CONFIG.tradeIntentPath),
+    sniperRoutePath: pathDiagnostics(CONFIG.sniperRoutePath),
+    autoLiveCandidatesPath: pathDiagnostics(CONFIG.autoLiveCandidatesPath),
+  };
 }
 
 function atomicWriteJson(filePath, obj) {
@@ -249,6 +309,64 @@ function tokenForDirection(direction) {
   return direction === 'UP' ? CONFIG.upTokenId : CONFIG.downTokenId;
 }
 
+function logNoSignal(reason, details = {}) {
+  stats.lastNoSignalReason = reason;
+  const now = Date.now();
+  const last = stats.lastNoSignalLoggedAt.get(reason) || 0;
+  if (now - last < CONFIG.noSignalLogCooldownMs) return;
+  stats.lastNoSignalLoggedAt.set(reason, now);
+  const fields = Object.entries(details)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(' ');
+  console.log(`${nowIso()} [ORACLE NO SIGNAL] reason=${reason}${fields ? ` ${fields}` : ''}`);
+}
+
+function reconnectDelayMs(name) {
+  const attempts = Math.max(0, Number(stats.reconnectAttempts[name] || 0));
+  const base = Math.max(1_000, CONFIG.reconnectBaseMs);
+  const max = Math.max(base, CONFIG.reconnectMaxMs);
+  const jitter = Math.floor(Math.random() * Math.max(0, CONFIG.reconnectJitterMs));
+  return Math.min(max, base * (2 ** attempts)) + jitter;
+}
+
+function scheduleReconnect(name, connectFn, code, reasonBuffer) {
+  if (stopping) return;
+  const reason = reasonBuffer ? reasonBuffer.toString() : '';
+  const delayMs = reconnectDelayMs(name);
+  stats.reconnectAttempts[name] = Math.min(8, Number(stats.reconnectAttempts[name] || 0) + 1);
+  console.warn(
+    `[${name.toUpperCase()}] WebSocket closed code=${code ?? 'NA'} reason=${reason || 'none'} ` +
+    `reconnectAttempt=${stats.reconnectAttempts[name]} reconnectInMs=${delayMs}`
+  );
+  setTimeout(() => {
+    if (!stopping) connectFn();
+  }, delayMs);
+}
+
+function healthLine() {
+  const now = Date.now();
+  const upBook = snapshotBook(CONFIG.upTokenId);
+  const downBook = snapshotBook(CONFIG.downTokenId);
+  const first = tradeHistory[0] || null;
+  const latest = tradeHistory[tradeHistory.length - 1] || null;
+  const btcMovePct = first && latest ? Math.abs(pctMove(first.price, latest.price)) : 0;
+  console.log(
+    `${nowIso()} [ORACLE HEALTH] btcConnected=${stats.btcConnected} polyConnected=${stats.polyConnected} ` +
+    `btcLastTradeAgeMs=${stats.lastBtcTradeAt ? now - stats.lastBtcTradeAt : 'NA'} ` +
+    `polyLastBookAgeMs=${stats.lastPolyBookAt ? now - stats.lastPolyBookAt : 'NA'} ` +
+    `upBookValid=${upBook.valid} upBookReason=${upBook.reason} downBookValid=${downBook.valid} downBookReason=${downBook.reason} ` +
+    `upBookAgeMs=${upBook.ageMs === Infinity ? 'NA' : upBook.ageMs} downBookAgeMs=${downBook.ageMs === Infinity ? 'NA' : downBook.ageMs} ` +
+    `upSpread=${upBook.spread ?? 'NA'} downSpread=${downBook.spread ?? 'NA'} ` +
+    `upDepth=${Number(upBook.askDepth || 0).toFixed(2)} downDepth=${Number(downBook.askDepth || 0).toFixed(2)} ` +
+    `upObi=${Number(upBook.obi || 0).toFixed(4)} downObi=${Number(downBook.obi || 0).toFixed(4)} ` +
+    `currentBtcPrice=${stats.currentBtcPrice ?? 'NA'} btcMovePct=${btcMovePct.toFixed(6)} ` +
+    `lastSignalAgeSec=${stats.lastSignalAt ? Math.round((now - stats.lastSignalAt) / 1000) : 'NA'} ` +
+    `lastSignalDirection=${stats.lastSignalDirection} signalsGenerated=${stats.signalsGenerated} signalsWritten=${stats.signalsWritten} ` +
+    `signalsDropped=${stats.signalsDropped} lastNoSignalReason=${stats.lastNoSignalReason}`
+  );
+}
+
 function subscribePolymarket(ws) {
   const assets = [CONFIG.upTokenId, CONFIG.downTokenId].filter(Boolean);
 
@@ -270,6 +388,8 @@ function connectPolymarket() {
   polyWs = new WebSocket(CONFIG.clobWs);
 
   polyWs.on('open', () => {
+    stats.polyConnected = true;
+    stats.reconnectAttempts.poly = 0;
     console.log('[POLY] WebSocket connected.');
     subscribePolymarket(polyWs);
   });
@@ -290,6 +410,7 @@ function connectPolymarket() {
           asks: item.asks || [],
           updatedAt: Date.now(),
         });
+        stats.lastPolyBookAt = Date.now();
       }
     } catch (e) {
       console.warn(`[POLY] Bad message: ${e.message}`);
@@ -300,10 +421,9 @@ function connectPolymarket() {
     console.warn(`[POLY] WebSocket error: ${e.message}`);
   });
 
-  polyWs.on('close', () => {
-    if (stopping) return;
-    console.warn('[POLY] WebSocket closed. Reconnecting in 5s...');
-    setTimeout(connectPolymarket, 5000);
+  polyWs.on('close', (code, reason) => {
+    stats.polyConnected = false;
+    scheduleReconnect('poly', connectPolymarket, code, reason);
   });
 }
 
@@ -316,7 +436,7 @@ function directionObiConfirmed(direction, finalBook) {
   return direction === 'UP' || direction === 'DOWN';
 }
 
-function emitSignal({ impulse, latest, persistedAbsMove, finalBook }) {
+function createSignalPayload({ impulse, latest, persistedAbsMove, finalBook }) {
   const polyMidMovePct =
     impulse.initialBook.valid &&
     finalBook.valid &&
@@ -335,7 +455,7 @@ function emitSignal({ impulse, latest, persistedAbsMove, finalBook }) {
 
   const hardInterrupt = polyLagConfirmed && lagScorePass && obiConfirmed;
 
-  const signal = {
+  return {
     timestamp: nowIso(),
     expires_at: new Date(Date.now() + CONFIG.signalTtlMs).toISOString(),
 
@@ -394,7 +514,7 @@ function emitSignal({ impulse, latest, persistedAbsMove, finalBook }) {
     obi_confirmed: obiConfirmed,
     confidence: Math.max(0.35, Math.min(0.95, 0.50 + lagScore * 60 + (polyLagConfirmed ? 0.10 : 0) + (obiConfirmed ? 0.10 : 0))),
     suggested_max_paper_usd: CONFIG.suggestedMaxPaperUsd,
-    action: hardInterrupt ? 'TELEGRAM_HARD_INTERRUPT_REQUEST' : 'TELEGRAM_ALERT_ONLY',
+    action: 'TELEGRAM_ALERT_ONLY',
 
     safety: {
       do_not_auto_trade: true,
@@ -404,12 +524,35 @@ function emitSignal({ impulse, latest, persistedAbsMove, finalBook }) {
       do_not_sweep_without_depth_check: true,
     },
   };
+}
+
+function writeSignal(signal) {
+  if (!signal?.token_id) {
+    stats.signalsDropped += 1;
+    console.warn(`${nowIso()} [ORACLE SIGNAL DROP] reason=missing_token direction=${signal?.direction || 'unknown'} confidence=${signal?.confidence ?? 'NA'} token=none`);
+    return false;
+  }
 
   atomicWriteJson(CONFIG.signalPath, signal);
   appendNdjson(CONFIG.signalLogPath, signal);
   emitStdout(signal);
+  stats.signalsWritten += 1;
+  console.log(
+    `${nowIso()} [ORACLE SIGNAL WRITTEN] direction=${signal.direction} token=${shortId(signal.token_id)} ` +
+    `confidence=${Number(signal.confidence || 0).toFixed(3)} action=${signal.action} path=${path.resolve(CONFIG.signalLogPath)} expiresAt=${signal.expires_at}`
+  );
+  return true;
+}
+
+function emitSignal({ impulse, latest, persistedAbsMove, finalBook }) {
+  const signal = createSignalPayload({ impulse, latest, persistedAbsMove, finalBook });
+  stats.signalsGenerated += 1;
+
+  if (!writeSignal(signal)) return;
 
   lastSignalAt = Date.now();
+  stats.lastSignalAt = lastSignalAt;
+  stats.lastSignalDirection = signal.direction;
 
   console.log(
     `[ORACLE] ${signal.interrupt_level} ${signal.direction} ` +
@@ -445,6 +588,12 @@ function startPersistenceCheck(candidate) {
         persisted_direction: persistedDirection,
       };
       appendNdjson(CONFIG.signalLogPath, rejected);
+      logNoSignal('persistence_not_met', {
+        persistedMs: CONFIG.persistenceMs,
+        requiredMs: CONFIG.persistenceMs,
+        btcMovePct: persistedAbs.toFixed(6),
+        threshold: CONFIG.persistenceMinPct,
+      });
       console.log(
         `[ORACLE] Rejected ${impulse.direction}: persistence failed. ` +
         `trigger=${fmtPct(impulse.triggerMovePct)} persisted=${fmtPct(persistedAbs)}`
@@ -453,6 +602,14 @@ function startPersistenceCheck(candidate) {
     }
 
     const finalBook = snapshotBook(impulse.tokenId);
+    if (!finalBook.valid) {
+      logNoSignal('poly_book_invalid', {
+        upReason: snapshotBook(CONFIG.upTokenId).reason,
+        downReason: snapshotBook(CONFIG.downTokenId).reason,
+      });
+    } else if (!directionObiConfirmed(impulse.direction, finalBook)) {
+      logNoSignal('obi_not_confirmed', { obi: finalBook.obi.toFixed(4), threshold: CONFIG.obiThreshold });
+    }
     emitSignal({ impulse, latest, persistedAbsMove: persistedAbs, finalBook });
   }, CONFIG.persistenceMs);
 }
@@ -467,23 +624,40 @@ function handleBinanceTrade(raw) {
   const now = Date.now();
   tradeHistory.push({ price, ts, receivedAt: now });
   tradeHistory = tradeHistory.filter((t) => t.ts > ts - CONFIG.lookbackWindowMs);
+  stats.lastBtcTradeAt = now;
+  stats.currentBtcPrice = price;
 
-  if (pendingImpulse) return;
-  if (now - lastSignalAt < CONFIG.cooldownMs) return;
+  if (pendingImpulse) {
+    logNoSignal('persistence_not_met', { persistedMs: now - pendingImpulse.triggerTs, requiredMs: CONFIG.persistenceMs });
+    return;
+  }
+  if (now - lastSignalAt < CONFIG.cooldownMs) {
+    logNoSignal('cooldown_active', { cooldownMs: CONFIG.cooldownMs });
+    return;
+  }
 
   const windowStart = ts - CONFIG.triggerWindowMs;
   const windowTrades = tradeHistory.filter((t) => t.ts >= windowStart);
-  if (windowTrades.length < 2) return;
+  if (windowTrades.length < 2) {
+    logNoSignal('waiting_for_book', { btcConnected: stats.btcConnected, polyConnected: stats.polyConnected });
+    return;
+  }
 
   const initial = windowTrades[0];
   const signedMove = pctMove(initial.price, price);
   const absMove = Math.abs(signedMove);
 
-  if (absMove < CONFIG.triggerThreshold) return;
+  if (absMove < CONFIG.triggerThreshold) {
+    logNoSignal('btc_move_below_threshold', { btcMovePct: absMove.toFixed(6), threshold: CONFIG.triggerThreshold });
+    return;
+  }
 
   const direction = signedMove > 0 ? 'UP' : 'DOWN';
   const tokenId = tokenForDirection(direction);
   const initialBook = snapshotBook(tokenId);
+  if (!initialBook.valid) {
+    logNoSignal('waiting_for_book', { btcConnected: stats.btcConnected, polyConnected: stats.polyConnected });
+  }
 
   console.log(
     `[ORACLE] Candidate ${direction}: ${fmtPct(absMove)} over ${ts - initial.ts}ms. ` +
@@ -505,6 +679,8 @@ function connectBinance() {
   binanceWs = new WebSocket(CONFIG.binanceWs);
 
   binanceWs.on('open', () => {
+    stats.btcConnected = true;
+    stats.reconnectAttempts.binance = 0;
     console.log(`[BINANCE] Connected: ${CONFIG.binanceWs}`);
   });
 
@@ -520,32 +696,53 @@ function connectBinance() {
     console.warn(`[BINANCE] WebSocket error: ${e.message}`);
   });
 
-  binanceWs.on('close', () => {
-    if (stopping) return;
-    console.warn('[BINANCE] WebSocket closed. Reconnecting in 5s...');
-    setTimeout(connectBinance, 5000);
+  binanceWs.on('close', (code, reason) => {
+    stats.btcConnected = false;
+    scheduleReconnect('binance', connectBinance, code, reason);
   });
 }
 
-process.on('SIGINT', () => {
+function shutdown() {
   stopping = true;
   try { binanceWs?.close(); } catch (_) {}
   try { polyWs?.close(); } catch (_) {}
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  stopping = true;
-  try { binanceWs?.close(); } catch (_) {}
-  try { polyWs?.close(); } catch (_) {}
-  process.exit(0);
-});
+function logStartup() {
+  console.log('[ORACLE] BTC + Polymarket OBI Hub v5 Online.');
+  console.log(`[ORACLE] BTC threshold=${fmtPct(CONFIG.triggerThreshold)} persistence=${CONFIG.persistenceMs}ms minPersist=${fmtPct(CONFIG.persistenceMinPct)}`);
+  console.log(`[ORACLE] Poly lag rule: polyMove <= btcMove * ${CONFIG.polyMoveWeight}`);
+  console.log(`[ORACLE] OBI threshold=${CONFIG.obiThreshold} minDepth=$${CONFIG.minDepthUsd} execDepth=$${CONFIG.execDepthUsd} maxSpread=$${CONFIG.maxSpread}`);
+  console.log(`[ORACLE] UP token=${shortId(CONFIG.upTokenId)} DOWN token=${shortId(CONFIG.downTokenId)}`);
+  console.log(
+    `[ORACLE OUTPUT] externalSignalEventsPath=${path.resolve(CONFIG.signalLogPath)} ` +
+    `externalSignalsPath=${path.resolve(CONFIG.signalPath)} tradeIntentPath=${path.resolve(CONFIG.tradeIntentPath)} ` +
+    `sniperRoutePath=${path.resolve(CONFIG.sniperRoutePath)} autoLiveCandidatesPath=${path.resolve(CONFIG.autoLiveCandidatesPath)}`
+  );
+  for (const [name, diag] of Object.entries(verifyOutputPaths())) {
+    console.log(`[ORACLE OUTPUT CHECK] ${name} dir=${diag.dir} exists=${diag.directoryExists} writable=${diag.directoryWritable} underProject=${diag.underProject} writeTestEnabled=${CONFIG.writeTestEvent}`);
+  }
+}
 
-console.log('[ORACLE] BTC + Polymarket OBI Hub v5 Online.');
-console.log(`[ORACLE] BTC threshold=${fmtPct(CONFIG.triggerThreshold)} persistence=${CONFIG.persistenceMs}ms minPersist=${fmtPct(CONFIG.persistenceMinPct)}`);
-console.log(`[ORACLE] Poly lag rule: polyMove <= btcMove * ${CONFIG.polyMoveWeight}`);
-console.log(`[ORACLE] OBI threshold=${CONFIG.obiThreshold} minDepth=$${CONFIG.minDepthUsd} execDepth=$${CONFIG.execDepthUsd} maxSpread=$${CONFIG.maxSpread}`);
-console.log(`[ORACLE] UP token=${shortId(CONFIG.upTokenId)} DOWN token=${shortId(CONFIG.downTokenId)}`);
+function main() {
+  logStartup();
+  connectPolymarket();
+  connectBinance();
+  setInterval(healthLine, Math.max(5_000, CONFIG.heartbeatMs));
+}
 
-connectPolymarket();
-connectBinance();
+if (require.main === module) {
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  main();
+}
+
+module.exports = {
+  CONFIG,
+  snapshotBook,
+  createSignalPayload,
+  verifyOutputPaths,
+  pathDiagnostics,
+  stats,
+};
