@@ -266,6 +266,8 @@ const CONFIG = {
   wsDebounceMs: envInt('WS_DEBOUNCE_MS', 250),
   reportEveryCycles: envInt('REPORT_EVERY_CYCLES', 3),
   nonBlockingResearchRefresh: envBool('NON_BLOCKING_RESEARCH_REFRESH', true),
+  researchRefreshTimeoutMs: envInt('RESEARCH_REFRESH_TIMEOUT_MS', 60_000),
+  researchStuckResetMs: envInt('RESEARCH_STUCK_RESET_MS', 90_000),
 
   historyLookback: envInt('HISTORY_LOOKBACK', 30),
   volatilityTripPct: envNum('VOL_TRIP_PCT', 12),
@@ -3473,6 +3475,9 @@ class BotEngine {
     this.cycle = 0;
     this.wsClient = null;
     this.researchInFlight = null;
+    this.researchInFlightStartedAt = 0;
+    this.researchRefreshToken = 0;
+    this.researchRefreshTimedOut = false;
     this.autoLiveCandidateLastWritten = new Map();
     this.dustExitLastLogged = new Map();
     this.lastDustExitSuppressed = null;
@@ -3531,14 +3536,78 @@ class BotEngine {
     }
   }
 
-  async refreshResearch() {
-    info('[RESEARCH REFRESH START]');
-    const selected = await this.research.discoverCandidates();
-    this.assets = selected;
-    info(`[RESEARCH REFRESH COMPLETE] selected=${selected.length}`);
+  researchRefreshAgeMs(now = Date.now()) {
+    if (!this.researchInFlight || !this.researchInFlightStartedAt) return 0;
+    return Math.max(0, now - this.researchInFlightStartedAt);
+  }
 
-    if (this.wsClient && this.assets.length > 0) {
-      this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
+  recoverStuckResearchRefresh(now = Date.now()) {
+    if (!this.researchInFlight) return false;
+
+    const ageMs = this.researchRefreshAgeMs(now);
+    const timeoutMs = Math.max(1, Number(this.config.researchRefreshTimeoutMs || 60_000));
+    const stuckResetMs = Math.max(1, Number(this.config.researchStuckResetMs || 90_000));
+    const resetMs = Math.min(timeoutMs, stuckResetMs);
+    if (ageMs < resetMs) return false;
+
+    warn(`[RESEARCH REFRESH TIMEOUT] ageMs=${Math.round(ageMs)} timeoutMs=${timeoutMs} stuckResetMs=${stuckResetMs}`);
+    this.researchRefreshToken += 1;
+    this.researchInFlight = null;
+    this.researchInFlightStartedAt = 0;
+    this.researchRefreshTimedOut = true;
+    warn('[RESEARCH REFRESH UNSTUCK]');
+    return true;
+  }
+
+  async runResearchRefresh({ background = false, token = null } = {}) {
+    info(background ? '[RESEARCH REFRESH START] background=true' : '[RESEARCH REFRESH START]');
+    try {
+      const selected = await this.research.discoverCandidates();
+      if (token === null || token === this.researchRefreshToken) {
+        this.assets = selected;
+        if (this.wsClient && this.assets.length > 0) {
+          this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
+        }
+        info(`[RESEARCH REFRESH COMPLETE] selected=${selected.length}`);
+      }
+      return selected;
+    } catch (e) {
+      warn(`[RESEARCH REFRESH FAILED] ${e.stack || e.message}`);
+      throw e;
+    }
+  }
+
+  async refreshResearch() {
+    const token = ++this.researchRefreshToken;
+    this.researchInFlight = Promise.resolve();
+    this.researchInFlightStartedAt = Date.now();
+    this.researchRefreshTimedOut = false;
+    const timeoutMs = Math.max(1, Number(this.config.researchRefreshTimeoutMs || 60_000));
+    let timeoutId = null;
+    const timeout = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        if (token !== this.researchRefreshToken) {
+          resolve(null);
+          return;
+        }
+        const ageMs = this.researchRefreshAgeMs();
+        warn(`[RESEARCH REFRESH TIMEOUT] ageMs=${Math.round(ageMs)} timeoutMs=${timeoutMs} stuckResetMs=${Math.max(1, Number(this.config.researchStuckResetMs || 90_000))}`);
+        this.researchRefreshToken += 1;
+        this.researchInFlight = null;
+        this.researchInFlightStartedAt = 0;
+        this.researchRefreshTimedOut = true;
+        warn('[RESEARCH REFRESH UNSTUCK]');
+        resolve(null);
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([this.runResearchRefresh({ token }), timeout]);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (token === this.researchRefreshToken) {
+        this.researchInFlight = null;
+        this.researchInFlightStartedAt = 0;
+      }
     }
   }
 
@@ -3547,27 +3616,28 @@ class BotEngine {
       return this.refreshResearch();
     }
 
+    this.recoverStuckResearchRefresh();
+
     if (this.researchInFlight) {
       info('[RESEARCH REFRESH SKIPPED already running]');
       return this.researchInFlight;
     }
 
-    info('[RESEARCH REFRESH START] background=true');
-    this.researchInFlight = this.research.discoverCandidates()
-      .then((selected) => {
-        this.assets = selected;
-        if (this.wsClient && this.assets.length > 0) {
-          this.wsClient.subscribe(this.assets.map((a) => a.tokenId));
-        }
-        info(`[RESEARCH REFRESH COMPLETE] selected=${selected.length}`);
-      })
+    const token = ++this.researchRefreshToken;
+    this.researchInFlightStartedAt = Date.now();
+    this.researchRefreshTimedOut = false;
+    const promise = this.runResearchRefresh({ background: true, token })
       .catch((e) => {
-        warn(`[RESEARCH REFRESH FAILED] ${e.stack || e.message}`);
+        return null;
       })
       .finally(() => {
-        this.researchInFlight = null;
+        if (token === this.researchRefreshToken && this.researchInFlight === promise) {
+          this.researchInFlight = null;
+          this.researchInFlightStartedAt = 0;
+        }
       });
 
+    this.researchInFlight = promise;
     return this.researchInFlight;
   }
 
