@@ -1,0 +1,103 @@
+{
+  "strategyName": "GabagoolBtcOracleStrategy",
+  "generatedAt": "2026-06-15T07:33:14.791Z",
+  "source": {
+    "username": "gabagool22",
+    "expectedProxyWallet": "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d",
+    "resolvedProxyWallet": "0x6031b6eed1c97e853c6e0f03ad3ce3529351f96d",
+    "resolvedName": "gabagool22",
+    "resolvedPseudonym": "Grown-Cantaloupe",
+    "usernameMatched": true,
+    "walletMatched": true,
+    "warnings": [],
+    "profileEndpoint": "https://gamma-api.polymarket.com/public-profile",
+    "activityEndpoint": "https://data-api.polymarket.com/activity",
+    "closedPositionsEndpoint": "https://data-api.polymarket.com/closed-positions"
+  },
+  "diagnostics": {
+    "lookbackTradesRequested": 500,
+    "tradesFetched": 500,
+    "closedPositionsFetched": 50,
+    "btcTrades": 312,
+    "btcFiveMinuteTrades": 95,
+    "avgEntryPrice": 0.467684,
+    "medianEntryPrice": 0.43,
+    "avgExitPrice": null,
+    "inferredAvgExitPrice": 0.444444,
+    "avgHoldSeconds": 75,
+    "medianHoldSeconds": 94,
+    "avgSizeUsd": 3.257485,
+    "medianSizeUsd": 3.12,
+    "winLossProxy": {
+      "wins": 4,
+      "losses": 5,
+      "winRate": 0.444444,
+      "basis": "closed_positions_realized_pnl_on_btc_5m"
+    },
+    "repeatedSameTokenCycleCount": 89,
+    "sameMarketBothSidesCount": 3,
+    "mostCommonEntryWindow": "early",
+    "mostCommonExitTrigger": "near_expiry_or_resolution_inferred",
+    "observedSellBehavior": "no_public_sell_activity",
+    "entryWindowCounts": {
+      "early": 70,
+      "mid": 14,
+      "late": 11,
+      "unknown": 0
+    },
+    "outcomeCounts": {
+      "Up": 51,
+      "Down": 44
+    }
+  },
+  "strategyProfile": {
+    "marketType": "btc_updown_5m",
+    "preferCurrentTargetMarket": true,
+    "requireFreshOracleSignal": true,
+    "requireLagConfirmed": true,
+    "requireBookValidity": true,
+    "allowSameMarketRepeats": true,
+    "allowSideSwitch": true,
+    "directionalBias": "none",
+    "priceStyle": {
+      "entry": "aggressive_touch",
+      "buyPriceSource": "bestAsk",
+      "sellPriceSource": "bestBid",
+      "entryPriceP25": 0.3,
+      "entryPriceMedian": 0.43,
+      "entryPriceP75": 0.65
+    },
+    "sizeStyle": {
+      "avgSizeUsd": 3.257485,
+      "medianSizeUsd": 3.12,
+      "p75SizeUsd": 5.5
+    },
+    "timingStyle": {
+      "avgEntrySecondsIntoWindow": 83.010526,
+      "medianEntrySecondsIntoWindow": 48,
+      "p75EntrySecondsIntoWindow": 136,
+      "entryCutoffSec": 156,
+      "mostCommonEntryWindow": "early"
+    },
+    "holdStyle": {
+      "avgHoldSecondsProxy": 75,
+      "medianHoldSecondsProxy": 94,
+      "timedExitSec": 94,
+      "lateExitSec": 186
+    },
+    "repeatStyle": {
+      "repeatedSameTokenCycleCount": 89,
+      "sameMarketBothSidesCount": 3,
+      "maxEntriesPerFreshSignal": 3,
+      "requireFreshOracleSignal": true,
+      "requireValidBook": true
+    },
+    "exitStyle": {
+      "mostCommonExitTrigger": "near_expiry_or_resolution_inferred",
+      "onOracleReversal": true,
+      "onSignalStale": true,
+      "onLateWindow": true,
+      "onTimedHold": true
+    }
+  }
+}
