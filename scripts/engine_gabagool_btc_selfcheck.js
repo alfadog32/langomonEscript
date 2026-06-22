@@ -658,6 +658,8 @@ async function run() {
       price: 0.50,
       size: 12,
       strategy: 'GabagoolBtcOracleStrategy',
+      marketSlug: `btc-updown-5m-${baseStartSec - 600}`,
+      outcome: 'Up',
     });
     portfolio.recordFill({
       tokenId: 'stale-btc-b',
@@ -666,6 +668,8 @@ async function run() {
       price: 0.50,
       size: 12,
       strategy: 'GabagoolBtcOracleStrategy',
+      marketSlug: `btc-updown-5m-${baseStartSec}`,
+      outcome: 'Down',
     });
     portfolio.setMarkPrice('stale-btc-a', 0.50);
     portfolio.setMarkPrice('stale-btc-b', 0.50);
@@ -691,11 +695,15 @@ async function run() {
         },
       },
     });
-    assert(admitted, 'stale BTC paper exposure should not block a fresh Gabagool buy via the BTC bucket');
+    assert(admitted, 'expired/404 BTC paper exposure should not block a fresh Gabagool buy via the BTC bucket');
     const admittedDetails = risk.riskDetails(admitted);
     assert.strictEqual(admittedDetails.strategyBucketExposureRawUsd, 12, 'bucket diagnostics should expose raw BTC bucket exposure');
-    assert.strictEqual(admittedDetails.strategyBucketExposureExclusionUsd, 12, 'bucket diagnostics should exclude stale BTC paper exposure');
-    assert.strictEqual(admittedDetails.strategyBucketExposureUsd, 0, 'effective BTC bucket exposure should ignore stale BTC paper exposure for paper buys');
+    assert.strictEqual(admittedDetails.strategyBucketExposureExclusionUsd, 12, 'bucket diagnostics should exclude only dead BTC paper exposure');
+    assert.strictEqual(admittedDetails.strategyBucketExposureUsd, 0, 'effective BTC bucket exposure should ignore dead BTC paper exposure for paper buys');
+    assert.strictEqual(admittedDetails.expiredBtc5mExposureUsd, 6, 'expired BTC 5m exposure should be reported separately');
+    assert.strictEqual(admittedDetails.confirmedNoOrderbook404ExposureUsd, 6, 'confirmed 404 exposure should be reported separately');
+    assert.strictEqual(admittedDetails.capBlockingExposureUsd, 0, 'dead BTC exposure should not count toward cap-blocking exposure');
+    assert.strictEqual(admittedDetails.rawTotalExposureUsd, 12, 'dead BTC exposure should remain visible in total portfolio exposure');
 
     const blockingPortfolio = new PaperPortfolio(config);
     const blockingRisk = new RiskEngine(config, blockingPortfolio);
@@ -707,9 +715,11 @@ async function run() {
       price: 0.50,
       size: 16,
       strategy: 'GabagoolBtcOracleStrategy',
+      marketSlug: `btc-updown-5m-${baseStartSec + 300}`,
+      outcome: 'Up',
     });
     blockingPortfolio.setMarkPrice('tradable-btc-token', 0.50);
-    blockingPortfolio.paperTokenTradeability.set('tradable-btc-token', { status: 'tradable' });
+    blockingPortfolio.paperTokenTradeability.set('tradable-btc-token', { status: 'stale_token_cooldown' });
     const blocked = blockingRisk.evaluate({
       strategy: 'GabagoolBtcOracleStrategy',
       tokenId: 'fresh-btc-entry-2',
@@ -730,11 +740,85 @@ async function run() {
         },
       },
     });
-    assert.strictEqual(blocked, null, 'tradable BTC exposure above the bucket cap should still be blocked');
-    assert.strictEqual(blockingRisk.lastBlockReason, 'btc_bucket_exposure', 'tradable BTC exposure must still count against the BTC bucket');
-    assert.strictEqual(blockingRisk.lastBlockDetails.strategyBucketExposureRawUsd, 8, 'raw tradable BTC exposure should be reported');
-    assert.strictEqual(blockingRisk.lastBlockDetails.strategyBucketExposureExclusionUsd, 0, 'tradable BTC exposure must not be excluded');
-    assert.strictEqual(blockingRisk.lastBlockDetails.strategyBucketExposureUsd, 8, 'effective bucket exposure should still include tradable BTC inventory');
+    assert.strictEqual(blocked, null, 'active live-window stale BTC exposure above the bucket cap should still be blocked');
+    assert.strictEqual(blockingRisk.lastBlockReason, 'btc_bucket_exposure', 'active stale BTC exposure must still count against the BTC bucket');
+    assert.strictEqual(blockingRisk.lastBlockDetails.strategyBucketExposureRawUsd, 8, 'raw active BTC exposure should be reported');
+    assert.strictEqual(blockingRisk.lastBlockDetails.strategyBucketExposureExclusionUsd, 0, 'active stale BTC exposure must not be excluded');
+    assert.strictEqual(blockingRisk.lastBlockDetails.strategyBucketExposureUsd, 8, 'effective bucket exposure should still include active stale BTC inventory');
+    assert.strictEqual(blockingRisk.lastBlockDetails.staleNoBidExposureUsd, 8, 'active live-window stale BTC exposure should be reported separately');
+    assert.strictEqual(blockingRisk.lastBlockDetails.capBlockingExposureUsd, 8, 'active live-window stale BTC exposure should remain cap blocking');
+
+    const pendingPortfolio = new PaperPortfolio(config);
+    const pendingRisk = new RiskEngine(config, pendingPortfolio);
+    pendingPortfolio.paperTokenTradeability = new Map();
+    pendingPortfolio.recordFill({
+      tokenId: 'pending-btc-token',
+      marketId: 'btc-pending-market',
+      side: 'buy',
+      price: 0.50,
+      size: 16,
+      strategy: 'GabagoolBtcOracleStrategy',
+      marketSlug: 'btc-resolution-pending-market',
+      outcome: 'Up',
+      ts: Date.now() - (11 * 60_000),
+    });
+    pendingPortfolio.setMarkPrice('pending-btc-token', 0.50);
+    pendingPortfolio.paperTokenTradeability.set('pending-btc-token', { status: 'stale_token_cooldown' });
+    const pendingBlocked = pendingRisk.evaluate({
+      strategy: 'GabagoolBtcOracleStrategy',
+      tokenId: 'fresh-btc-entry-3',
+      marketId: 'btc-fresh-market-3',
+      side: 'buy',
+      price: 0.49,
+      sizeUsd: 3,
+      expectedEdge: 0.12,
+      confidence: 0.60,
+      metadata: {
+        outcome: 'Up',
+        marketSlug: `btc-updown-5m-${baseStartSec + 600}`,
+        gabagool: {
+          oracleSignalFresh: true,
+          validBook: true,
+          volatilityGuardPassed: true,
+          lateEntryWindowPassed: true,
+        },
+      },
+    });
+    assert.strictEqual(pendingBlocked, null, 'resolution-pending BTC exposure above the bucket cap should still be blocked');
+    assert.strictEqual(pendingRisk.lastBlockReason, 'btc_bucket_exposure', 'resolution-pending BTC exposure should still count against the BTC bucket');
+    assert.strictEqual(pendingRisk.lastBlockDetails.resolutionPendingExposureUsd, 8, 'resolution-pending BTC exposure should be reported separately');
+    assert.strictEqual(pendingRisk.lastBlockDetails.strategyBucketExposureExclusionUsd, 0, 'resolution-pending BTC exposure must remain conservative');
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      maxTotalExposureUsd: 4.5,
+      maxMarketExposureUsd: 10,
+      maxPositionUsdPerAsset: 10,
+    }));
+    bot.portfolio.recordFill({
+      tokenId: 'stale-no-bid-token',
+      marketId: 'btc-no-bid-market',
+      side: 'buy',
+      price: 0.50,
+      size: 10,
+      strategy: 'GabagoolBtcOracleStrategy',
+      marketSlug: `btc-updown-5m-${baseStartSec}`,
+      outcome: 'Up',
+    });
+    bot.portfolio.setMarkPrice('stale-no-bid-token', 0.50);
+    bot.cache.getFreshBook = async () => {
+      const error = new Error('negative cache');
+      error.mmBookFetchStatus = 'stale_token_cooldown';
+      error.mmCooldownMsRemaining = 60_000;
+      throw error;
+    };
+    const scan = await bot.buildGabagoolExposureCapExitScan({ now: Date.now() });
+    assert.strictEqual(scan.active, true, 'live-window stale BTC inventory should still trigger the exposure-cap scan');
+    assert.strictEqual(scan.positionsClosable, 0, 'reduce-only exits should not be attempted without a real bid');
+    assert.strictEqual(scan.candidates.length, 0, 'no real bid should produce no reduce-only candidates');
+    assert.strictEqual(scan.capTriggerReason, 'active_tradable_exposure_over_cap', 'scan should expose the active cap-trigger reason');
+    assert(scan.blockedReasonSummary.includes('stale_token_cooldown_active_window:1'), 'scan should expose the active-window stale no-bid reason');
   }
 
   {
@@ -1464,6 +1548,11 @@ async function run() {
     assert.strictEqual(typeof report.exposure.audit.btcOracleExposureUsd, 'number', 'btc oracle report should expose the strategy audit total');
     assert.strictEqual(typeof report.exposure.audit.exposureMismatchUsd, 'number', 'btc oracle report should expose the audit mismatch');
     assert.strictEqual(typeof report.exposure.audit.exposureAvailableUsd, 'number', 'btc oracle report should expose the remaining exposure headroom');
+    assert.strictEqual(typeof report.exposure.audit.capBlockingExposureUsd, 'number', 'btc oracle report should expose cap-blocking exposure');
+    assert.strictEqual(typeof report.exposure.audit.excludedDeadExposureUsd, 'number', 'btc oracle report should expose excluded dead exposure');
+    assert.strictEqual(typeof report.exposure.buckets.activeTradableExposureUsd, 'number', 'btc oracle report should expose active tradable exposure');
+    assert.strictEqual(typeof report.exposure.buckets.expiredBtc5mExposureUsd, 'number', 'btc oracle report should expose expired BTC 5m exposure');
+    assert.strictEqual(typeof report.exposure.btcBuckets.confirmedNoOrderbook404ExposureUsd, 'number', 'btc oracle report should expose BTC 404 exposure');
     assert.strictEqual(typeof report.pnl.gabagoolPaperClosedPnl, 'number', 'btc oracle report should expose Gabagool closed pnl');
     assert.strictEqual(typeof report.pnl.gabagoolPaperUnrealizedPnl, 'number', 'btc oracle report should expose Gabagool unrealized pnl');
     assert.strictEqual(typeof report.pnl.gabagoolPaperNetPnl, 'number', 'btc oracle report should expose Gabagool net pnl');
@@ -1472,6 +1561,8 @@ async function run() {
     assert.strictEqual(typeof report.dust.gabagoolDustPositionsCount, 'number', 'btc oracle report should expose dust position counts');
     assert.strictEqual(typeof report.dust.gabagoolDustValueUsd, 'number', 'btc oracle report should expose dust position value');
     assert(bot.formatBtcOracleReport(report).includes('Exposure Audit:'), 'formatted btc oracle report should include the exposure audit line');
+    assert(bot.formatBtcOracleReport(report).includes('Exposure Buckets:'), 'formatted btc oracle report should include the exposure bucket line');
+    assert(bot.formatBtcOracleReport(report).includes('BTC Exposure Buckets:'), 'formatted btc oracle report should include the BTC exposure bucket line');
     assert(bot.formatBtcOracleReport(report).includes('Gabagool PnL:'), 'formatted btc oracle report should include the Gabagool pnl line');
     assert(bot.formatBtcOracleReport(report).includes('Round Trips:'), 'formatted btc oracle report should include round-trip stats');
     assert.strictEqual(report.tradeQuality.winLossProxy, '1/0', 'btc oracle report should include a win/loss proxy after fake fills');

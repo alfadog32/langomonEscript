@@ -3744,31 +3744,7 @@ class PaperPortfolio {
     )).length;
     const openOrders = [...this.openOrders.values()];
     const agesSec = openOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
-    const positionEntries = this.positionExposureEntries(this.markPricesSnapshot());
-    const tradeability = this.paperTokenTradeability instanceof Map ? this.paperTokenTradeability : new Map();
-    const minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0));
-    let staleExposureUsd = 0;
-    let tradableExposureUsd = 0;
-    let dustExposureUsd = 0;
-    let staleExposureCount = 0;
-    let tradableExposureCount = 0;
-    let dustExposureCount = 0;
-    for (const entry of positionEntries) {
-      const valueUsd = Number(entry?.valueUsd || 0);
-      if (!(valueUsd > 0)) continue;
-      const status = String((tradeability.get(String(entry.tokenId || '')) || {}).status || '');
-      if (status === 'no_orderbook_404' || status === 'stale_token_cooldown') {
-        staleExposureUsd += valueUsd;
-        staleExposureCount += 1;
-      } else {
-        tradableExposureUsd += valueUsd;
-        tradableExposureCount += 1;
-      }
-      if (valueUsd < minOrderUsd) {
-        dustExposureUsd += valueUsd;
-        dustExposureCount += 1;
-      }
-    }
+    const exposureBreakdown = new RiskEngine(this.config, this).exposureBreakdown();
     const candidateEvaluationsLastHour = countType('candidate_evaluation');
     const paperOrdersPlacedLastHour = countType('order_placed');
     const paperOrdersFilledLastHour = countType('fill');
@@ -3979,12 +3955,25 @@ class PaperPortfolio {
       strategyFillCountsLastHour,
       gabagoolRepeatedSameMarketSameTokenEntriesLastHour,
       openOrderExposureUsd: this.openOrderExposureUsd(),
-      staleExposureUsd,
-      tradableExposureUsd,
-      dustExposureUsd,
-      staleExposureCount,
-      tradableExposureCount,
-      dustExposureCount,
+      staleExposureUsd: Number(exposureBreakdown.staleUntradeablePositionExposureUsd || 0),
+      tradableExposureUsd: Number(exposureBreakdown.tradablePositionExposureUsd || 0),
+      activeTradableExposureUsd: Number(exposureBreakdown.activeTradableExposureUsd || 0),
+      staleNoBidExposureUsd: Number(exposureBreakdown.staleNoBidExposureUsd || 0),
+      confirmedNoOrderbook404ExposureUsd: Number(exposureBreakdown.confirmedNoOrderbook404ExposureUsd || 0),
+      expiredBtc5mExposureUsd: Number(exposureBreakdown.expiredBtc5mExposureUsd || 0),
+      resolutionPendingExposureUsd: Number(exposureBreakdown.resolutionPendingExposureUsd || 0),
+      dustExposureUsd: Number(exposureBreakdown.dustPositionExposureUsd || 0),
+      staleExposureCount: Number(exposureBreakdown.staleUntradeablePositionCount || 0),
+      tradableExposureCount: Number(exposureBreakdown.tradablePositionCount || 0),
+      activeTradableExposureCount: Number(exposureBreakdown.activeTradableExposureCount || 0),
+      staleNoBidExposureCount: Number(exposureBreakdown.staleNoBidExposureCount || 0),
+      confirmedNoOrderbook404ExposureCount: Number(exposureBreakdown.confirmedNoOrderbook404ExposureCount || 0),
+      expiredBtc5mExposureCount: Number(exposureBreakdown.expiredBtc5mExposureCount || 0),
+      resolutionPendingExposureCount: Number(exposureBreakdown.resolutionPendingExposureCount || 0),
+      dustExposureCount: Number(exposureBreakdown.dustPositionCount || 0),
+      capBlockingExposureUsd: Number(exposureBreakdown.capBlockingExposureUsd || 0),
+      excludedDeadExposureUsd: Number(exposureBreakdown.excludedDeadExposureUsd || 0),
+      excludedDeadExposureReasonSummary: exposureBreakdown.excludedDeadExposureReasonSummary || 'none',
       gabagoolExposureCapBlockedReasonCountsLastHour: [...gabagoolExposureCapBlockedReasonCounts.entries()]
         .sort((a, b) => {
           if (b[1] !== a[1]) return b[1] - a[1];
@@ -4585,10 +4574,180 @@ class RiskEngine {
     return minSignalEdgeForCandidate(signal, this.config);
   }
 
+  gabagoolPositionContext(tokenId, marketId) {
+    return BotEngine.prototype.gabagoolPositionContext.call({
+      portfolio: this.portfolio,
+      lastGabagoolOracleTarget: null,
+    }, tokenId, marketId);
+  }
+
+  gabagoolExposureCleanupState(context = {}, now = Date.now()) {
+    return BotEngine.prototype.gabagoolExposureCleanupState.call({
+      gabagoolMarketWindowState: BotEngine.prototype.gabagoolMarketWindowState,
+      gabagoolMarketStartSec: BotEngine.prototype.gabagoolMarketStartSec,
+    }, context, now);
+  }
+
+  classifyExposureBuckets({
+    positionEntries = [],
+    btcOracleTokenIds = new Set(),
+    tradeability = new Map(),
+    minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0)),
+    now = Date.now(),
+  } = {}) {
+    const totals = {
+      activeTradableExposureUsd: 0,
+      staleNoBidExposureUsd: 0,
+      confirmedNoOrderbook404ExposureUsd: 0,
+      expiredBtc5mExposureUsd: 0,
+      resolutionPendingExposureUsd: 0,
+      dustExposureUsd: 0,
+      activeTradableExposureCount: 0,
+      staleNoBidExposureCount: 0,
+      confirmedNoOrderbook404ExposureCount: 0,
+      expiredBtc5mExposureCount: 0,
+      resolutionPendingExposureCount: 0,
+      dustExposureCount: 0,
+      btcOracleActiveTradableExposureUsd: 0,
+      btcOracleStaleNoBidExposureUsd: 0,
+      btcOracleConfirmedNoOrderbook404ExposureUsd: 0,
+      btcOracleExpiredBtc5mExposureUsd: 0,
+      btcOracleResolutionPendingExposureUsd: 0,
+      btcOracleDustExposureUsd: 0,
+      activeTradableBtcOraclePositionCount: 0,
+      staleNoBidBtcOraclePositionCount: 0,
+      confirmedNoOrderbook404BtcOraclePositionCount: 0,
+      expiredBtc5mBtcOraclePositionCount: 0,
+      resolutionPendingBtcOraclePositionCount: 0,
+      dustBtcOraclePositionCount: 0,
+      staleUntradeablePositionExposureUsd: 0,
+      tradablePositionExposureUsd: 0,
+      staleUntradeablePositionCount: 0,
+      tradablePositionCount: 0,
+      staleBtcOraclePositionExposureUsd: 0,
+      tradableBtcOraclePositionExposureUsd: 0,
+      staleNonBtcPositionExposureUsd: 0,
+      tradableNonBtcPositionExposureUsd: 0,
+      excludedDeadExposureUsd: 0,
+      excludedDeadBtcOracleExposureUsd: 0,
+    };
+    const excludedDeadReasonExposure = new Map();
+
+    for (const entry of positionEntries) {
+      const valueUsd = Number(entry?.valueUsd || 0);
+      if (!(valueUsd > 0)) continue;
+      const tokenId = String(entry?.tokenId || '');
+      const isBtcOraclePosition = btcOracleTokenIds.has(tokenId);
+      const tokenTradeability = tradeability.get(tokenId) || null;
+      const tradeabilityStatus = String(tokenTradeability?.status || '');
+      const context = isBtcOraclePosition
+        ? this.gabagoolPositionContext(tokenId, entry?.marketId)
+        : null;
+      const cleanupState = isBtcOraclePosition
+        ? this.gabagoolExposureCleanupState(context, now)
+        : null;
+      const isDust = valueUsd < minOrderUsd;
+      let bucketKey = 'activeTradableExposureUsd';
+      let countKey = 'activeTradableExposureCount';
+      let btcBucketKey = isBtcOraclePosition ? 'btcOracleActiveTradableExposureUsd' : null;
+      let btcCountKey = isBtcOraclePosition ? 'activeTradableBtcOraclePositionCount' : null;
+      let excludedDeadReason = null;
+
+      if (isBtcOraclePosition && tradeabilityStatus === 'no_orderbook_404') {
+        bucketKey = 'confirmedNoOrderbook404ExposureUsd';
+        countKey = 'confirmedNoOrderbook404ExposureCount';
+        btcBucketKey = 'btcOracleConfirmedNoOrderbook404ExposureUsd';
+        btcCountKey = 'confirmedNoOrderbook404BtcOraclePositionCount';
+        excludedDeadReason = 'confirmed_no_orderbook_404';
+      } else if (isBtcOraclePosition && cleanupState?.staleMarket === true) {
+        bucketKey = 'expiredBtc5mExposureUsd';
+        countKey = 'expiredBtc5mExposureCount';
+        btcBucketKey = 'btcOracleExpiredBtc5mExposureUsd';
+        btcCountKey = 'expiredBtc5mBtcOraclePositionCount';
+        excludedDeadReason = 'expired_btc_5m_window';
+      } else if (
+        isBtcOraclePosition &&
+        cleanupState?.staleEvidence === true &&
+        (tradeabilityStatus === 'stale_token_cooldown' || tradeabilityStatus === 'no_bid')
+      ) {
+        bucketKey = 'resolutionPendingExposureUsd';
+        countKey = 'resolutionPendingExposureCount';
+        btcBucketKey = 'btcOracleResolutionPendingExposureUsd';
+        btcCountKey = 'resolutionPendingBtcOraclePositionCount';
+      } else if (
+        isBtcOraclePosition &&
+        (tradeabilityStatus === 'stale_token_cooldown' || tradeabilityStatus === 'no_bid')
+      ) {
+        bucketKey = 'staleNoBidExposureUsd';
+        countKey = 'staleNoBidExposureCount';
+        btcBucketKey = 'btcOracleStaleNoBidExposureUsd';
+        btcCountKey = 'staleNoBidBtcOraclePositionCount';
+      }
+
+      totals[bucketKey] += valueUsd;
+      totals[countKey] += 1;
+      if (btcBucketKey) totals[btcBucketKey] += valueUsd;
+      if (btcCountKey) totals[btcCountKey] += 1;
+
+      if (isDust) {
+        totals.dustExposureUsd += valueUsd;
+        totals.dustExposureCount += 1;
+        if (isBtcOraclePosition) {
+          totals.btcOracleDustExposureUsd += valueUsd;
+          totals.dustBtcOraclePositionCount += 1;
+        }
+      }
+
+      if (bucketKey === 'activeTradableExposureUsd') {
+        totals.tradablePositionExposureUsd += valueUsd;
+        totals.tradablePositionCount += 1;
+        if (isBtcOraclePosition) totals.tradableBtcOraclePositionExposureUsd += valueUsd;
+        else totals.tradableNonBtcPositionExposureUsd += valueUsd;
+      } else {
+        totals.staleUntradeablePositionExposureUsd += valueUsd;
+        totals.staleUntradeablePositionCount += 1;
+        if (isBtcOraclePosition) totals.staleBtcOraclePositionExposureUsd += valueUsd;
+        else totals.staleNonBtcPositionExposureUsd += valueUsd;
+      }
+
+      if (excludedDeadReason) {
+        totals.excludedDeadExposureUsd += valueUsd;
+        if (isBtcOraclePosition) totals.excludedDeadBtcOracleExposureUsd += valueUsd;
+        excludedDeadReasonExposure.set(
+          excludedDeadReason,
+          Number(excludedDeadReasonExposure.get(excludedDeadReason) || 0) + valueUsd
+        );
+      }
+    }
+
+    return {
+      ...totals,
+      capBlockingPositionExposureUsd: Math.max(0, (
+        Number(totals.activeTradableExposureUsd || 0) +
+        Number(totals.staleNoBidExposureUsd || 0) +
+        Number(totals.resolutionPendingExposureUsd || 0)
+      )),
+      capBlockingBtcOraclePositionExposureUsd: Math.max(0, (
+        Number(totals.btcOracleActiveTradableExposureUsd || 0) +
+        Number(totals.btcOracleStaleNoBidExposureUsd || 0) +
+        Number(totals.btcOracleResolutionPendingExposureUsd || 0)
+      )),
+      excludedDeadExposureReasonSummary: [...excludedDeadReasonExposure.entries()]
+        .sort((a, b) => {
+          if (b[1] !== a[1]) return b[1] - a[1];
+          return a[0].localeCompare(b[0]);
+        })
+        .map(([reason, exposureUsd]) => `${reason}:${Number(exposureUsd).toFixed(2)}`)
+        .join(',') || 'none',
+      excludedDeadExposureReasons: Object.fromEntries(excludedDeadReasonExposure.entries()),
+    };
+  }
+
   exposureBreakdown(signal = null) {
     const markPrices = this.portfolio.markPricesSnapshot();
     const portfolioExposure = this.portfolio.portfolioExposureBreakdown(markPrices);
-    const btcOracleLedger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, Date.now());
+    const now = Date.now();
+    const btcOracleLedger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
     const btcOraclePositionExposureUsd = Number(btcOracleLedger.currentPositionExposureUsd || 0);
     const btcOracleOpenOrderExposureUsd = Number(btcOracleLedger.currentOpenOrderExposureUsd || 0);
     const btcOracleTokenIds = new Set(
@@ -4601,53 +4760,21 @@ class RiskEngine {
       ? this.portfolio.paperTokenTradeability
       : new Map();
     const minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0));
-    let staleUntradeablePositionExposureUsd = 0;
-    let tradablePositionExposureUsd = 0;
-    let dustPositionExposureUsd = 0;
-    let staleUntradeablePositionCount = 0;
-    let tradablePositionCount = 0;
-    let dustPositionCount = 0;
-    let staleBtcOraclePositionExposureUsd = 0;
-    let tradableBtcOraclePositionExposureUsd = 0;
-    let staleNonBtcPositionExposureUsd = 0;
-    let tradableNonBtcPositionExposureUsd = 0;
-    for (const entry of positionEntries) {
-      const valueUsd = Number(entry?.valueUsd || 0);
-      if (!(valueUsd > 0)) continue;
-      const tokenId = String(entry?.tokenId || '');
-      const tokenTradeability = tradeability.get(String(entry.tokenId || '')) || null;
-      const staleStatus = String(tokenTradeability?.status || '');
-      const staleUntradeable = staleStatus === 'no_orderbook_404' || staleStatus === 'stale_token_cooldown';
-      const isBtcOraclePosition = btcOracleTokenIds.has(tokenId);
-      if (staleUntradeable) {
-        staleUntradeablePositionExposureUsd += valueUsd;
-        staleUntradeablePositionCount += 1;
-        if (isBtcOraclePosition) staleBtcOraclePositionExposureUsd += valueUsd;
-        else staleNonBtcPositionExposureUsd += valueUsd;
-      } else {
-        tradablePositionExposureUsd += valueUsd;
-        tradablePositionCount += 1;
-        if (isBtcOraclePosition) tradableBtcOraclePositionExposureUsd += valueUsd;
-        else tradableNonBtcPositionExposureUsd += valueUsd;
-      }
-      if (valueUsd < minOrderUsd) {
-        dustPositionExposureUsd += valueUsd;
-        dustPositionCount += 1;
-      }
-    }
-    const paperEntryExposureExclusionActive = (
-      this.config.enableLiveTrading !== true &&
-      String(signal?.side || '').toLowerCase() === 'buy'
-    );
+    const bucketSummary = this.classifyExposureBuckets({
+      positionEntries,
+      btcOracleTokenIds,
+      tradeability,
+      minOrderUsd,
+      now,
+    });
+    const paperEntryExposureExclusionActive = this.config.enableLiveTrading !== true;
     const paperEntryExposureExclusionUsd = paperEntryExposureExclusionActive
-      ? staleUntradeablePositionExposureUsd
+      ? Number(bucketSummary.excludedDeadExposureUsd || 0)
       : 0;
     const paperEntryBtcBucketExposureExclusionUsd = paperEntryExposureExclusionActive
-      ? staleBtcOraclePositionExposureUsd
+      ? Number(bucketSummary.excludedDeadBtcOracleExposureUsd || 0)
       : 0;
-    const paperEntryStandardBucketExposureExclusionUsd = paperEntryExposureExclusionActive
-      ? staleNonBtcPositionExposureUsd
-      : 0;
+    const paperEntryStandardBucketExposureExclusionUsd = 0;
     const rawTotalExposureUsd = Number(portfolioExposure.totalExposureUsd || 0);
     const riskTotalExposureUsd = Math.max(0, rawTotalExposureUsd - paperEntryExposureExclusionUsd);
     const candidateSizeUsd = Number(signal?.sizeUsd);
@@ -4657,16 +4784,9 @@ class RiskEngine {
       rawTotalExposureUsd,
       portfolioPositionExposureUsd: Number(portfolioExposure.positionExposureUsd || 0),
       portfolioOpenOrderExposureUsd: Number(portfolioExposure.openOrderExposureUsd || 0),
-      staleUntradeablePositionExposureUsd,
-      tradablePositionExposureUsd,
-      dustPositionExposureUsd,
-      staleUntradeablePositionCount,
-      tradablePositionCount,
-      dustPositionCount,
-      staleBtcOraclePositionExposureUsd,
-      tradableBtcOraclePositionExposureUsd,
-      staleNonBtcPositionExposureUsd,
-      tradableNonBtcPositionExposureUsd,
+      ...bucketSummary,
+      dustPositionExposureUsd: Number(bucketSummary.dustExposureUsd || 0),
+      dustPositionCount: Number(bucketSummary.dustExposureCount || 0),
       paperEntryExposureExclusionActive,
       paperEntryExposureExclusionUsd,
       paperEntryBtcBucketExposureExclusionUsd,
@@ -4677,6 +4797,9 @@ class RiskEngine {
       nonBtcOpenOrderExposureUsd: Number(portfolioExposure.openOrderExposureUsd || 0) - btcOracleOpenOrderExposureUsd,
       maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
       exposureAvailableUsd: Number(this.config.maxTotalExposureUsd || 0) - riskTotalExposureUsd,
+      capBlockingExposureUsd: riskTotalExposureUsd,
+      excludedDeadExposureUsd: Number(bucketSummary.excludedDeadExposureUsd || 0),
+      excludedDeadBtcOracleExposureUsd: Number(bucketSummary.excludedDeadBtcOracleExposureUsd || 0),
       candidateSizeUsd,
       wouldTotalExposureUsd: riskTotalExposureUsd + buyDeltaUsd,
     };
@@ -6111,6 +6234,20 @@ class PaperTelegramUpdateRelay {
       'portfolioOpenOrderExposureUsd',
       'btcOraclePositionExposureUsd',
       'btcOracleOpenOrderExposureUsd',
+      'activeTradableExposureUsd',
+      'staleNoBidExposureUsd',
+      'confirmedNoOrderbook404ExposureUsd',
+      'expiredBtc5mExposureUsd',
+      'resolutionPendingExposureUsd',
+      'dustExposureUsd',
+      'capBlockingExposureUsd',
+      'excludedDeadExposureUsd',
+      'btcOracleActiveTradableExposureUsd',
+      'btcOracleStaleNoBidExposureUsd',
+      'btcOracleConfirmedNoOrderbook404ExposureUsd',
+      'btcOracleExpiredBtc5mExposureUsd',
+      'btcOracleResolutionPendingExposureUsd',
+      'btcOracleDustExposureUsd',
       'nonBtcPositionExposureUsd',
       'nonBtcOpenOrderExposureUsd',
       'strategyBucketExposureRawUsd',
@@ -6333,6 +6470,20 @@ class PaperTelegramUpdateRelay {
       portfolioOpenOrderExposureUsd: numericOrNull(payload.portfolioOpenOrderExposureUsd),
       btcOraclePositionExposureUsd: numericOrNull(payload.btcOraclePositionExposureUsd),
       btcOracleOpenOrderExposureUsd: numericOrNull(payload.btcOracleOpenOrderExposureUsd),
+      activeTradableExposureUsd: numericOrNull(payload.activeTradableExposureUsd),
+      staleNoBidExposureUsd: numericOrNull(payload.staleNoBidExposureUsd),
+      confirmedNoOrderbook404ExposureUsd: numericOrNull(payload.confirmedNoOrderbook404ExposureUsd),
+      expiredBtc5mExposureUsd: numericOrNull(payload.expiredBtc5mExposureUsd),
+      resolutionPendingExposureUsd: numericOrNull(payload.resolutionPendingExposureUsd),
+      dustExposureUsd: numericOrNull(payload.dustExposureUsd),
+      capBlockingExposureUsd: numericOrNull(payload.capBlockingExposureUsd),
+      excludedDeadExposureUsd: numericOrNull(payload.excludedDeadExposureUsd),
+      btcOracleActiveTradableExposureUsd: numericOrNull(payload.btcOracleActiveTradableExposureUsd),
+      btcOracleStaleNoBidExposureUsd: numericOrNull(payload.btcOracleStaleNoBidExposureUsd),
+      btcOracleConfirmedNoOrderbook404ExposureUsd: numericOrNull(payload.btcOracleConfirmedNoOrderbook404ExposureUsd),
+      btcOracleExpiredBtc5mExposureUsd: numericOrNull(payload.btcOracleExpiredBtc5mExposureUsd),
+      btcOracleResolutionPendingExposureUsd: numericOrNull(payload.btcOracleResolutionPendingExposureUsd),
+      btcOracleDustExposureUsd: numericOrNull(payload.btcOracleDustExposureUsd),
       nonBtcPositionExposureUsd: numericOrNull(payload.nonBtcPositionExposureUsd),
       nonBtcOpenOrderExposureUsd: numericOrNull(payload.nonBtcOpenOrderExposureUsd),
       strategyBucketExposureRawUsd: numericOrNull(payload.strategyBucketExposureRawUsd),
@@ -7206,12 +7357,17 @@ class BotEngine {
     const ledger = this.gabagoolLedger(markPrices, now);
     const riskExposure = this.risk.exposureBreakdown();
     const maxTotalExposureUsd = Math.max(0, Number(this.config.maxTotalExposureUsd || 0));
-    const totalExposureUsd = Math.max(
+    const portfolioExposureUsd = Math.max(
       Number(ledger.totalExposureUsd || 0),
-      Number(riskExposure.riskTotalExposureUsd || 0)
+      Number(riskExposure.rawTotalExposureUsd || 0)
     );
+    const capBlockingExposureUsd = Math.max(
+      0,
+      Number(riskExposure.capBlockingExposureUsd || riskExposure.riskTotalExposureUsd || 0)
+    );
+    const excludedDeadExposureUsd = Math.max(0, Number(riskExposure.excludedDeadExposureUsd || 0));
     const excessExposureUsd = maxTotalExposureUsd > 0
-      ? Math.max(0, totalExposureUsd - maxTotalExposureUsd)
+      ? Math.max(0, capBlockingExposureUsd - maxTotalExposureUsd)
       : 0;
     const positions = (ledger.perTokenExposure || [])
       .filter((item) => Number(item.qty || 0) > 0)
@@ -7230,13 +7386,18 @@ class BotEngine {
     const scan = {
       active: excessExposureUsd > 1e-9 && positions.length > 0,
       reason: excessExposureUsd > 1e-9 ? 'exposure_cap_waiting_for_exit' : null,
+      capTriggerReason: excessExposureUsd > 1e-9 ? 'active_tradable_exposure_over_cap' : null,
       exitMode: 'exposure_cap_reduce_only',
       positionsScanned: 0,
       positionsClosable: 0,
       candidates: [],
       noExitReason: null,
       blockedReasons: new Map(),
-      totalExposureUsd,
+      totalExposureUsd: capBlockingExposureUsd,
+      capBlockingExposureUsd,
+      portfolioExposureUsd,
+      excludedDeadExposureUsd,
+      excludedDeadExposureReasonSummary: riskExposure.excludedDeadExposureReasonSummary || 'none',
       maxTotalExposureUsd,
       excessExposureUsd,
       largestExposurePositions,
@@ -7259,10 +7420,18 @@ class BotEngine {
     const minDustExitUsd = Math.max(0.01, Number(this.config.gabagoolMinDustExitUsd || 0.01));
     const minReduceOnlyExitUsd = Math.max(0.01, Number(this.config.reduceOnlyMinExitUsd || 0.01));
     let remainingExcessUsd = excessExposureUsd;
+    const classifyNoExitBidReason = (tradeabilityStatus, cleanupState) => {
+      if (tradeabilityStatus === 'no_orderbook_404') return 'confirmed_no_orderbook_404';
+      if (cleanupState?.staleMarket === true) return 'expired_btc_5m_no_bid';
+      if (cleanupState?.staleEvidence === true) return 'resolution_pending_no_bid';
+      if (tradeabilityStatus === 'stale_token_cooldown') return 'stale_token_cooldown_active_window';
+      return 'no_exit_bid_available';
+    };
 
     for (const position of positions) {
       scan.positionsScanned += 1;
       const context = this.gabagoolPositionContext(position.tokenId, position.marketId);
+      const cleanupState = this.gabagoolExposureCleanupState(context, now);
       const asset = this.buildGabagoolSyntheticAssetFromContext(context);
       const book = await this.getGabagoolBook(position.tokenId, books);
       const availableSellQty = this.portfolio.availablePositionQty(position.tokenId);
@@ -7288,11 +7457,7 @@ class BotEngine {
         : null;
       if (!book) {
         const tradeabilityStatus = String(tradeability?.status || '');
-        const blockedReason = tradeabilityStatus === 'no_orderbook_404'
-          ? '404_no_orderbook'
-          : tradeabilityStatus === 'stale_token_cooldown'
-            ? 'stale_token_cooldown'
-            : 'no_bid';
+        const blockedReason = classifyNoExitBidReason(tradeabilityStatus, cleanupState);
         recordExposureCapBlocked(blockedReason, {
           ...commonDetails,
           source: tradeabilityStatus || 'book_fetch_failed',
@@ -7301,7 +7466,7 @@ class BotEngine {
         continue;
       }
       if (!Number.isFinite(Number(book.bestBid)) || !(Number(book.bestBid) > 0) || Number(book.bestBid) >= 1) {
-        recordExposureCapBlocked('no_bid', {
+        recordExposureCapBlocked(classifyNoExitBidReason(String(tradeability?.status || ''), cleanupState), {
           ...commonDetails,
           source: 'best_bid_missing_or_invalid',
           price: Number.isFinite(Number(book?.bestBid)) ? Number(book.bestBid) : null,
@@ -7317,7 +7482,6 @@ class BotEngine {
         continue;
       }
 
-      const cleanupState = this.gabagoolExposureCleanupState(context, now);
       const currentValueUsd = availableSellQty * Number(book.bestBid);
       const roundedExitSizeUsd = Math.max(0, Math.round(currentValueUsd * 100) / 100);
       const minProfitPrice = avgEntryPrice + Math.max(0, Number(this.config.gabagoolMinProfitBuffer || 0));
@@ -7492,7 +7656,7 @@ class BotEngine {
         positionsScanned: scan.positionsScanned,
         positionsClosable: scan.positionsClosable,
         exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
-        riskTotalExposureUsd: totalExposureUsd,
+        riskTotalExposureUsd: capBlockingExposureUsd,
         maxTotalExposureUsd,
       });
       remainingExcessUsd = Math.max(0, remainingExcessUsd - candidateSizeUsd);
@@ -7503,12 +7667,15 @@ class BotEngine {
     }
     this.recordGabagoolMetric('gabagool_reduce_only_exit_scan', {
       reason: scan.noExitReason || 'scan_complete',
+      capTriggerReason: scan.capTriggerReason,
       positionsScanned: scan.positionsScanned,
       positionsClosable: scan.positionsClosable,
       exitMode: scan.exitMode,
-      riskTotalExposureUsd: totalExposureUsd,
+      riskTotalExposureUsd: capBlockingExposureUsd,
       maxTotalExposureUsd,
       exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
+      capBlockingExposureUsd,
+      excludedDeadExposureUsd,
       blockedReasonSummary: [...scan.blockedReasons.entries()]
         .sort((a, b) => b[1] - a[1])
         .map(([reason, count]) => `${reason}:${count}`)
@@ -9123,6 +9290,11 @@ class BotEngine {
         exitUnfreezeReason: useExposureCapExitMode ? exposureCapExitScan.unfreezeReasonLast : null,
         largestExposurePositions: useExposureCapExitMode ? exposureCapExitScan.largestExposurePositions : [],
         totalExposureUsd: useExposureCapExitMode ? exposureCapExitScan.totalExposureUsd : null,
+        capBlockingExposureUsd: useExposureCapExitMode ? exposureCapExitScan.capBlockingExposureUsd : null,
+        portfolioExposureUsd: useExposureCapExitMode ? exposureCapExitScan.portfolioExposureUsd : null,
+        excludedDeadExposureUsd: useExposureCapExitMode ? exposureCapExitScan.excludedDeadExposureUsd : null,
+        excludedDeadExposureReasonSummary: useExposureCapExitMode ? exposureCapExitScan.excludedDeadExposureReasonSummary : 'none',
+        capTriggerReason: useExposureCapExitMode ? exposureCapExitScan.capTriggerReason : null,
         maxTotalExposureUsd: useExposureCapExitMode ? exposureCapExitScan.maxTotalExposureUsd : null,
         excessExposureUsd: useExposureCapExitMode ? exposureCapExitScan.excessExposureUsd : null,
       };
@@ -9153,13 +9325,18 @@ class BotEngine {
       warn(
         `[GABAGOOL EXPOSURE STALL] reason=exposure_cap_waiting_for_exit token=${shortId(tokenForLog)} ` +
         `marketSlug=${marketSlugForLog} totalExposureUsd=${fmtMoney(exitAttemptSummary.totalExposureUsd)} ` +
+        `portfolioExposureUsd=${fmtMoney(exitAttemptSummary.portfolioExposureUsd)} ` +
+        `capBlockingExposureUsd=${fmtMoney(exitAttemptSummary.capBlockingExposureUsd)} ` +
+        `excludedDeadExposureUsd=${fmtMoney(exitAttemptSummary.excludedDeadExposureUsd)} ` +
         `maxTotalExposureUsd=${fmtMoney(exitAttemptSummary.maxTotalExposureUsd)} excessExposureUsd=${fmtMoney(exitAttemptSummary.excessExposureUsd)} ` +
         `positionsScanned=${exitAttemptSummary.positionsScanned} positionsClosable=${exitAttemptSummary.positionsClosable} ` +
         `exitsAttempted=${exitAttemptSummary.attempts} exitsPlaced=${exitAttemptSummary.placed} ` +
         `noExitReason=${exitAttemptSummary.noExitReason || 'none'} ` +
+        `capTriggerReason=${exitAttemptSummary.capTriggerReason || 'none'} ` +
         `exitBlockedReason=${exitAttemptSummary.lastBlockedReason || 'none'} ` +
         `dominantBlockedReason=${exitAttemptSummary.dominantBlockedReason || 'none'} ` +
         `blockedReasonSummary=${exitAttemptSummary.blockedReasonSummary || 'none'} ` +
+        `excludedDeadExposureReasons=${exitAttemptSummary.excludedDeadExposureReasonSummary || 'none'} ` +
         `exitUnfreezeReason=${exitAttemptSummary.exitUnfreezeReason || 'none'}`
       );
     };
@@ -9886,6 +10063,28 @@ class BotEngine {
           maxMarketExposureUsd: Number(this.config.maxMarketExposureUsd || 0),
           maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
         },
+        buckets: {
+          activeTradableExposureUsd: Number(riskExposure.activeTradableExposureUsd || 0),
+          staleNoBidExposureUsd: Number(riskExposure.staleNoBidExposureUsd || 0),
+          confirmedNoOrderbook404ExposureUsd: Number(riskExposure.confirmedNoOrderbook404ExposureUsd || 0),
+          expiredBtc5mExposureUsd: Number(riskExposure.expiredBtc5mExposureUsd || 0),
+          resolutionPendingExposureUsd: Number(riskExposure.resolutionPendingExposureUsd || 0),
+          dustExposureUsd: Number(riskExposure.dustExposureUsd || riskExposure.dustPositionExposureUsd || 0),
+          capBlockingExposureUsd: Number(riskExposure.capBlockingExposureUsd || 0),
+          excludedDeadExposureUsd: Number(riskExposure.excludedDeadExposureUsd || 0),
+          excludedDeadExposureReasonSummary: riskExposure.excludedDeadExposureReasonSummary || 'none',
+        },
+        btcBuckets: {
+          activeTradableExposureUsd: Number(riskExposure.btcOracleActiveTradableExposureUsd || 0),
+          staleNoBidExposureUsd: Number(riskExposure.btcOracleStaleNoBidExposureUsd || 0),
+          confirmedNoOrderbook404ExposureUsd: Number(riskExposure.btcOracleConfirmedNoOrderbook404ExposureUsd || 0),
+          expiredBtc5mExposureUsd: Number(riskExposure.btcOracleExpiredBtc5mExposureUsd || 0),
+          resolutionPendingExposureUsd: Number(riskExposure.btcOracleResolutionPendingExposureUsd || 0),
+          dustExposureUsd: Number(riskExposure.btcOracleDustExposureUsd || 0),
+          capBlockingExposureUsd: Number(riskExposure.capBlockingBtcOraclePositionExposureUsd || 0),
+          excludedDeadExposureUsd: Number(riskExposure.excludedDeadBtcOracleExposureUsd || 0),
+          excludedDeadExposureReasonSummary: riskExposure.excludedDeadExposureReasonSummary || 'none',
+        },
         audit: {
           riskExposureUsd,
           portfolioExposureUsd,
@@ -9894,6 +10093,9 @@ class BotEngine {
           exposureMismatchReason,
           maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
           exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
+          capBlockingExposureUsd: Number(riskExposure.capBlockingExposureUsd || 0),
+          excludedDeadExposureUsd: Number(riskExposure.excludedDeadExposureUsd || 0),
+          excludedDeadExposureReasonSummary: riskExposure.excludedDeadExposureReasonSummary || 'none',
         },
       },
       tradeQuality: {
@@ -10105,7 +10307,30 @@ class BotEngine {
       `exposureMismatchUsd=${fmtMoney(report.exposure.audit.exposureMismatchUsd)} ` +
       `exposureMismatchReason=${report.exposure.audit.exposureMismatchReason || 'unknown'} ` +
       `maxTotalExposureUsd=${fmtMoney(report.exposure.audit.maxTotalExposureUsd)} ` +
-      `exposureAvailableUsd=${fmtMoney(report.exposure.audit.exposureAvailableUsd)}`
+      `exposureAvailableUsd=${fmtMoney(report.exposure.audit.exposureAvailableUsd)} ` +
+      `capBlockingExposureUsd=${fmtMoney(report.exposure.audit.capBlockingExposureUsd)} ` +
+      `excludedDeadExposureUsd=${fmtMoney(report.exposure.audit.excludedDeadExposureUsd)} ` +
+      `excludedDeadExposureReasons=${report.exposure.audit.excludedDeadExposureReasonSummary || 'none'}`
+    );
+    lines.push(
+      `Exposure Buckets: activeTradable=${fmtMoney(report.exposure.buckets.activeTradableExposureUsd)} ` +
+      `staleNoBid=${fmtMoney(report.exposure.buckets.staleNoBidExposureUsd)} ` +
+      `confirmed404=${fmtMoney(report.exposure.buckets.confirmedNoOrderbook404ExposureUsd)} ` +
+      `expiredBtc5m=${fmtMoney(report.exposure.buckets.expiredBtc5mExposureUsd)} ` +
+      `resolutionPending=${fmtMoney(report.exposure.buckets.resolutionPendingExposureUsd)} ` +
+      `dust=${fmtMoney(report.exposure.buckets.dustExposureUsd)} ` +
+      `capBlocking=${fmtMoney(report.exposure.buckets.capBlockingExposureUsd)} ` +
+      `excludedDead=${fmtMoney(report.exposure.buckets.excludedDeadExposureUsd)}`
+    );
+    lines.push(
+      `BTC Exposure Buckets: activeTradable=${fmtMoney(report.exposure.btcBuckets.activeTradableExposureUsd)} ` +
+      `staleNoBid=${fmtMoney(report.exposure.btcBuckets.staleNoBidExposureUsd)} ` +
+      `confirmed404=${fmtMoney(report.exposure.btcBuckets.confirmedNoOrderbook404ExposureUsd)} ` +
+      `expiredBtc5m=${fmtMoney(report.exposure.btcBuckets.expiredBtc5mExposureUsd)} ` +
+      `resolutionPending=${fmtMoney(report.exposure.btcBuckets.resolutionPendingExposureUsd)} ` +
+      `dust=${fmtMoney(report.exposure.btcBuckets.dustExposureUsd)} ` +
+      `capBlocking=${fmtMoney(report.exposure.btcBuckets.capBlockingExposureUsd)} ` +
+      `excludedDead=${fmtMoney(report.exposure.btcBuckets.excludedDeadExposureUsd)}`
     );
     lines.push(
       `Round Trips: gabagoolRoundTripsLastHour=${report.tradeQuality.gabagoolRoundTripsLastHour} ` +
@@ -10956,6 +11181,20 @@ class BotEngine {
           portfolioOpenOrderExposureUsd: this.risk.lastBlockDetails?.portfolioOpenOrderExposureUsd,
           btcOraclePositionExposureUsd: this.risk.lastBlockDetails?.btcOraclePositionExposureUsd,
           btcOracleOpenOrderExposureUsd: this.risk.lastBlockDetails?.btcOracleOpenOrderExposureUsd,
+          activeTradableExposureUsd: this.risk.lastBlockDetails?.activeTradableExposureUsd,
+          staleNoBidExposureUsd: this.risk.lastBlockDetails?.staleNoBidExposureUsd,
+          confirmedNoOrderbook404ExposureUsd: this.risk.lastBlockDetails?.confirmedNoOrderbook404ExposureUsd,
+          expiredBtc5mExposureUsd: this.risk.lastBlockDetails?.expiredBtc5mExposureUsd,
+          resolutionPendingExposureUsd: this.risk.lastBlockDetails?.resolutionPendingExposureUsd,
+          dustExposureUsd: this.risk.lastBlockDetails?.dustExposureUsd,
+          capBlockingExposureUsd: this.risk.lastBlockDetails?.capBlockingExposureUsd,
+          excludedDeadExposureUsd: this.risk.lastBlockDetails?.excludedDeadExposureUsd,
+          btcOracleActiveTradableExposureUsd: this.risk.lastBlockDetails?.btcOracleActiveTradableExposureUsd,
+          btcOracleStaleNoBidExposureUsd: this.risk.lastBlockDetails?.btcOracleStaleNoBidExposureUsd,
+          btcOracleConfirmedNoOrderbook404ExposureUsd: this.risk.lastBlockDetails?.btcOracleConfirmedNoOrderbook404ExposureUsd,
+          btcOracleExpiredBtc5mExposureUsd: this.risk.lastBlockDetails?.btcOracleExpiredBtc5mExposureUsd,
+          btcOracleResolutionPendingExposureUsd: this.risk.lastBlockDetails?.btcOracleResolutionPendingExposureUsd,
+          btcOracleDustExposureUsd: this.risk.lastBlockDetails?.btcOracleDustExposureUsd,
           nonBtcPositionExposureUsd: this.risk.lastBlockDetails?.nonBtcPositionExposureUsd,
           nonBtcOpenOrderExposureUsd: this.risk.lastBlockDetails?.nonBtcOpenOrderExposureUsd,
           strategyBucketExposureRawUsd: this.risk.lastBlockDetails?.strategyBucketExposureRawUsd,
@@ -12512,12 +12751,16 @@ class BotEngine {
       `repeatedSameMarketSameTokenEntriesLastHour=${health.gabagoolRepeatedSameMarketSameTokenEntriesLastHour}`
     );
     info(
-      `Exposure Split: tradableExposure=$${Number(health.tradableExposureUsd || 0).toFixed(2)} ` +
-      `staleExposure=$${Number(health.staleExposureUsd || 0).toFixed(2)} ` +
+      `Exposure Split: portfolioExposure=$${Number(this.portfolio.totalExposureUsd(markPrices) || 0).toFixed(2)} ` +
+      `capBlockingExposure=$${Number(health.capBlockingExposureUsd || 0).toFixed(2)} ` +
+      `activeTradableExposure=$${Number(health.activeTradableExposureUsd || 0).toFixed(2)} ` +
+      `staleNoBidExposure=$${Number(health.staleNoBidExposureUsd || 0).toFixed(2)} ` +
+      `confirmedNoOrderbook404Exposure=$${Number(health.confirmedNoOrderbook404ExposureUsd || 0).toFixed(2)} ` +
+      `expiredBtc5mExposure=$${Number(health.expiredBtc5mExposureUsd || 0).toFixed(2)} ` +
+      `resolutionPendingExposure=$${Number(health.resolutionPendingExposureUsd || 0).toFixed(2)} ` +
       `dustExposure=$${Number(health.dustExposureUsd || 0).toFixed(2)} ` +
-      `tradableCount=${Number(health.tradableExposureCount || 0)} ` +
-      `staleCount=${Number(health.staleExposureCount || 0)} ` +
-      `dustCount=${Number(health.dustExposureCount || 0)}`
+      `excludedDeadExposure=$${Number(health.excludedDeadExposureUsd || 0).toFixed(2)} ` +
+      `excludedDeadExposureReasons=${health.excludedDeadExposureReasonSummary || 'none'}`
     );
     info(
       `Gabagool Exit Blocks: exposureCap=${health.gabagoolExposureCapBlockedReasonCountsLastHour || 'none'} ` +
@@ -12994,6 +13237,20 @@ function formatRiskBlockDetails(details = {}) {
     'portfolioOpenOrderExposureUsd',
     'btcOraclePositionExposureUsd',
     'btcOracleOpenOrderExposureUsd',
+    'activeTradableExposureUsd',
+    'staleNoBidExposureUsd',
+    'confirmedNoOrderbook404ExposureUsd',
+    'expiredBtc5mExposureUsd',
+    'resolutionPendingExposureUsd',
+    'dustExposureUsd',
+    'capBlockingExposureUsd',
+    'excludedDeadExposureUsd',
+    'btcOracleActiveTradableExposureUsd',
+    'btcOracleStaleNoBidExposureUsd',
+    'btcOracleConfirmedNoOrderbook404ExposureUsd',
+    'btcOracleExpiredBtc5mExposureUsd',
+    'btcOracleResolutionPendingExposureUsd',
+    'btcOracleDustExposureUsd',
     'nonBtcPositionExposureUsd',
     'nonBtcOpenOrderExposureUsd',
     'strategyBucket',
