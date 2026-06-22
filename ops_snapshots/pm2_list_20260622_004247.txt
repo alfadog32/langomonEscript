@@ -1,0 +1,9 @@
+┌────┬────────────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name                   │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼────────────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 0  │ btcPolyOracle          │ default     │ 3.1.1   │ fork    │ 2494     │ 26m    │ 0    │ online    │ 0%       │ 78.4mb   │ lango    │ disabled │
+│ 2  │ langomon-dashboard     │ default     │ 3.1.1   │ fork    │ 2643     │ 25m    │ 0    │ online    │ 0%       │ 84.3mb   │ lango    │ disabled │
+│ 1  │ langomonEscript        │ default     │ 3.1.1   │ fork    │ 2609     │ 25m    │ 0    │ online    │ 0%       │ 158.0mb  │ lango    │ disabled │
+│ 3  │ liveIntentRouter       │ default     │ 3.1.1   │ fork    │ 5680     │ 15m    │ 0    │ online    │ 0%       │ 61.7mb   │ lango    │ disabled │
+│ 4  │ telegramApprovalBot    │ default     │ 3.1.1   │ fork    │ 5705     │ 15m    │ 0    │ online    │ 0%       │ 73.6mb   │ lango    │ disabled │
+└────┴────────────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘

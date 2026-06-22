@@ -1,0 +1,62 @@
+[
+  {
+    "name": "btcPolyOracle",
+    "pm_id": 0,
+    "status": "online",
+    "script": "/home/lango/langomonEscript/btc_poly_oracle_auto_discovery_runner.js",
+    "cwd": "/home/lango/langomonEscript",
+    "node_version": "22.23.0",
+    "restart_time": 0,
+    "unstable_restarts": 0,
+    "memory": 82198528,
+    "cpu": 0
+  },
+  {
+    "name": "langomonEscript",
+    "pm_id": 1,
+    "status": "online",
+    "script": "/home/lango/langomonEscript/moneymaker_v3.js",
+    "cwd": "/home/lango/langomonEscript",
+    "node_version": "22.23.0",
+    "restart_time": 0,
+    "unstable_restarts": 0,
+    "memory": 165892096,
+    "cpu": 7.7
+  },
+  {
+    "name": "langomon-dashboard",
+    "pm_id": 2,
+    "status": "online",
+    "script": "/home/lango/langomonEscript/dashboard_server.js",
+    "cwd": "/home/lango/langomonEscript",
+    "node_version": "22.23.0",
+    "restart_time": 0,
+    "unstable_restarts": 0,
+    "memory": 88428544,
+    "cpu": 0
+  },
+  {
+    "name": "liveIntentRouter",
+    "pm_id": 3,
+    "status": "online",
+    "script": "/home/lango/langomonEscript/live_intent_router.js",
+    "cwd": "/home/lango/langomonEscript",
+    "node_version": "22.23.0",
+    "restart_time": 0,
+    "unstable_restarts": 0,
+    "memory": 64647168,
+    "cpu": 0
+  },
+  {
+    "name": "telegramApprovalBot",
+    "pm_id": 4,
+    "status": "online",
+    "script": "/home/lango/langomonEscript/telegram/telegram_approval_bot.js",
+    "cwd": "/home/lango/langomonEscript",
+    "node_version": "22.23.0",
+    "restart_time": 0,
+    "unstable_restarts": 0,
+    "memory": 77160448,
+    "cpu": 0
+  }
+]

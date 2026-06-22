@@ -523,6 +523,8 @@ function buildEntryPlan({
   minExpectedEdge = 0.0001,
   minPrice = 0.02,
   maxPrice = 0.98,
+  maxEntryPrice = 0.85,
+  allowHighPriceEntryEdge = 0.20,
   maxSpread = 0.12,
   depthFloorUsd = 5,
 } = {}) {
@@ -623,6 +625,16 @@ function buildEntryPlan({
   const timeBoost = Number.isFinite(secondsIntoWindow) && secondsIntoWindow <= 60 ? 1.05 : 0.95;
   const confidence = clamp(oracleConfidence * timeBoost, 0.35, 0.95);
   const expectedEdge = Math.max(derivedExpectedEdge, minExpectedEdge);
+  if (price > Number(maxEntryPrice || 0.85) && expectedEdge < Number(allowHighPriceEntryEdge || 0.20)) {
+    return {
+      blockReason: 'gabagool_high_price_entry_guard',
+      price: round(price),
+      expectedEdge: round(expectedEdge),
+      maxEntryPrice: round(Number(maxEntryPrice || 0.85), 2),
+      allowHighPriceEntryEdge: round(Number(allowHighPriceEntryEdge || 0.20)),
+      secondsIntoWindow,
+    };
+  }
   const ttlMs = Math.max(1_000, Math.min(freshUntilMs - now, 12_000));
 
   return {
@@ -668,6 +680,10 @@ function buildExitPlan({
   book,
   now = Date.now(),
   minEdge = 0.008,
+  minProfitBuffer = 0,
+  allowLossExit = false,
+  allowDustExit = true,
+  minDustExitUsd = 0.05,
 } = {}) {
   if (!model || !oracleTarget?.target || !book) return { blockReason: 'missing_exit_inputs' };
   if (!Number.isFinite(positionQty) || positionQty <= 0) return { blockReason: 'no_position' };
@@ -694,6 +710,74 @@ function buildExitPlan({
   if (!trigger) return { blockReason: 'exit_not_ready' };
 
   const currentValueUsd = positionQty * book.bestBid;
+  const roundedExitSizeUsd = round(currentValueUsd, 2);
+  if (!Number.isFinite(currentValueUsd) || currentValueUsd <= 0) {
+    return {
+      blockReason: 'zero_size_candidate',
+      source: 'position_value_non_positive',
+      tokenId: String(tokenId),
+      positionQty: round(positionQty, 6),
+      availableSellQty: round(positionQty, 6),
+      bestBid: round(Number(book.bestBid)),
+      currentValueUsd: round(currentValueUsd),
+      roundedExitSizeUsd,
+    };
+  }
+  if (!Number.isFinite(roundedExitSizeUsd) || roundedExitSizeUsd <= 0) {
+    return {
+      blockReason: 'zero_size_candidate',
+      source: 'position_value_rounds_to_zero',
+      tokenId: String(tokenId),
+      positionQty: round(positionQty, 6),
+      availableSellQty: round(positionQty, 6),
+      bestBid: round(Number(book.bestBid)),
+      currentValueUsd: round(currentValueUsd),
+      roundedExitSizeUsd,
+    };
+  }
+  if (allowDustExit && roundedExitSizeUsd < Math.max(0.01, Number(minDustExitUsd || 0.05))) {
+    return {
+      blockReason: 'dust_exit_below_min',
+      source: 'position_value_below_dust_floor',
+      tokenId: String(tokenId),
+      positionQty: round(positionQty, 6),
+      availableSellQty: round(positionQty, 6),
+      bestBid: round(Number(book.bestBid)),
+      currentValueUsd: round(currentValueUsd),
+      roundedExitSizeUsd,
+      minDustExitUsd: round(Math.max(0.01, Number(minDustExitUsd || 0.05)), 2),
+    };
+  }
+  const sellPrice = Number(book.bestBid);
+  const profitBuffer = Math.max(0, Number(minProfitBuffer || 0));
+  const minProfitPrice = Number(avgCost) + profitBuffer;
+  if (!allowLossExit && sellPrice < Number(avgCost) - 1e-9) {
+    return {
+      blockReason: 'blocked_loss_exit',
+      tokenId: String(tokenId),
+      positionQty: round(positionQty, 6),
+      availableSellQty: round(positionQty, 6),
+      avgEntryPrice: round(Number(avgCost)),
+      sellPrice: round(sellPrice),
+      minProfitPrice: round(minProfitPrice),
+      currentValueUsd: round(currentValueUsd),
+      roundedExitSizeUsd,
+    };
+  }
+  if (!allowLossExit && sellPrice < minProfitPrice - 1e-9) {
+    return {
+      blockReason: 'profit_buffer_not_met',
+      tokenId: String(tokenId),
+      positionQty: round(positionQty, 6),
+      availableSellQty: round(positionQty, 6),
+      avgEntryPrice: round(Number(avgCost)),
+      sellPrice: round(sellPrice),
+      minProfitPrice: round(minProfitPrice),
+      currentValueUsd: round(currentValueUsd),
+      roundedExitSizeUsd,
+      minProfitBuffer: round(profitBuffer),
+    };
+  }
   const expectedEdge = Math.max(minEdge, Math.abs(book.bestBid - avgCost));
   const confidence = clamp(
     trigger === 'oracle_reversal' ? 0.78 :
@@ -713,7 +797,7 @@ function buildExitPlan({
       outcome,
       side: 'sell',
       price: round(Number(book.bestBid)),
-      sizeUsd: round(currentValueUsd, 2),
+      sizeUsd: roundedExitSizeUsd,
       expectedEdge: round(expectedEdge),
       confidence: round(confidence),
       ttlMs: 10_000,

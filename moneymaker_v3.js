@@ -265,9 +265,17 @@ const CONFIG = {
   makerSpreadMultiplier: envNum('MAKER_SPREAD_MULTIPLIER', 1.2),
 
   minSignalEdge: envNum('MIN_SIGNAL_EDGE', 0.008),
+  standardMinSignalEdge: envNum('STANDARD_MIN_SIGNAL_EDGE', 0.004),
   paperConfidenceProfile: envStr('PAPER_CONFIDENCE_PROFILE', 'balanced'),
   spreadHunterMinConfidencePaper: envNum('SPREADHUNTER_MIN_CONFIDENCE_PAPER', 0.35),
+  standardPaperMinConfidence: envNum('STANDARD_PAPER_MIN_CONFIDENCE', 0.58),
+  standardChurnCooldownMs: envInt('STANDARD_CHURN_COOLDOWN_SEC', 60) * 1000,
+  standardChurnMinEdgeImprovement: envNum('STANDARD_CHURN_MIN_EDGE_IMPROVEMENT', 0.003),
   minConfidence: envNum('MIN_CONFIDENCE', 0.45),
+  paperRealisticFills: envBool('PAPER_REALISTIC_FILLS', true),
+  paperFillMinDelayMs: envInt('PAPER_FILL_MIN_DELAY_MS', 1_000),
+  paperFillMaxBookAgeMs: envInt('PAPER_FILL_MAX_BOOK_AGE_MS', 3_000),
+  paperQueueHaircutPct: envNum('PAPER_QUEUE_HAIRCUT_PCT', 0.50),
   slippageBuffer: envNum('SLIPPAGE_BUFFER', 0.004),
   adverseSelectionBuffer: envNum('ADVERSE_SELECTION_BUFFER', 0.006),
 
@@ -323,10 +331,34 @@ const CONFIG = {
   gabagoolTelegramNotifyRiskBlocks: envBool('GABAGOOL_TELEGRAM_NOTIFY_RISK_BLOCKS', true),
   gabagoolTelegramNotifyOrders: envBool('GABAGOOL_TELEGRAM_NOTIFY_ORDERS', true),
   gabagoolTelegramNotifyFills: envBool('GABAGOOL_TELEGRAM_NOTIFY_FILLS', true),
+  paperTelegramDigestEnabled: envBool('PAPER_TELEGRAM_DIGEST_ENABLED', true),
+  paperTelegramDigestEveryMs: envInt('PAPER_TELEGRAM_DIGEST_EVERY_MS', 300_000),
   gabagoolTelegramBlockDedupeMs: envInt('GABAGOOL_TELEGRAM_BLOCK_DEDUPE_MS', 60_000),
+  gabagoolTelegramRiskBlockDedupeMs: envInt(
+    'GABAGOOL_TELEGRAM_RISK_BLOCK_DEDUPE_MS',
+    envInt('GABAGOOL_TELEGRAM_BLOCK_DEDUPE_MS', 120_000)
+  ),
+  gabagoolMaxPaperDrawdownPct: envNum('GABAGOOL_MAX_PAPER_DRAWDOWN_PCT', 2.0),
+  gabagoolMaxPaperClosedLossUsd: envNum('GABAGOOL_MAX_PAPER_CLOSED_LOSS_USD', 0.75),
+  gabagoolPauseEntriesOnLoss: envBool('GABAGOOL_PAUSE_ENTRIES_ON_LOSS', true),
+  gabagoolLossGuardExitMode: envStr('GABAGOOL_LOSS_GUARD_EXIT_MODE', 'reduce_only'),
+  gabagoolMaxRoundTripsPerTokenPerMarket: envInt('GABAGOOL_MAX_ROUND_TRIPS_PER_TOKEN_PER_MARKET', 2),
+  gabagoolReenterCooldownMs: envInt('GABAGOOL_REENTER_COOLDOWN_MS', 30_000),
+  gabagoolAllowMarketReentry: envBool('GABAGOOL_ALLOW_MARKET_REENTRY', false),
+  gabagoolAllowDustExits: envBool('GABAGOOL_ALLOW_DUST_EXITS', true),
+  gabagoolMinDustExitUsd: envNum('GABAGOOL_MIN_DUST_EXIT_USD', 0.01),
+  gabagoolMinProfitBuffer: envNum('GABAGOOL_MIN_PROFIT_BUFFER', 0.01),
   gabagoolMinPrice: envNum('GABAGOOL_MIN_PRICE', 0.02),
+  gabagoolMaxEntryPrice: envNum('GABAGOOL_MAX_ENTRY_PRICE', 0.85),
   gabagoolMaxPrice: envNum('GABAGOOL_MAX_PRICE', 0.98),
+  gabagoolAllowHighPriceEntryEdge: envNum('GABAGOOL_ALLOW_HIGH_PRICE_ENTRY_EDGE', 0.20),
+  gabagoolMinConfidence: envNum('GABAGOOL_MIN_CONFIDENCE', 0.50),
+  gabagoolMinConfidenceLive: envNum('GABAGOOL_MIN_CONFIDENCE_LIVE', 0.70),
   gabagoolMinExpectedEdge: envNum('GABAGOOL_MIN_EXPECTED_EDGE', 0.0001),
+  mixedModeBtcOrderShareCap: envNum('MIXED_MODE_BTC_ORDER_SHARE_CAP', 0.75),
+  btcExposureBucketShare: envNum('BTC_EXPOSURE_BUCKET_SHARE', 0.5),
+  standardExposureBucketShare: envNum('STANDARD_EXPOSURE_BUCKET_SHARE', 0.5),
+  reduceOnlyMinExitUsd: envNum('REDUCE_ONLY_MIN_EXIT_USD', 0.01),
   enableBtcOracleReport: envBool('ENABLE_BTC_ORACLE_REPORT', true),
   btcOracleReportEveryMs: envInt('BTC_ORACLE_REPORT_EVERY_MS', 60_000),
   btcOracleReportTelegram: envBool('BTC_ORACLE_REPORT_TELEGRAM', false),
@@ -665,6 +697,7 @@ class MarketCache {
     this.books = new Map();
     this.marketsById = new Map();
     this.assetsByToken = new Map();
+    this.negativeBookCache = new Map();
   }
 
   setCandidates(assets) {
@@ -696,14 +729,52 @@ class MarketCache {
   }
 
   async getFreshBook(tokenId, maxAgeMs = 1_500) {
-    const cached = this.getBook(tokenId);
+    const key = String(tokenId || '');
+    const negativeCache = this.negativeBookCache.get(key);
+    if (negativeCache && Number(negativeCache.expiresAt || 0) > Date.now()) {
+      const cooldownMsRemaining = Math.max(0, Number(negativeCache.expiresAt || 0) - Date.now());
+      const cachedError = new Error(
+        `Negative-cached orderbook miss for ${key}: ${negativeCache.message || negativeCache.reason || 'unknown'}`
+      );
+      cachedError.mmBookFetchStatus = 'stale_token_cooldown';
+      cachedError.mmNoOrderbookConfirmed = true;
+      cachedError.mmNegativeCacheHit = true;
+      cachedError.mmCooldownMsRemaining = cooldownMsRemaining;
+      cachedError.mmOriginalBookFetchReason = negativeCache.reason || null;
+      cachedError.mmOriginalErrorMessage = negativeCache.message || null;
+      throw cachedError;
+    }
+    if (negativeCache) this.negativeBookCache.delete(key);
+
+    const cached = this.getBook(key);
     if (cached && Date.now() - (cached.cachedAt || 0) <= maxAgeMs && cached.midpoint !== null) {
       return cached;
     }
 
-    const book = await this.poly.getOrderBook(tokenId);
-    this.setBook(tokenId, book);
-    return book;
+    try {
+      const book = await this.poly.getOrderBook(key);
+      this.negativeBookCache.delete(key);
+      this.setBook(key, book);
+      return book;
+    } catch (error) {
+      const message = String(error?.message || '');
+      const confirmedNoOrderbook = /HTTP\s+404\b/i.test(message) && /No orderbook exists/i.test(message);
+      if (confirmedNoOrderbook) {
+        const cooldownMs = 5 * 60_000;
+        this.negativeBookCache.set(key, {
+          reason: 'no_orderbook_404',
+          message,
+          tokenId: key,
+          ts: Date.now(),
+          expiresAt: Date.now() + cooldownMs,
+        });
+        error.mmBookFetchStatus = 'no_orderbook_404';
+        error.mmNoOrderbookConfirmed = true;
+        error.mmNegativeCacheHit = false;
+        error.mmCooldownMsRemaining = cooldownMs;
+      }
+      throw error;
+    }
   }
 
   markPrices() {
@@ -1008,6 +1079,76 @@ function topDepthUsd(levels, n) {
   return (levels || []).slice(0, n).reduce((sum, level) => sum + level.price * level.size, 0);
 }
 
+const PAPER_FILL_SOURCES = new Set([
+  'crossed_bid_ask',
+  'resting_queue',
+  'touch_fill',
+  'instant_sim',
+  'forced_test_fill',
+  'unknown',
+]);
+
+function normalizePaperFillSource(value) {
+  const source = String(value || '').trim().toLowerCase();
+  return PAPER_FILL_SOURCES.has(source) ? source : 'unknown';
+}
+
+function bestBidAskExecutable(side, orderPrice, bestBid, bestAsk, epsilon = 1e-9) {
+  const px = Number(orderPrice);
+  const bid = Number(bestBid);
+  const ask = Number(bestAsk);
+  const normalizedSide = String(side || '').toLowerCase();
+  if (!Number.isFinite(px) || px <= 0) return false;
+  if (normalizedSide === 'buy') {
+    return Number.isFinite(ask) && ask > 0 && px + epsilon >= ask;
+  }
+  if (normalizedSide === 'sell') {
+    return Number.isFinite(bid) && bid > 0 && px <= bid + epsilon;
+  }
+  return false;
+}
+
+function isZeroSecondPaperFill(fillDelayMs) {
+  return Number.isFinite(Number(fillDelayMs)) && Number(fillDelayMs) >= 0 && Number(fillDelayMs) < 1_000;
+}
+
+function paperFillTrusted(fill, config = CONFIG) {
+  const source = normalizePaperFillSource(fill?.fillSource);
+  const invalidSource = source === 'instant_sim' || source === 'forced_test_fill' || source === 'unknown';
+  const executableAtFill = fill?.wasExecutableAtFill === true;
+  const staleBook = Number.isFinite(Number(fill?.bookAgeMs)) &&
+    Number(fill.bookAgeMs) > Math.max(0, Number(config?.paperFillMaxBookAgeMs || 0));
+  const zeroSecondNeedsProof = isZeroSecondPaperFill(fill?.fillDelayMs) && source !== 'crossed_bid_ask';
+  return !invalidSource && executableAtFill && !staleBook && !zeroSecondNeedsProof;
+}
+
+function fillSourceCountsObject(fills = []) {
+  const counts = {
+    crossed_bid_ask: 0,
+    resting_queue: 0,
+    touch_fill: 0,
+    instant_sim: 0,
+    forced_test_fill: 0,
+    unknown: 0,
+  };
+  for (const fill of fills || []) {
+    const source = normalizePaperFillSource(fill?.fillSource);
+    counts[source] += 1;
+  }
+  return counts;
+}
+
+function formatFillSourceCounts(counts = {}) {
+  return [
+    `crossed_bid_ask:${Number(counts.crossed_bid_ask || 0)}`,
+    `resting_queue:${Number(counts.resting_queue || 0)}`,
+    `touch_fill:${Number(counts.touch_fill || 0)}`,
+    `instant_sim:${Number(counts.instant_sim || 0)}`,
+    `forced_test_fill:${Number(counts.forced_test_fill || 0)}`,
+    `unknown:${Number(counts.unknown || 0)}`,
+  ].join(',');
+}
+
 function estimateLiquidityConsumption(book, side, sizeUsd, config = CONFIG) {
   if (!book || !Number.isFinite(sizeUsd) || sizeUsd <= 0) {
     return { consumedPct: 1, penalty: 0, topDepthUsd: 0 };
@@ -1162,6 +1303,19 @@ class Strategy {
   }
 
   skip(asset, book, reason, extra = {}) {
+    this.portfolio?.recordExecutionEvent?.('strategy_skip', {
+      tokenId: asset?.tokenId,
+      marketId: asset?.market?.marketId,
+      marketSlug: asset?.market?.marketSlug,
+      outcome: asset?.outcome,
+      strategy: this.name,
+      side: extra?.side || null,
+      reason,
+      price: numericOrNull(book?.midpoint),
+      expectedEdge: numericOrNull(extra?.edgeEstimate),
+      confidence: numericOrNull(extra?.confidence),
+      source: 'strategy_generate_skip',
+    });
     if (this.shouldLogDiagnostic(asset, reason)) {
       info(`[RAW SIGNAL COUNT] count=0 skipReason=${reason} ${this.formatGenerateContext(asset, book, extra)}`);
     }
@@ -1232,6 +1386,7 @@ class SpreadHunterStrategy extends Strategy {
       baseUsd *= dangerScale;
     }
 
+    const minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0));
     let buyUsd = Math.max(0, baseUsd * (1 - Math.max(0, invRatio)));
     let sellUsd = Math.max(0, baseUsd * (1 + Math.min(0, invRatio)));
     let ghostThrottle = null;
@@ -1243,15 +1398,29 @@ class SpreadHunterStrategy extends Strategy {
       const favorablePct = (this.portfolio.ghostStats.favorable / Math.max(1, this.portfolio.ghostStats.total)) * 100;
       if (favorablePct < this.config.spreadHunterMinGhostFavorablePct) {
         const multiplier = clamp(this.config.spreadHunterGhostSizeMultiplier, 0.05, 1);
+        const buyUsdBeforeGhost = buyUsd;
         buyUsd *= multiplier;
-        sellUsd *= multiplier;
+        const action = buyUsd >= minOrderUsd
+          ? 'entry_size_reduced'
+          : (sellUsd >= minOrderUsd && this.portfolio.position(asset.tokenId) > 0 ? 'exits_only' : 'entry_blocked');
         ghostThrottle = {
           favorablePct: Number(favorablePct.toFixed(2)),
           thresholdPct: this.config.spreadHunterMinGhostFavorablePct,
           samples: this.portfolio.ghostStats.total,
           sizeMultiplier: multiplier,
+          action,
+          buyUsdBefore: Number(buyUsdBeforeGhost.toFixed(6)),
+          buyUsdAfter: Number(buyUsd.toFixed(6)),
           reason: 'SpreadHunter ghost favorable rate below threshold',
         };
+        if (this.shouldLogDiagnostic(asset, 'ghost_throttle', 15_000)) {
+          warn(
+            `[GHOST THROTTLE] favorable=${ghostThrottle.favorablePct} action=${action} ` +
+            `token=${shortId(asset?.tokenId)} threshold=${cleanLogValue(ghostThrottle.thresholdPct)} ` +
+            `samples=${ghostThrottle.samples} buyUsdBefore=${cleanLogValue(ghostThrottle.buyUsdBefore)} ` +
+            `buyUsdAfter=${cleanLogValue(ghostThrottle.buyUsdAfter)}`
+          );
+        }
       }
     }
 
@@ -1269,7 +1438,8 @@ class SpreadHunterStrategy extends Strategy {
       ((ask - bid) / 2 - this.config.slippageBuffer - this.config.adverseSelectionBuffer) * makerLiquidityPenalty
     );
 
-    const requiredEdge = this.config.minSignalEdge * volatilityEdgeMultiplier;
+    const strategyMinEdge = minSignalEdgeForCandidate({ strategy: this.name }, this.config);
+    const requiredEdge = strategyMinEdge * volatilityEdgeMultiplier;
     const edgeDiagnostics = {
       bid,
       ask,
@@ -1284,6 +1454,7 @@ class SpreadHunterStrategy extends Strategy {
       worstLiquidityPenalty,
       makerLiquidityPenalty,
       edgeEstimate,
+      strategyMinEdge,
       requiredEdge,
       volatilityEdgeMultiplier,
     };
@@ -1296,16 +1467,73 @@ class SpreadHunterStrategy extends Strategy {
       confidence = clamp(confidence * ghostThrottle.sizeMultiplier, 0, 0.85);
     }
 
+    const health = this.portfolio.executionHealth(Date.now());
+    const paperFlowStarved = (
+      this.config.enableLiveTrading !== true &&
+      this.portfolio.openOrders.size === 0 &&
+      Number(health.paperOrdersPlacedLastHour || 0) === 0
+    );
+    const baseConfidenceFloor = Number(this.config.minConfidence || 0);
+    const standardPaperConfidenceFloor = Number.isFinite(Number(this.config.standardPaperMinConfidence))
+      ? Number(this.config.standardPaperMinConfidence)
+      : baseConfidenceFloor;
+    const spreadHunterPaperConfidenceFloor = Number.isFinite(Number(this.config.spreadHunterMinConfidencePaper))
+      ? Number(this.config.spreadHunterMinConfidencePaper)
+      : standardPaperConfidenceFloor;
+    const strictPaperConfidenceFloor = clamp(
+      Math.max(
+        Math.min(baseConfidenceFloor, standardPaperConfidenceFloor),
+        Math.min(baseConfidenceFloor, spreadHunterPaperConfidenceFloor)
+      ),
+      0,
+      1
+    );
+    const probationConfidenceFloor = clamp(
+      Math.max(
+        0.34,
+        Math.min(
+          strictPaperConfidenceFloor - 0.01,
+          Number(this.config.paperMakerRecoveryMinConfidence || 0.35) - 0.01,
+          Number(this.config.sophieBootstrapMinConfidence || 0.38) - 0.04
+        )
+      ),
+      0,
+      1
+    );
+    const probationTinyOrderUsd = Math.max(minOrderUsd, 1);
+    const probationEligible = (
+      paperFlowStarved &&
+      Number(edgeEstimate) >= strategyMinEdge &&
+      Number(confidence) < strictPaperConfidenceFloor &&
+      Number(confidence) >= probationConfidenceFloor
+    );
+
     const signals = [];
 
-    if (buyUsd >= this.config.minOrderUsd) {
+    if (buyUsd >= this.config.minOrderUsd || probationEligible) {
+      const paperProbation = probationEligible
+        ? {
+          active: true,
+          paperOnly: true,
+          trigger: ghostThrottle ? 'ghost_throttle_zero_order_drought' : 'confidence_zero_order_drought',
+          minConfidence: Number(probationConfidenceFloor.toFixed(3)),
+          strictMinConfidence: Number(strictPaperConfidenceFloor.toFixed(3)),
+          tinySizeUsd: Number(probationTinyOrderUsd.toFixed(2)),
+          edgeFloor: Number(strategyMinEdge.toFixed(4)),
+          ordersPlacedLastHour: Number(health.paperOrdersPlacedLastHour || 0),
+          openOrders: Number(this.portfolio.openOrders.size || 0),
+          ghostThrottleActive: ghostThrottle ? true : false,
+          buyUsdBefore: Number(buyUsd.toFixed(6)),
+          buyUsdAfter: Number(probationTinyOrderUsd.toFixed(6)),
+        }
+        : null;
       signals.push(new Signal({
         strategy: this.name,
         tokenId: asset.tokenId,
         marketId: asset.market.marketId,
         side: 'buy',
         price: bid,
-        sizeUsd: buyUsd,
+        sizeUsd: probationEligible ? probationTinyOrderUsd : buyUsd,
         expectedEdge: edgeEstimate,
         confidence,
         reason: `Wide spread hunter: spread=${fmtPrice(spread)}, inv=${(invRatio * 100).toFixed(1)}%, liqUse=${(buyLiquidity.consumedPct * 100).toFixed(1)}%`,
@@ -1319,9 +1547,36 @@ class SpreadHunterStrategy extends Strategy {
           liquidityConsumedPct: buyLiquidity.consumedPct,
           liquidityPenalty: buyLiquidity.penalty,
           entryMid: mark,
+          ...(paperProbation ? { paperProbation } : {}),
           ...(ghostThrottle ? { ghostThrottle } : {}),
         },
       }));
+      const probationTraceNearFloor = (
+        paperFlowStarved &&
+        Number(edgeEstimate) >= strategyMinEdge &&
+        Number(confidence) >= Math.max(0, probationConfidenceFloor - 0.05) &&
+        Number(confidence) <= Math.min(1, strictPaperConfidenceFloor + 0.02)
+      );
+      if (probationTraceNearFloor && this.shouldLogDiagnostic(asset, 'paper_probation_trace', 30_000)) {
+        const probationTraceReason = probationEligible
+          ? 'eligible'
+          : Number(confidence) < probationConfidenceFloor
+            ? 'confidence_below_probation_floor'
+            : Number(confidence) >= strictPaperConfidenceFloor
+              ? 'confidence_at_or_above_strict_floor'
+              : Number(edgeEstimate) < strategyMinEdge
+                ? 'edge_below_standard_min'
+                : 'paper_flow_not_starved';
+        info(
+          `[PAPER PROBATION TRACE] stage=generate strategy=${this.name} token=${shortId(asset?.tokenId)} ` +
+          `edge=${cleanLogValue(edgeEstimate)} confidence=${cleanLogValue(confidence)} ` +
+          `probationEligible=${probationEligible ? 'true' : 'false'} ` +
+          `hasPaperProbationMetadata=${probationEligible ? 'true' : 'false'} ` +
+          `paperFlowStarved=${paperFlowStarved ? 'true' : 'false'} ` +
+          `strictFloor=${cleanLogValue(strictPaperConfidenceFloor)} probationFloor=${cleanLogValue(probationConfidenceFloor)} ` +
+          `reason=${probationTraceReason}`
+        );
+      }
     }
 
     if (sellUsd >= this.config.minOrderUsd && this.portfolio.position(asset.tokenId) > 0) {
@@ -1348,6 +1603,19 @@ class SpreadHunterStrategy extends Strategy {
           ...(ghostThrottle ? { ghostThrottle } : {}),
         },
       }));
+    }
+
+    if (signals.length === 0 && ghostThrottle) {
+      return this.skip(asset, book, 'ghost_throttle', {
+        ...edgeDiagnostics,
+        confidence,
+        favorablePct: ghostThrottle.favorablePct,
+        thresholdPct: ghostThrottle.thresholdPct,
+        samples: ghostThrottle.samples,
+        buyUsdBeforeGhost: ghostThrottle.buyUsdBefore,
+        buyUsdAfterGhost: ghostThrottle.buyUsdAfter,
+        ghostThrottleAction: ghostThrottle.action,
+      });
     }
 
     if (signals.length === 0) {
@@ -2054,7 +2322,7 @@ class MultiConsensusEngine {
       };
     }
 
-    if (isGabagoolStrategy(signal.strategy)) {
+    if (isGabagoolStrategy(signal)) {
       return this.executeGabagoolOracleStrategy(marketData);
     }
 
@@ -2515,7 +2783,7 @@ class MultiConsensusEngine {
   }
 
   scoreStructure(signal, asset, book, cache) {
-    if (isGabagoolStrategy(signal.strategy)) {
+    if (isGabagoolStrategy(signal)) {
       const freshOracle = signal.metadata?.gabagool?.oracleSignalFresh === true;
       const exitIntent = signal.metadata?.gabagool?.exitIntent === true;
       return clamp((freshOracle ? 0.72 : 0.55) + (exitIntent ? 0.06 : 0), 0, 1);
@@ -2612,7 +2880,7 @@ class MultiConsensusEngine {
   }
 
   scoreTiming(signal, asset) {
-    if (isGabagoolStrategy(signal.strategy)) {
+    if (isGabagoolStrategy(signal)) {
       const exitIntent = signal.metadata?.gabagool?.exitIntent === true;
       const secondsIntoWindow = Number(signal.metadata?.gabagool?.secondsIntoWindow);
       if (exitIntent) return 0.78;
@@ -2687,6 +2955,8 @@ class PaperPortfolio {
     this.peakEquity = config.initialCash;
     this.positions = new Map();
     this.costBasis = new Map();
+    this.positionMarkets = new Map();
+    this.latestMarks = new Map();
     this.openOrders = new Map();
     this.closedPnl = 0;
     this.strategyPnl = new Map();
@@ -2702,6 +2972,68 @@ class PaperPortfolio {
     };
   }
 
+  fillTrustFlags(fill = {}) {
+    const source = normalizePaperFillSource(fill?.fillSource);
+    const trustedFill = paperFillTrusted(fill, this.config);
+    const invalidSource = source === 'instant_sim' || source === 'forced_test_fill' || source === 'unknown';
+    const staleBook = Number.isFinite(Number(fill?.bookAgeMs)) &&
+      Number(fill.bookAgeMs) > Math.max(0, Number(this.config.paperFillMaxBookAgeMs || 0));
+    const zeroSecondWithoutCross = isZeroSecondPaperFill(fill?.fillDelayMs) && source !== 'crossed_bid_ask';
+    return {
+      fillSource: source,
+      trustedFill,
+      fillInvalid: invalidSource || staleBook || zeroSecondWithoutCross || fill?.wasExecutableAtFill === false,
+      fillInvalidReason: invalidSource
+        ? `invalid_source:${source}`
+        : fill?.wasExecutableAtFill === false
+          ? 'non_executable_fill'
+          : staleBook
+            ? 'stale_book'
+            : zeroSecondWithoutCross
+              ? 'zero_second_without_cross'
+              : null,
+    };
+  }
+
+  fillsForToken(tokenId) {
+    const key = String(tokenId || '');
+    return this.fills
+      .filter((fill) => String(fill?.tokenId || '') === key)
+      .slice()
+      .sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+  }
+
+  reconstructLotsForToken(tokenId) {
+    const relevantFills = this.fillsForToken(tokenId);
+    const lots = [];
+    for (const fill of relevantFills) {
+      const qty = Number(fill?.size || 0);
+      const price = Number(fill?.price || 0);
+      if (!(qty > 0) || !(price > 0)) continue;
+      if (String(fill?.side || '').toLowerCase() === 'buy') {
+        const trust = this.fillTrustFlags(fill);
+        lots.push({
+          qty,
+          price,
+          ts: Number(fill?.ts || 0),
+          trustedFill: trust.trustedFill,
+          fillSource: trust.fillSource,
+        });
+        continue;
+      }
+      if (String(fill?.side || '').toLowerCase() !== 'sell') continue;
+      let remainingQty = qty;
+      while (remainingQty > 1e-9 && lots.length > 0) {
+        const lot = lots[0];
+        const matchedQty = Math.min(remainingQty, lot.qty);
+        lot.qty -= matchedQty;
+        remainingQty -= matchedQty;
+        if (lot.qty <= 1e-9) lots.shift();
+      }
+    }
+    return lots;
+  }
+
   position(tokenId) {
     return this.positions.get(String(tokenId)) || 0;
   }
@@ -2710,44 +3042,176 @@ class PaperPortfolio {
     return this.costBasis.get(String(tokenId)) || 0;
   }
 
+  positionCostDetails(tokenId) {
+    const key = String(tokenId || '');
+    const currentQty = this.position(key);
+    const fallbackAvgEntryPrice = this.avgCost(key);
+    if (!(currentQty > 0)) {
+      return {
+        tokenId: key,
+        qty: 0,
+        costUsd: 0,
+        avgEntryPrice: 0,
+        source: 'no_position',
+      };
+    }
+
+    const lots = this.reconstructLotsForToken(key);
+
+    const reconstructedQty = lots.reduce((sum, lot) => sum + Number(lot.qty || 0), 0);
+    const reconstructedCostUsd = lots.reduce((sum, lot) => sum + (Number(lot.qty || 0) * Number(lot.price || 0)), 0);
+    const qtyMatches = Math.abs(reconstructedQty - currentQty) <= Math.max(1e-6, currentQty * 1e-4);
+    if (!qtyMatches || !(reconstructedQty > 0) || !(reconstructedCostUsd > 0)) {
+      return {
+        tokenId: key,
+        qty: currentQty,
+        costUsd: currentQty * fallbackAvgEntryPrice,
+        avgEntryPrice: fallbackAvgEntryPrice,
+        source: 'cost_basis_fallback',
+        reconstructedQty,
+      };
+    }
+
+    return {
+      tokenId: key,
+      qty: reconstructedQty,
+      costUsd: reconstructedCostUsd,
+      avgEntryPrice: reconstructedCostUsd / reconstructedQty,
+      source: 'fills',
+    };
+  }
+
   positionUsd(tokenId, mark) {
     return this.position(tokenId) * (Number.isFinite(mark) ? mark : this.avgCost(tokenId));
   }
 
-  marketExposureUsd(marketId, fallbackMark = 0.5) {
-    let total = 0;
-    const targetMarketId = String(marketId || '');
-
-    for (const order of this.openOrders.values()) {
-      if (String(order.marketId || '') === targetMarketId) {
-        total += order.remainingUsd();
-      }
+  setMarkPrice(tokenId, mark) {
+    const key = String(tokenId || '');
+    if (!key) return;
+    if (Number.isFinite(Number(mark)) && Number(mark) > 0) {
+      this.latestMarks.set(key, Number(mark));
+      return;
     }
-
-    const countedTokenIds = new Set();
-    for (const fill of this.fills) {
-      if (String(fill.marketId || '') !== targetMarketId) continue;
-      if (!fill.tokenId) continue;
-      countedTokenIds.add(String(fill.tokenId));
-    }
-
-    for (const tokenId of countedTokenIds) {
-      const qty = this.position(tokenId);
-      if (qty > 0) total += qty * fallbackMark;
-    }
-
-    return total;
+    this.latestMarks.delete(key);
   }
 
-  totalExposureUsd(fallbackMark = 0.5) {
-    let total = 0;
-    for (const [tokenId, qty] of this.positions.entries()) {
-      if (qty > 0) total += qty * fallbackMark;
+  setMarkPrices(markPrices = new Map()) {
+    if (!markPrices || typeof markPrices.entries !== 'function') return;
+    for (const [tokenId, mark] of markPrices.entries()) {
+      this.setMarkPrice(tokenId, mark);
     }
+  }
+
+  markPricesSnapshot() {
+    return new Map(this.latestMarks);
+  }
+
+  positionMarketId(tokenId) {
+    const key = String(tokenId || '');
+    if (!key) return '';
+    const direct = String(this.positionMarkets.get(key) || '');
+    if (direct) return direct;
+    for (let i = this.fills.length - 1; i >= 0; i -= 1) {
+      const fill = this.fills[i];
+      if (String(fill?.tokenId || '') !== key) continue;
+      const marketId = String(fill?.marketId || '');
+      if (!marketId) continue;
+      this.positionMarkets.set(key, marketId);
+      return marketId;
+    }
+    return '';
+  }
+
+  resolveExposureContext(markSource = null) {
+    if (markSource instanceof Map) {
+      return {
+        markMap: markSource,
+        numericFallback: null,
+      };
+    }
+    if (Number.isFinite(Number(markSource)) && Number(markSource) > 0) {
+      return {
+        markMap: null,
+        numericFallback: Number(markSource),
+      };
+    }
+    return {
+      markMap: null,
+      numericFallback: null,
+    };
+  }
+
+  markPriceForExposure(tokenId, markSource = null) {
+    const key = String(tokenId || '');
+    const { markMap, numericFallback } = this.resolveExposureContext(markSource);
+    const mapMark = markMap?.get(key);
+    if (Number.isFinite(Number(mapMark)) && Number(mapMark) > 0) return Number(mapMark);
+    const cachedMark = this.latestMarks.get(key);
+    if (Number.isFinite(Number(cachedMark)) && Number(cachedMark) > 0) return Number(cachedMark);
+    const avgCost = this.avgCost(key);
+    if (Number.isFinite(Number(avgCost)) && Number(avgCost) > 0) return Number(avgCost);
+    if (Number.isFinite(Number(numericFallback)) && Number(numericFallback) > 0) return Number(numericFallback);
+    return 0;
+  }
+
+  positionExposureEntries(markSource = null) {
+    return [...this.positions.entries()]
+      .filter(([, qty]) => Number(qty) > 0)
+      .map(([tokenId, qty]) => {
+        const marketId = this.positionMarketId(tokenId);
+        const mark = this.markPriceForExposure(tokenId, markSource);
+        return {
+          tokenId: String(tokenId),
+          marketId,
+          qty: Number(qty),
+          mark,
+          valueUsd: Number(qty) * mark,
+        };
+      });
+  }
+
+  positionExposureUsd(markSource = null) {
+    return this.positionExposureEntries(markSource)
+      .reduce((sum, entry) => sum + entry.valueUsd, 0);
+  }
+
+  exposureIncreasingOpenOrders(filterFn = null) {
+    return [...this.openOrders.values()]
+      .filter((order) => order.side === 'buy')
+      .filter((order) => (typeof filterFn === 'function' ? filterFn(order) : true));
+  }
+
+  grossOpenOrderUsd() {
+    let total = 0;
     for (const order of this.openOrders.values()) {
       total += order.remainingUsd();
     }
     return total;
+  }
+
+  marketExposureUsd(marketId, markSource = null) {
+    const targetMarketId = String(marketId || '');
+    const positionExposureUsd = this.positionExposureEntries(markSource)
+      .filter((entry) => String(entry.marketId || '') === targetMarketId)
+      .reduce((sum, entry) => sum + entry.valueUsd, 0);
+    const openOrderExposureUsd = this.exposureIncreasingOpenOrders(
+      (order) => String(order.marketId || '') === targetMarketId
+    ).reduce((sum, order) => sum + order.remainingUsd(), 0);
+    return positionExposureUsd + openOrderExposureUsd;
+  }
+
+  totalExposureUsd(markSource = null) {
+    return this.positionExposureUsd(markSource) + this.openOrderExposureUsd();
+  }
+
+  portfolioExposureBreakdown(markSource = null) {
+    const positionExposureUsd = this.positionExposureUsd(markSource);
+    const openOrderExposureUsd = this.openOrderExposureUsd();
+    return {
+      positionExposureUsd,
+      openOrderExposureUsd,
+      totalExposureUsd: positionExposureUsd + openOrderExposureUsd,
+    };
   }
 
   equity(markPrices = new Map()) {
@@ -2773,11 +3237,7 @@ class PaperPortfolio {
   }
 
   totalOpenOrderUsd() {
-    let total = 0;
-    for (const order of this.openOrders.values()) {
-      total += order.remainingUsd();
-    }
-    return total;
+    return this.grossOpenOrderUsd();
   }
 
   openBuyOrderUsd() {
@@ -2819,43 +3279,34 @@ class PaperPortfolio {
       .sort((a, b) => a.order.createdAt - b.order.createdAt);
   }
 
-  positionExposureUsd(markPrices = new Map()) {
-    let total = 0;
-    for (const [tokenId, qty] of this.positions.entries()) {
-      if (qty <= 0) continue;
-      const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
-      total += qty * mark;
-    }
-    return total;
-  }
-
   openOrderExposureUsd() {
-    return this.totalOpenOrderUsd();
+    return this.exposureIncreasingOpenOrders()
+      .reduce((sum, order) => sum + order.remainingUsd(), 0);
   }
 
-  dustPositions(markPrices = new Map()) {
+  dustPositions(markSource = null) {
     return [...this.positions.entries()]
       .filter(([, qty]) => qty > 0)
       .map(([tokenId, qty]) => {
-        const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
+        const mark = this.markPriceForExposure(tokenId, markSource);
         return { tokenId, qty, mark, value: qty * mark };
       })
       .filter((pos) => pos.value > 0 && pos.value < this.config.minOrderUsd);
   }
 
-  dustSummary(markPrices = new Map()) {
-    const positions = this.dustPositions(markPrices);
+  dustSummary(markSource = null) {
+    const positions = this.dustPositions(markSource);
     return {
       count: positions.length,
       valueUsd: positions.reduce((sum, pos) => sum + pos.value, 0),
     };
   }
 
-  topPositions(markPrices = new Map(), limit = 10) {
+  topPositions(markSource = null, limit = 10) {
     return [...this.positions.entries()]
       .filter(([, qty]) => qty > 0)
       .map(([tokenId, qty]) => {
-        const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
+        const mark = this.markPriceForExposure(tokenId, markSource);
         return { tokenId, qty, mark, avg: this.avgCost(tokenId), value: qty * mark };
       })
       .sort((a, b) => b.value - a.value)
@@ -2878,7 +3329,7 @@ class PaperPortfolio {
 
   strategyOpenOrderExposure() {
     const totals = new Map();
-    for (const order of this.openOrders.values()) {
+    for (const order of this.exposureIncreasingOpenOrders()) {
       const key = order.strategy || 'UNKNOWN';
       totals.set(key, (totals.get(key) || 0) + order.remainingUsd());
     }
@@ -2887,11 +3338,14 @@ class PaperPortfolio {
       .sort((a, b) => b.exposureUsd - a.exposureUsd);
   }
 
-  openOrderExposureByStrategy(strategyMatcher = () => true) {
+  openOrderExposureByStrategy(strategyMatcher = () => true, { includeSellOrders = false } = {}) {
     const perToken = new Map();
     let totalUsd = 0;
     let maxExposureUsd = 0;
-    for (const order of this.openOrders.values()) {
+    const orders = includeSellOrders
+      ? [...this.openOrders.values()]
+      : this.exposureIncreasingOpenOrders();
+    for (const order of orders) {
       if (!strategyMatcher(order.strategy)) continue;
       const remainingUsd = Number(order.remainingUsd() || 0);
       if (!(remainingUsd > 0)) continue;
@@ -2925,11 +3379,15 @@ class PaperPortfolio {
     let grossBuyQty = 0;
     let grossSellQty = 0;
     let realizedPnl = 0;
+    let trustedClosedPnl = 0;
+    let untrustedClosedPnl = 0;
     let holdQty = 0;
     let holdWeightedSeconds = 0;
     let winCount = 0;
     let lossCount = 0;
     let breakevenCount = 0;
+    let dustExitPnl = 0;
+    const roundTrips = [];
 
     for (const fill of relevantFills) {
       const tokenId = String(fill.tokenId || '');
@@ -2937,6 +3395,7 @@ class PaperPortfolio {
         tokenState.set(tokenId, {
           tokenId,
           marketId: String(fill.marketId || this.positionMarkets?.get?.(tokenId) || ''),
+          marketSlug: String(fill.marketSlug || ''),
           lots: [],
           grossBuyUsd: 0,
           grossSellUsd: 0,
@@ -2946,17 +3405,25 @@ class PaperPortfolio {
       }
       const state = tokenState.get(tokenId);
       state.marketId = state.marketId || String(fill.marketId || this.positionMarkets?.get?.(tokenId) || '');
+      state.marketSlug = state.marketSlug || String(fill.marketSlug || '');
       const qty = Number(fill.size || 0);
       const price = Number(fill.price || 0);
       const value = Number.isFinite(Number(fill.value)) ? Number(fill.value) : qty * price;
       if (!(qty > 0) || !(price > 0)) continue;
 
       if (fill.side === 'buy') {
+        const fillTrust = this.fillTrustFlags(fill);
         grossBuyUsd += value;
         grossBuyQty += qty;
         state.grossBuyUsd += value;
         state.grossBuyQty += qty;
-        state.lots.push({ qty, price, ts: Number(fill.ts) || now });
+        state.lots.push({
+          qty,
+          price,
+          ts: Number(fill.ts) || now,
+          trustedFill: fillTrust.trustedFill,
+          fillSource: fillTrust.fillSource,
+        });
         continue;
       }
 
@@ -2969,17 +3436,70 @@ class PaperPortfolio {
 
       let remainingQty = qty;
       let realizedForFill = 0;
+      let matchedQtyTotal = 0;
+      let matchedCostUsd = 0;
+      let holdWeightedSecondsForFill = 0;
+      let trustedMatchedQty = 0;
+      let untrustedMatchedQty = 0;
+      let trustedRealizedForFill = 0;
+      let untrustedRealizedForFill = 0;
+      const sellTrust = this.fillTrustFlags(fill);
       while (remainingQty > 1e-9 && state.lots.length > 0) {
         const lot = state.lots[0];
         const matchedQty = Math.min(remainingQty, lot.qty);
-        realizedForFill += (price - lot.price) * matchedQty;
-        holdWeightedSeconds += matchedQty * Math.max(0, ((Number(fill.ts) || now) - lot.ts) / 1000);
+        const pnlContribution = (price - lot.price) * matchedQty;
+        realizedForFill += pnlContribution;
+        const holdSeconds = matchedQty * Math.max(0, ((Number(fill.ts) || now) - lot.ts) / 1000);
+        holdWeightedSeconds += holdSeconds;
+        holdWeightedSecondsForFill += holdSeconds;
         holdQty += matchedQty;
+        matchedQtyTotal += matchedQty;
+        matchedCostUsd += matchedQty * lot.price;
+        if (sellTrust.trustedFill && lot.trustedFill) {
+          trustedMatchedQty += matchedQty;
+          trustedRealizedForFill += pnlContribution;
+        } else {
+          untrustedMatchedQty += matchedQty;
+          untrustedRealizedForFill += pnlContribution;
+        }
         lot.qty -= matchedQty;
         remainingQty -= matchedQty;
         if (lot.qty <= 1e-9) state.lots.shift();
       }
       realizedPnl += realizedForFill;
+      trustedClosedPnl += trustedRealizedForFill;
+      untrustedClosedPnl += untrustedRealizedForFill;
+      if (matchedQtyTotal > 1e-9) {
+        const averageEntryPrice = matchedCostUsd / matchedQtyTotal;
+        const exitClassification = classifyGabagoolExit({
+          filledUsd: value,
+          avgEntryPrice: averageEntryPrice,
+          sellPrice: price,
+          realizedPnl: realizedForFill,
+          positionQtyBefore: matchedQtyTotal,
+          positionQtyAfter: 0,
+          minOrderUsd: Number(this.config.minOrderUsd || 0),
+        });
+        const isDustExit = exitClassification === 'dust_exit';
+        if (isDustExit) dustExitPnl += realizedForFill;
+        roundTrips.push({
+          tokenId: state.tokenId,
+          marketId: state.marketId || '',
+          marketSlug: state.marketSlug || '',
+          exitTs: Number(fill.ts) || now,
+          realizedPnl: realizedForFill,
+          filledUsd: value,
+          filledQty: matchedQtyTotal,
+          entryPrice: averageEntryPrice,
+          exitPrice: price,
+          holdSeconds: holdWeightedSecondsForFill / matchedQtyTotal,
+          classification: exitClassification,
+          trustedPnl: sellTrust.trustedFill && untrustedMatchedQty <= 1e-9,
+          trustedRealizedPnl: trustedRealizedForFill,
+          untrustedRealizedPnl: untrustedRealizedForFill,
+          fillSource: sellTrust.fillSource,
+        });
+      }
       if (realizedForFill > 1e-9) winCount += 1;
       else if (realizedForFill < -1e-9) lossCount += 1;
       else breakevenCount += 1;
@@ -2988,6 +3508,8 @@ class PaperPortfolio {
     const perTokenExposure = [];
     let currentPositionExposureUsd = 0;
     let unrealizedPnl = 0;
+    let trustedOpenPnl = 0;
+    let untrustedOpenPnl = 0;
     for (const state of tokenState.values()) {
       const qty = state.lots.reduce((sum, lot) => sum + lot.qty, 0);
       if (qty <= 1e-9) continue;
@@ -2996,16 +3518,25 @@ class PaperPortfolio {
       const mark = markPrices.get(state.tokenId) ?? avgEntryPrice;
       const positionExposureUsd = qty * mark;
       const tokenUnrealizedPnl = state.lots.reduce((sum, lot) => sum + ((mark - lot.price) * lot.qty), 0);
+      const tokenTrustedUnrealizedPnl = state.lots.reduce((sum, lot) => (
+        sum + (lot.trustedFill ? ((mark - lot.price) * lot.qty) : 0)
+      ), 0);
+      const tokenUntrustedUnrealizedPnl = tokenUnrealizedPnl - tokenTrustedUnrealizedPnl;
       currentPositionExposureUsd += positionExposureUsd;
       unrealizedPnl += tokenUnrealizedPnl;
+      trustedOpenPnl += tokenTrustedUnrealizedPnl;
+      untrustedOpenPnl += tokenUntrustedUnrealizedPnl;
       perTokenExposure.push({
         tokenId: state.tokenId,
         marketId: state.marketId || '',
+        marketSlug: state.marketSlug || '',
         qty,
         avgEntryPrice,
         mark,
         positionExposureUsd,
         unrealizedPnl: tokenUnrealizedPnl,
+        trustedUnrealizedPnl: tokenTrustedUnrealizedPnl,
+        untrustedUnrealizedPnl: tokenUntrustedUnrealizedPnl,
       });
     }
 
@@ -3013,8 +3544,17 @@ class PaperPortfolio {
     const totalExposureUsd = currentPositionExposureUsd + openOrders.totalUsd;
     const feesEstimate = 0;
     const realizedPlusUnrealized = realizedPnl + unrealizedPnl;
+    const relevantFillTrust = relevantFills.map((fill) => this.fillTrustFlags(fill));
+    const trustedFillCount = relevantFillTrust.filter((fill) => fill.trustedFill).length;
+    const untrustedFillCount = relevantFillTrust.length - trustedFillCount;
+    const invalidFillCount = relevantFillTrust.filter((fill) => fill.fillInvalid).length;
+    const fillCountsBySource = fillSourceCountsObject(relevantFills);
     return {
       fillsCount: relevantFills.length,
+      trustedFillCount,
+      untrustedFillCount,
+      invalidFillCount,
+      fillCountsBySource,
       grossBuyUsd,
       grossSellUsd,
       grossBuyQty,
@@ -3026,6 +3566,10 @@ class PaperPortfolio {
       unrealizedPnl,
       closedPnl: realizedPnl,
       openPnl: unrealizedPnl,
+      trustedClosedPnl,
+      untrustedClosedPnl,
+      trustedOpenPnl,
+      untrustedOpenPnl,
       equityContribution: realizedPlusUnrealized,
       feesEstimate,
       netAfterFeesEstimate: realizedPlusUnrealized - feesEstimate,
@@ -3033,6 +3577,12 @@ class PaperPortfolio {
       currentOpenOrderExposureUsd: openOrders.totalUsd,
       totalExposureUsd,
       maxOpenOrderExposureUsd: openOrders.maxExposureUsd,
+      roundTrips,
+      roundTripsCount: roundTrips.length,
+      averageRoundTripPnl: roundTrips.length > 0
+        ? roundTrips.reduce((sum, trip) => sum + Number(trip.realizedPnl || 0), 0) / roundTrips.length
+        : null,
+      dustExitPnl,
       perTokenExposure: perTokenExposure
         .map((item) => {
           const openOrder = openOrders.perToken.find((entry) => entry.tokenId === item.tokenId);
@@ -3048,6 +3598,46 @@ class PaperPortfolio {
       lossCount,
       breakevenCount,
       winLossProxy: winCount + lossCount > 0 ? `${winCount}/${lossCount}` : '0/0',
+    };
+  }
+
+  pnlBreakdownByStrategy(markPrices = new Map(), now = Date.now()) {
+    const strategyNames = new Set();
+    for (const fill of this.fills) {
+      const strategy = resolveStrategyName(fill?.strategy) || String(fill?.strategy || '').trim();
+      if (strategy) strategyNames.add(strategy);
+    }
+    for (const order of this.openOrders.values()) {
+      const strategy = resolveStrategyName(order?.strategy) || String(order?.strategy || '').trim();
+      if (strategy) strategyNames.add(strategy);
+    }
+
+    const pnlByStrategy = {};
+    const trustedPnlByStrategy = {};
+    const untrustedPnlByStrategy = {};
+    for (const strategy of strategyNames) {
+      const ledger = this.strategyLedger((value) => resolveStrategyName(value) === strategy, markPrices, now);
+      pnlByStrategy[strategy] = {
+        closedPnl: Number(ledger.closedPnl || 0),
+        openPnl: Number(ledger.openPnl || 0),
+        netPnl: Number(ledger.closedPnl || 0) + Number(ledger.openPnl || 0),
+      };
+      trustedPnlByStrategy[strategy] = {
+        closedPnl: Number(ledger.trustedClosedPnl || 0),
+        openPnl: Number(ledger.trustedOpenPnl || 0),
+        netPnl: Number(ledger.trustedClosedPnl || 0) + Number(ledger.trustedOpenPnl || 0),
+      };
+      untrustedPnlByStrategy[strategy] = {
+        closedPnl: Number(ledger.untrustedClosedPnl || 0),
+        openPnl: Number(ledger.untrustedOpenPnl || 0),
+        netPnl: Number(ledger.untrustedClosedPnl || 0) + Number(ledger.untrustedOpenPnl || 0),
+      };
+    }
+
+    return {
+      pnlByStrategy,
+      trustedPnlByStrategy,
+      untrustedPnlByStrategy,
     };
   }
 
@@ -3071,6 +3661,8 @@ class PaperPortfolio {
       side: details.side ? String(details.side).toLowerCase() : null,
       strategy: details.strategy || null,
       reason: details.reason || null,
+      source: details.source ? String(details.source) : null,
+      exitMode: details.exitMode ? String(details.exitMode) : null,
       price: numeric(details.price),
       sizeUsd: numeric(details.sizeUsd ?? details.value),
       expectedEdge: numeric(details.expectedEdge),
@@ -3079,7 +3671,39 @@ class PaperPortfolio {
       distanceFromTouch: numeric(details.distanceFromTouch),
       predictedFillProbability: numeric(details.predictedFillProbability),
       timeToFillSec: numeric(details.timeToFillSec),
+      fillDelayMs: numeric(details.fillDelayMs),
+      bookAgeMs: numeric(details.bookAgeMs),
       filledUsd: numeric(details.filledUsd),
+      fillSource: normalizePaperFillSource(details.fillSource),
+      bestBidAtPlacement: numeric(details.bestBidAtPlacement),
+      bestAskAtPlacement: numeric(details.bestAskAtPlacement),
+      bestBidAtFill: numeric(details.bestBidAtFill),
+      bestAskAtFill: numeric(details.bestAskAtFill),
+      orderPrice: numeric(details.orderPrice),
+      wasExecutableAtPlacement: details.wasExecutableAtPlacement === true ? true : details.wasExecutableAtPlacement === false ? false : null,
+      wasExecutableAtFill: details.wasExecutableAtFill === true ? true : details.wasExecutableAtFill === false ? false : null,
+      queueHaircutApplied: numeric(details.queueHaircutApplied),
+      slippageApplied: numeric(details.slippageApplied),
+      adverseSelectionBufferApplied: numeric(details.adverseSelectionBufferApplied),
+      trustedFill: details.trustedFill === true ? true : details.trustedFill === false ? false : null,
+      trustedPnl: details.trustedPnl === true ? true : details.trustedPnl === false ? false : null,
+      fillInvalid: details.fillInvalid === true ? true : details.fillInvalid === false ? false : null,
+      fillInvalidReason: details.fillInvalidReason ? String(details.fillInvalidReason) : null,
+      avgEntryPrice: numeric(details.avgEntryPrice),
+      realizedPnl: numeric(details.realizedPnl),
+      trustedRealizedPnl: numeric(details.trustedRealizedPnl),
+      untrustedRealizedPnl: numeric(details.untrustedRealizedPnl),
+      positionQtyBefore: numeric(details.positionQtyBefore),
+      positionQtyAfter: numeric(details.positionQtyAfter),
+      positionQty: numeric(details.positionQty),
+      availableSellQty: numeric(details.availableSellQty),
+      currentValueUsd: numeric(details.currentValueUsd),
+      roundedExitSizeUsd: numeric(details.roundedExitSizeUsd),
+      positionsScanned: numeric(details.positionsScanned),
+      positionsClosable: numeric(details.positionsClosable),
+      exitsAttempted: numeric(details.exitsAttempted),
+      exitsPlaced: numeric(details.exitsPlaced),
+      exitBlockedReason: details.exitBlockedReason ? String(details.exitBlockedReason) : null,
     });
     while (this.executionEvents.length > 5000) this.executionEvents.shift();
 
@@ -3094,8 +3718,57 @@ class PaperPortfolio {
     const recent = this.executionEvents.filter((event) => Number(event.ts) >= hourAgo);
     const countType = (type) => recent.filter((event) => event.type === type).length;
     const countGabagoolType = (type) => recent.filter((event) => event.type === type && isBtcOracleStrategy(event.strategy)).length;
+    const gabagoolEvents = this.executionEvents.filter((event) => isBtcOracleStrategy(event.strategy));
+    const latestGabagoolReason = (type) => {
+      for (let i = gabagoolEvents.length - 1; i >= 0; i -= 1) {
+        if (gabagoolEvents[i].type === type) return gabagoolEvents[i].reason || null;
+      }
+      return null;
+    };
+    const latestGabagoolField = (type, field) => {
+      for (let i = gabagoolEvents.length - 1; i >= 0; i -= 1) {
+        if (gabagoolEvents[i].type === type && gabagoolEvents[i][field] != null) return gabagoolEvents[i][field];
+      }
+      return null;
+    };
+    const latestGabagoolTs = (type) => {
+      for (let i = gabagoolEvents.length - 1; i >= 0; i -= 1) {
+        if (gabagoolEvents[i].type === type) return gabagoolEvents[i].ts || null;
+      }
+      return null;
+    };
+    const countGabagoolReason = (type, reason) => recent.filter((event) => (
+      event.type === type &&
+      isBtcOracleStrategy(event.strategy) &&
+      event.reason === reason
+    )).length;
     const openOrders = [...this.openOrders.values()];
     const agesSec = openOrders.map((order) => Math.max(0, (now - order.createdAt) / 1000));
+    const positionEntries = this.positionExposureEntries(this.markPricesSnapshot());
+    const tradeability = this.paperTokenTradeability instanceof Map ? this.paperTokenTradeability : new Map();
+    const minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0));
+    let staleExposureUsd = 0;
+    let tradableExposureUsd = 0;
+    let dustExposureUsd = 0;
+    let staleExposureCount = 0;
+    let tradableExposureCount = 0;
+    let dustExposureCount = 0;
+    for (const entry of positionEntries) {
+      const valueUsd = Number(entry?.valueUsd || 0);
+      if (!(valueUsd > 0)) continue;
+      const status = String((tradeability.get(String(entry.tokenId || '')) || {}).status || '');
+      if (status === 'no_orderbook_404' || status === 'stale_token_cooldown') {
+        staleExposureUsd += valueUsd;
+        staleExposureCount += 1;
+      } else {
+        tradableExposureUsd += valueUsd;
+        tradableExposureCount += 1;
+      }
+      if (valueUsd < minOrderUsd) {
+        dustExposureUsd += valueUsd;
+        dustExposureCount += 1;
+      }
+    }
     const candidateEvaluationsLastHour = countType('candidate_evaluation');
     const paperOrdersPlacedLastHour = countType('order_placed');
     const paperOrdersFilledLastHour = countType('fill');
@@ -3112,10 +3785,42 @@ class PaperPortfolio {
       : 0;
     const noFillStreaks = this.noFillStreaks(now);
     const noFillStreakMax = noFillStreaks.length ? Math.max(...noFillStreaks.map((item) => item.noFillStreak)) : 0;
-    const fillEventsWithTime = recent.filter((event) => event.type === 'fill' && Number.isFinite(event.timeToFillSec));
+    const fillEvents = recent.filter((event) => event.type === 'fill');
+    const fillEventsWithTime = fillEvents.filter((event) => Number.isFinite(event.timeToFillSec));
     const avgTimeToFillSec = fillEventsWithTime.length
       ? fillEventsWithTime.reduce((sum, event) => sum + event.timeToFillSec, 0) / fillEventsWithTime.length
       : null;
+    const fillEventsWithDelay = fillEvents.filter((event) => Number.isFinite(event.fillDelayMs));
+    const avgFillDelayMs = fillEventsWithDelay.length
+      ? fillEventsWithDelay.reduce((sum, event) => sum + Number(event.fillDelayMs || 0), 0) / fillEventsWithDelay.length
+      : null;
+    const zeroSecondFillCountLastHour = fillEvents.filter((event) => isZeroSecondPaperFill(event.fillDelayMs)).length;
+    const fillCountsBySourceLastHour = fillSourceCountsObject(fillEvents);
+    const invalidOrUntrustedFillCountLastHour = fillEvents.filter((event) => (
+      event.fillInvalid === true || event.trustedFill === false
+    )).length;
+    const trustedFillCountLastHour = fillEvents.filter((event) => event.trustedFill === true).length;
+    const untrustedFillCountLastHour = fillEvents.filter((event) => event.trustedFill === false).length;
+    const orderRealismBlocksLastHour = countType('order_realism_block');
+    const strategyOrderCountsLastHour = {};
+    for (const event of recent) {
+      if (event.type !== 'order_placed') continue;
+      const strategy = resolveStrategyName(event.strategy) || event.strategy || 'UNKNOWN';
+      strategyOrderCountsLastHour[strategy] = Number(strategyOrderCountsLastHour[strategy] || 0) + 1;
+    }
+    const strategyFillCountsLastHour = {};
+    for (const event of fillEvents) {
+      const strategy = resolveStrategyName(event.strategy) || event.strategy || 'UNKNOWN';
+      strategyFillCountsLastHour[strategy] = Number(strategyFillCountsLastHour[strategy] || 0) + 1;
+    }
+    const gabagoolRepeatedSameMarketSameTokenEntriesLastHour = [...recent
+      .filter((event) => event.type === 'order_placed' && isBtcOracleStrategy(event.strategy) && String(event.side || '').toLowerCase() === 'buy')
+      .reduce((map, event) => {
+        const key = `${String(event.marketId || event.marketSlug || '')}:${String(event.tokenId || '')}`;
+        map.set(key, Number(map.get(key) || 0) + 1);
+        return map;
+      }, new Map()).values()]
+      .reduce((sum, count) => sum + Math.max(0, Number(count || 0) - 1), 0);
     const oracleSignalsReadLastHour = countGabagoolType('gabagool_oracle_signal_read');
     const oracleSignalsFreshLastHour = countGabagoolType('gabagool_oracle_signal_fresh');
     const oracleSignalsExpiredLastHour = countGabagoolType('gabagool_oracle_signal_expired');
@@ -3129,10 +3834,120 @@ class PaperPortfolio {
     const gabagoolRiskEvaluatedLastHour = countGabagoolType('gabagool_risk_evaluated');
     const gabagoolRiskAdmittedLastHour = countGabagoolType('gabagool_risk_admitted');
     const gabagoolRiskBlockedLastHour = countGabagoolType('gabagool_risk_blocked');
+    const gabagoolPlacementAttemptedLastHour = countGabagoolType('gabagool_placement_attempted');
+    const gabagoolPlacementBlockedLastHour = countGabagoolType('gabagool_placement_blocked');
     const gabagoolOrdersPlacedLastHour = countGabagoolType('gabagool_order_placed');
     const gabagoolFillsLastHour = countGabagoolType('gabagool_fill');
     const gabagoolExitsLastHour = countGabagoolType('gabagool_exit');
     const gabagoolTelegramSuppressedLastHour = countGabagoolType('gabagool_telegram_suppressed');
+    const gabagoolZeroSizeBlockedLastHour = countGabagoolType('gabagool_zero_size_blocked');
+    const gabagoolDustExitsLastHour = countGabagoolReason('gabagool_exit', 'dust_exit');
+    const gabagoolDustExitsSuppressedLastHour = countGabagoolType('gabagool_dust_exit_suppressed');
+    const gabagoolDustExitAllowedLastHour = countGabagoolType('gabagool_dust_exit_allowed');
+    const gabagoolDustPositionRemainingLastHour = countGabagoolType('gabagool_dust_position_remaining');
+    const gabagoolProfitExitsLastHour = countGabagoolReason('gabagool_exit', 'profit_exit');
+    const gabagoolLossExitsLastHour = countGabagoolReason('gabagool_exit', 'loss_exit');
+    const gabagoolLossExitBlocksLastHour = countGabagoolType('gabagool_blocked_loss_exit');
+    const gabagoolInventoryReducesLastHour = countGabagoolReason('gabagool_exit', 'inventory_reduce');
+    const gabagoolInvalidZeroSizeLastHour = gabagoolZeroSizeBlockedLastHour;
+    const gabagoolEntryPauseBlocksLastHour = countGabagoolType('gabagool_entry_paused');
+    const gabagoolChurnBlocksLastHour = countGabagoolType('gabagool_churn_blocked');
+    const gabagoolSameMarketDirectionBlocksLastHour = countGabagoolType('gabagool_same_market_direction_blocked');
+    const gabagoolStaleDustIgnoredLastHour = countGabagoolType('gabagool_stale_dust_ignored');
+    const gabagoolSameMarketUnknownDirectionIgnoredLastHour = countGabagoolType('gabagool_same_market_unknown_direction_ignored');
+    const gabagoolReentryBlocksLastHour = countGabagoolType('gabagool_reentry_blocked');
+    const gabagoolHighPriceEntryBlocksLastHour = countGabagoolType('gabagool_high_price_entry_blocked');
+    const gabagoolLossGuardExitScanLastHour = countGabagoolType('gabagool_loss_guard_exit_scan');
+    const gabagoolLossGuardExitCandidatesLastHour = countGabagoolType('gabagool_loss_guard_exit_candidate');
+    const gabagoolLossGuardExitsAttemptedLastHour = countGabagoolType('gabagool_loss_guard_exit_attempted');
+    const gabagoolLossGuardExitsPlacedLastHour = countGabagoolType('gabagool_loss_guard_exit_placed');
+    const gabagoolLossGuardExitsFilledLastHour = countGabagoolType('gabagool_loss_guard_exit_filled');
+    const gabagoolLossGuardDustRemainingLastHour = countGabagoolType('gabagool_loss_guard_dust_remaining');
+    const gabagoolReduceOnlyExitScanLastHour = countGabagoolType('gabagool_reduce_only_exit_scan');
+    const gabagoolReduceOnlyExitCandidatesLastHour = countGabagoolType('gabagool_reduce_only_exit_candidate');
+    const gabagoolReduceOnlyExitAttemptsLastHour = countGabagoolType('gabagool_reduce_only_exit_attempted');
+    const gabagoolReduceOnlyExitOrdersLastHour = countGabagoolType('gabagool_reduce_only_exit_placed');
+    const gabagoolReduceOnlyExitFillsLastHour = countGabagoolType('gabagool_reduce_only_exit_filled');
+    const gabagoolRepeatedBlockedLossExitCountLastHour = countGabagoolType('gabagool_blocked_loss_exit_repeat');
+    const gabagoolExposureCapBlockedReasonCounts = new Map();
+    for (const event of recent) {
+      if (
+        event.type === 'gabagool_reduce_only_exit_blocked' &&
+        isBtcOracleStrategy(event.strategy) &&
+        event.reason
+      ) {
+        gabagoolExposureCapBlockedReasonCounts.set(
+          event.reason,
+          Number(gabagoolExposureCapBlockedReasonCounts.get(event.reason) || 0) + 1
+        );
+      }
+      if (
+        (event.type === 'gabagool_risk_blocked' || event.type === 'gabagool_sophie_blocked' || event.type === 'gabagool_placement_blocked') &&
+        isBtcOracleStrategy(event.strategy) &&
+        String(event.exitMode || '') === 'exposure_cap_reduce_only'
+      ) {
+        gabagoolExposureCapBlockedReasonCounts.set(
+          'valid_but_risk_or_execution_blocked',
+          Number(gabagoolExposureCapBlockedReasonCounts.get('valid_but_risk_or_execution_blocked') || 0) + 1
+        );
+      }
+    }
+    const spreadHunterGhostBlocksLastHour = recent.filter((event) => (
+      resolveStrategyName(event.strategy) === 'SpreadHunter' && event.reason === 'ghost_throttle'
+    )).length;
+    const spreadHunterSophieBlocksLastHour = recent.filter((event) => (
+      resolveStrategyName(event.strategy) === 'SpreadHunter' && event.type === 'quality_block'
+    )).length;
+    const spreadHunterConfidenceBlocksLastHour = recent.filter((event) => (
+      resolveStrategyName(event.strategy) === 'SpreadHunter' &&
+      event.type === 'risk_block' &&
+      event.reason === 'confidence_below_min'
+    )).length;
+    const spreadHunterCooldownBlocksLastHour = recent.filter((event) => (
+      resolveStrategyName(event.strategy) === 'SpreadHunter' &&
+      (
+        event.type === 'quality_throttle' ||
+        event.type === 'standard_churn_block'
+      )
+    )).length;
+    const spreadHunterExecutionRealismBlocksLastHour = recent.filter((event) => (
+      resolveStrategyName(event.strategy) === 'SpreadHunter' && event.type === 'order_realism_block'
+    )).length;
+    const probationAdmissionsLastHour = countType('paper_probation_admit');
+    const probationBlocksLastHour = countType('paper_probation_block');
+    const topBlockReasons = new Map();
+    for (const event of recent) {
+      let key = null;
+      if (event.type === 'strategy_skip' && event.reason) key = `strategy:${event.reason}`;
+      if (event.type === 'quality_block') key = `sophie:${event.reason || 'quality_block'}`;
+      if (event.type === 'quality_throttle') key = `throttle:${event.reason || 'quality_throttle'}`;
+      if (event.type === 'risk_block') key = `risk:${event.reason || 'risk_block'}`;
+      if (event.type === 'standard_churn_block') key = `churn:${event.reason || 'standard_churn_block'}`;
+      if (event.type === 'order_realism_block') key = `realism:${event.reason || 'order_realism_block'}`;
+      if (event.type === 'paper_probation_block') key = `probation:${event.reason || 'paper_probation_block'}`;
+      if (!key) continue;
+      topBlockReasons.set(key, Number(topBlockReasons.get(key) || 0) + 1);
+    }
+    const topBlockReasonsLastHour = [...topBlockReasons.entries()]
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        return a[0].localeCompare(b[0]);
+      })
+      .slice(0, 5)
+      .map(([reason, count]) => `${reason}:${count}`)
+      .join(',') || 'none';
+    const whyTotalOrdersZeroLastHour = paperOrdersPlacedLastHour === 0
+      ? [
+        openOrders.length > 0 ? `openOrders=${openOrders.length}` : null,
+        paperOrdersAdmittedLastHour > 0 ? `admitted=${paperOrdersAdmittedLastHour}` : null,
+        paperOrdersRejectedBySophieLastHour > 0 ? `sophieRejected=${paperOrdersRejectedBySophieLastHour}` : null,
+        spreadHunterGhostBlocksLastHour > 0 ? `ghost=${spreadHunterGhostBlocksLastHour}` : null,
+        spreadHunterConfidenceBlocksLastHour > 0 ? `confidence=${spreadHunterConfidenceBlocksLastHour}` : null,
+        probationBlocksLastHour > 0 ? `probationBlocked=${probationBlocksLastHour}` : null,
+        topBlockReasonsLastHour !== 'none' ? `topBlocks=${topBlockReasonsLastHour}` : null,
+      ].filter(Boolean).join(' ') || 'no_orders_recorded'
+      : null;
+    const lastFillEvent = fillEvents.slice().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))[0] || null;
 
     return {
       ...this.executionTotals,
@@ -3153,7 +3968,30 @@ class PaperPortfolio {
       avgActiveOrderAgeSec: avgOpenOrderAgeSec,
       noFillStreakMax,
       avgTimeToFillSec,
+      avgFillDelayMs,
+      zeroSecondFillCountLastHour,
+      fillCountsBySourceLastHour,
+      invalidOrUntrustedFillCountLastHour,
+      trustedFillCountLastHour,
+      untrustedFillCountLastHour,
+      orderRealismBlocksLastHour,
+      strategyOrderCountsLastHour,
+      strategyFillCountsLastHour,
+      gabagoolRepeatedSameMarketSameTokenEntriesLastHour,
       openOrderExposureUsd: this.openOrderExposureUsd(),
+      staleExposureUsd,
+      tradableExposureUsd,
+      dustExposureUsd,
+      staleExposureCount,
+      tradableExposureCount,
+      dustExposureCount,
+      gabagoolExposureCapBlockedReasonCountsLastHour: [...gabagoolExposureCapBlockedReasonCounts.entries()]
+        .sort((a, b) => {
+          if (b[1] !== a[1]) return b[1] - a[1];
+          return a[0].localeCompare(b[0]);
+        })
+        .map(([reason, count]) => `${reason}:${count}`)
+        .join(',') || 'none',
       fillRateLastHour: paperOrdersPlacedLastHour > 0 ? (fillsLastHour / paperOrdersPlacedLastHour) * 100 : 0,
       fillRateByPlacedOrdersLastHour: paperOrdersPlacedLastHour > 0 ? (paperOrdersFilledLastHour / paperOrdersPlacedLastHour) * 100 : 0,
       fillStarvationReason: openOrders.length > 0 && fillsLastHour === 0 ? 'no_recent_fills' : null,
@@ -3170,10 +4008,87 @@ class PaperPortfolio {
       gabagoolRiskEvaluatedLastHour,
       gabagoolRiskAdmittedLastHour,
       gabagoolRiskBlockedLastHour,
+      gabagoolPlacementAttemptedLastHour,
+      gabagoolPlacementBlockedLastHour,
       gabagoolOrdersPlacedLastHour,
       gabagoolFillsLastHour,
       gabagoolExitsLastHour,
       gabagoolTelegramSuppressedLastHour,
+      gabagoolZeroSizeBlockedLastHour,
+      gabagoolDustExitsLastHour,
+      gabagoolDustExitsSuppressedLastHour,
+      gabagoolDustExitAllowedLastHour,
+      gabagoolDustPositionRemainingLastHour,
+      gabagoolProfitExitsLastHour,
+      gabagoolLossExitsLastHour,
+      gabagoolLossExitBlocksLastHour,
+      gabagoolInventoryReducesLastHour,
+      gabagoolInvalidZeroSizeLastHour,
+      gabagoolEntryPauseBlocksLastHour,
+      gabagoolChurnBlocksLastHour,
+      gabagoolSameMarketDirectionBlocksLastHour,
+      gabagoolStaleDustIgnoredLastHour,
+      gabagoolSameMarketUnknownDirectionIgnoredLastHour,
+      gabagoolReentryBlocksLastHour,
+      gabagoolHighPriceEntryBlocksLastHour,
+      gabagoolLossGuardExitScanLastHour,
+      gabagoolLossGuardExitCandidatesLastHour,
+      gabagoolLossGuardExitsAttemptedLastHour,
+      gabagoolLossGuardExitsPlacedLastHour,
+      gabagoolLossGuardExitsFilledLastHour,
+      gabagoolLossGuardDustRemainingLastHour,
+      gabagoolReduceOnlyExitScanLastHour,
+      gabagoolReduceOnlyExitCandidatesLastHour,
+      gabagoolReduceOnlyExitAttemptsLastHour,
+      gabagoolReduceOnlyExitOrdersLastHour,
+      gabagoolReduceOnlyExitFillsLastHour,
+      gabagoolRepeatedBlockedLossExitCountLastHour,
+      spreadHunterGhostBlocksLastHour,
+      spreadHunterSophieBlocksLastHour,
+      spreadHunterConfidenceBlocksLastHour,
+      spreadHunterCooldownBlocksLastHour,
+      spreadHunterExecutionRealismBlocksLastHour,
+      probationAdmissionsLastHour,
+      probationBlocksLastHour,
+      topBlockReasonsLastHour,
+      whyTotalOrdersZeroLastHour,
+      gabagoolLossGuardExitBlockedLastReason: latestGabagoolReason('gabagool_loss_guard_exit_blocked'),
+      gabagoolLossGuardPositionsScanned: latestGabagoolField('gabagool_loss_guard_exit_scan', 'positionsScanned') || 0,
+      gabagoolLossGuardPositionsClosable: latestGabagoolField('gabagool_loss_guard_exit_scan', 'positionsClosable') || 0,
+      gabagoolReduceOnlyExitBlockedLastReason: latestGabagoolReason('gabagool_reduce_only_exit_blocked'),
+      gabagoolReduceOnlyPositionsScanned: latestGabagoolField('gabagool_reduce_only_exit_scan', 'positionsScanned') || 0,
+      gabagoolReduceOnlyPositionsClosable: latestGabagoolField('gabagool_reduce_only_exit_scan', 'positionsClosable') || 0,
+      gabagoolPlacementBlockReasonLast: latestGabagoolReason('gabagool_placement_blocked'),
+      gabagoolLastRiskBlockReason: latestGabagoolReason('gabagool_risk_blocked'),
+      gabagoolLastSophieBlockReason: latestGabagoolReason('gabagool_sophie_blocked'),
+      gabagoolLastPlacementDecision: latestGabagoolReason('gabagool_placement_decision'),
+      gabagoolLastPlacementDecisionAt: latestGabagoolTs('gabagool_placement_decision'),
+      gabagoolLastRiskBlockAt: latestGabagoolTs('gabagool_risk_blocked'),
+      gabagoolLastSophieBlockAt: latestGabagoolTs('gabagool_sophie_blocked'),
+      gabagoolMarketLockoutReasonLast: latestGabagoolReason('gabagool_market_lockout_set'),
+      gabagoolLastExitClassification: latestGabagoolReason('gabagool_exit'),
+      gabagoolLastExitAt: latestGabagoolTs('gabagool_exit'),
+      gabagoolLastExitPnl: latestGabagoolField('gabagool_exit', 'realizedPnl'),
+      lastExitAvgEntry: latestGabagoolField('gabagool_exit', 'avgEntryPrice'),
+      lastExitSellPrice: latestGabagoolField('gabagool_exit', 'price'),
+      gabagoolEntryPauseReason: latestGabagoolReason('gabagool_entry_paused'),
+      gabagoolZeroSizeSourceLast: latestGabagoolField('gabagool_zero_size_blocked', 'source'),
+      lastFillAudit: lastFillEvent ? {
+        fillSource: lastFillEvent.fillSource,
+        fillDelayMs: lastFillEvent.fillDelayMs,
+        bookAgeMs: lastFillEvent.bookAgeMs,
+        bestBidAtPlacement: lastFillEvent.bestBidAtPlacement,
+        bestAskAtPlacement: lastFillEvent.bestAskAtPlacement,
+        bestBidAtFill: lastFillEvent.bestBidAtFill,
+        bestAskAtFill: lastFillEvent.bestAskAtFill,
+        orderPrice: lastFillEvent.orderPrice,
+        wasExecutableAtPlacement: lastFillEvent.wasExecutableAtPlacement,
+        wasExecutableAtFill: lastFillEvent.wasExecutableAtFill,
+        queueHaircutApplied: lastFillEvent.queueHaircutApplied,
+        slippageApplied: lastFillEvent.slippageApplied,
+        adverseSelectionBufferApplied: lastFillEvent.adverseSelectionBufferApplied,
+        trustedPnl: lastFillEvent.trustedPnl,
+      } : null,
     };
   }
 
@@ -3330,13 +4245,37 @@ class PaperPortfolio {
     this.ghostOrders = remaining;
   }
 
-  recordFill({ tokenId, marketId, side, price, size, strategy }) {
+  recordFill({
+    tokenId,
+    marketId,
+    side,
+    price,
+    size,
+    strategy,
+    marketSlug = null,
+    outcome = null,
+    ts = Date.now(),
+    fillSource = 'unknown',
+    fillDelayMs = null,
+    bookAgeMs = null,
+    bestBidAtPlacement = null,
+    bestAskAtPlacement = null,
+    bestBidAtFill = null,
+    bestAskAtFill = null,
+    orderPrice = null,
+    wasExecutableAtPlacement = null,
+    wasExecutableAtFill = null,
+    queueHaircutApplied = 0,
+    slippageApplied = 0,
+    adverseSelectionBufferApplied = 0,
+    fillInvalidReason = null,
+  }) {
     tokenId = String(tokenId);
     marketId = String(marketId || '');
 
     const qty = Number(size);
     const px = Number(price);
-    if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(px) || px <= 0) return;
+    if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(px) || px <= 0) return null;
 
     if (!this.positionMarkets) this.positionMarkets = new Map();
     if (marketId) this.positionMarkets.set(tokenId, marketId);
@@ -3344,6 +4283,39 @@ class PaperPortfolio {
     const value = qty * px;
     const currentQty = this.position(tokenId);
     const currentCost = this.avgCost(tokenId);
+    const fillRecord = {
+      ts: Number.isFinite(Number(ts)) ? Number(ts) : Date.now(),
+      tokenId,
+      marketId,
+      marketSlug: marketSlug ? String(marketSlug) : '',
+      outcome: outcome ? String(outcome) : '',
+      side,
+      price: px,
+      size: qty,
+      value,
+      strategy,
+      fillSource: normalizePaperFillSource(fillSource),
+      fillDelayMs: numericOrNull(fillDelayMs),
+      bookAgeMs: numericOrNull(bookAgeMs),
+      bestBidAtPlacement: numericOrNull(bestBidAtPlacement),
+      bestAskAtPlacement: numericOrNull(bestAskAtPlacement),
+      bestBidAtFill: numericOrNull(bestBidAtFill),
+      bestAskAtFill: numericOrNull(bestAskAtFill),
+      orderPrice: numericOrNull(orderPrice),
+      wasExecutableAtPlacement: wasExecutableAtPlacement === true ? true : wasExecutableAtPlacement === false ? false : null,
+      wasExecutableAtFill: wasExecutableAtFill === true ? true : wasExecutableAtFill === false ? false : null,
+      queueHaircutApplied: numericOrNull(queueHaircutApplied) ?? 0,
+      slippageApplied: numericOrNull(slippageApplied) ?? 0,
+      adverseSelectionBufferApplied: numericOrNull(adverseSelectionBufferApplied) ?? 0,
+      fillInvalidReason: fillInvalidReason ? String(fillInvalidReason) : null,
+    };
+    const fillTrust = this.fillTrustFlags(fillRecord);
+    fillRecord.trustedFill = fillTrust.trustedFill;
+    fillRecord.fillInvalid = fillTrust.fillInvalid;
+    fillRecord.fillInvalidReason = fillRecord.fillInvalidReason || fillTrust.fillInvalidReason;
+    fillRecord.trustedPnl = fillTrust.trustedFill;
+    fillRecord.trustedRealizedPnl = 0;
+    fillRecord.untrustedRealizedPnl = 0;
 
     if (side === 'buy') {
       const newQty = currentQty + qty;
@@ -3352,14 +4324,74 @@ class PaperPortfolio {
       this.cash -= value;
       this.positions.set(tokenId, newQty);
       this.costBasis.set(tokenId, newCost);
+
+      this.fills.push(fillRecord);
+      return {
+        ts: fillRecord.ts,
+        tokenId,
+        marketId,
+        side,
+        price: px,
+        qty,
+        value,
+        avgEntryPrice: newCost,
+        positionQtyBefore: currentQty,
+        positionQtyAfter: newQty,
+        realizedPnl: 0,
+        trustedFill: fillTrust.trustedFill,
+        trustedPnl: fillTrust.trustedFill,
+        fillInvalid: fillTrust.fillInvalid,
+        fillInvalidReason: fillRecord.fillInvalidReason,
+        fillSource: fillRecord.fillSource,
+        fillDelayMs: fillRecord.fillDelayMs,
+        bookAgeMs: fillRecord.bookAgeMs,
+        bestBidAtPlacement: fillRecord.bestBidAtPlacement,
+        bestAskAtPlacement: fillRecord.bestAskAtPlacement,
+        bestBidAtFill: fillRecord.bestBidAtFill,
+        bestAskAtFill: fillRecord.bestAskAtFill,
+        orderPrice: fillRecord.orderPrice,
+        wasExecutableAtPlacement: fillRecord.wasExecutableAtPlacement,
+        wasExecutableAtFill: fillRecord.wasExecutableAtFill,
+        queueHaircutApplied: fillRecord.queueHaircutApplied,
+        slippageApplied: fillRecord.slippageApplied,
+        adverseSelectionBufferApplied: fillRecord.adverseSelectionBufferApplied,
+      };
     }
 
     if (side === 'sell') {
       const sellQty = Math.min(qty, currentQty);
-      if (sellQty <= 0) return;
+      if (sellQty <= 0) return null;
 
       const realized = (px - currentCost) * sellQty;
       const newQty = currentQty - sellQty;
+      const priorLots = this.reconstructLotsForToken(tokenId);
+      let remainingQty = sellQty;
+      let matchedQtyTotal = 0;
+      let matchedCostUsd = 0;
+      let trustedMatchedQty = 0;
+      let trustedRealizedPnl = 0;
+      let untrustedRealizedPnl = 0;
+      for (const lot of priorLots) {
+        if (remainingQty <= 1e-9) break;
+        const matchedQty = Math.min(remainingQty, lot.qty);
+        const pnlContribution = (px - lot.price) * matchedQty;
+        matchedQtyTotal += matchedQty;
+        matchedCostUsd += matchedQty * lot.price;
+        if (fillTrust.trustedFill && lot.trustedFill) {
+          trustedMatchedQty += matchedQty;
+          trustedRealizedPnl += pnlContribution;
+        } else {
+          untrustedRealizedPnl += pnlContribution;
+        }
+        remainingQty -= matchedQty;
+      }
+      const avgEntryPrice = matchedQtyTotal > 0 ? matchedCostUsd / matchedQtyTotal : currentCost;
+      const trustedPnl = fillTrust.trustedFill && trustedMatchedQty >= sellQty - 1e-9;
+      fillRecord.size = sellQty;
+      fillRecord.value = sellQty * px;
+      fillRecord.trustedPnl = trustedPnl;
+      fillRecord.trustedRealizedPnl = trustedRealizedPnl;
+      fillRecord.untrustedRealizedPnl = untrustedRealizedPnl;
 
       this.cash += sellQty * px;
       this.closedPnl += realized;
@@ -3372,18 +4404,73 @@ class PaperPortfolio {
       }
 
       this.strategyPnl.set(strategy, (this.strategyPnl.get(strategy) || 0) + realized);
+
+      this.fills.push(fillRecord);
+      return {
+        ts: fillRecord.ts,
+        tokenId,
+        marketId,
+        side,
+        price: px,
+        qty: sellQty,
+        value: sellQty * px,
+        avgEntryPrice,
+        positionQtyBefore: currentQty,
+        positionQtyAfter: Math.max(0, newQty),
+        realizedPnl: realized,
+        trustedFill: fillTrust.trustedFill,
+        trustedPnl,
+        fillInvalid: fillTrust.fillInvalid,
+        fillInvalidReason: fillRecord.fillInvalidReason,
+        trustedRealizedPnl,
+        untrustedRealizedPnl,
+        fillSource: fillRecord.fillSource,
+        fillDelayMs: fillRecord.fillDelayMs,
+        bookAgeMs: fillRecord.bookAgeMs,
+        bestBidAtPlacement: fillRecord.bestBidAtPlacement,
+        bestAskAtPlacement: fillRecord.bestAskAtPlacement,
+        bestBidAtFill: fillRecord.bestBidAtFill,
+        bestAskAtFill: fillRecord.bestAskAtFill,
+        orderPrice: fillRecord.orderPrice,
+        wasExecutableAtPlacement: fillRecord.wasExecutableAtPlacement,
+        wasExecutableAtFill: fillRecord.wasExecutableAtFill,
+        queueHaircutApplied: fillRecord.queueHaircutApplied,
+        slippageApplied: fillRecord.slippageApplied,
+        adverseSelectionBufferApplied: fillRecord.adverseSelectionBufferApplied,
+      };
     }
 
-    this.fills.push({
-      ts: Date.now(),
+    this.fills.push(fillRecord);
+    return {
+      ts: fillRecord.ts,
       tokenId,
       marketId,
       side,
       price: px,
-      size: qty,
+      qty,
       value,
-      strategy,
-    });
+      avgEntryPrice: currentCost,
+      positionQtyBefore: currentQty,
+      positionQtyAfter: currentQty,
+      realizedPnl: 0,
+      trustedFill: fillTrust.trustedFill,
+      trustedPnl: fillTrust.trustedFill,
+      fillInvalid: fillTrust.fillInvalid,
+      fillInvalidReason: fillRecord.fillInvalidReason,
+      fillSource: fillRecord.fillSource,
+      fillDelayMs: fillRecord.fillDelayMs,
+      bookAgeMs: fillRecord.bookAgeMs,
+      bestBidAtPlacement: fillRecord.bestBidAtPlacement,
+      bestAskAtPlacement: fillRecord.bestAskAtPlacement,
+      bestBidAtFill: fillRecord.bestBidAtFill,
+      bestAskAtFill: fillRecord.bestAskAtFill,
+      orderPrice: fillRecord.orderPrice,
+      wasExecutableAtPlacement: fillRecord.wasExecutableAtPlacement,
+      wasExecutableAtFill: fillRecord.wasExecutableAtFill,
+      queueHaircutApplied: fillRecord.queueHaircutApplied,
+      slippageApplied: fillRecord.slippageApplied,
+      adverseSelectionBufferApplied: fillRecord.adverseSelectionBufferApplied,
+    };
   }
 
   saveState() {
@@ -3395,7 +4482,9 @@ class PaperPortfolio {
         startingCash: this.startingCash,
         peakEquity: this.peakEquity,
         positions: Object.fromEntries(this.positions),
+        positionMarkets: Object.fromEntries(this.positionMarkets),
         costBasis: Object.fromEntries(this.costBasis),
+        latestMarks: Object.fromEntries(this.latestMarks),
         closedPnl: this.closedPnl,
         strategyPnl: Object.fromEntries(this.strategyPnl),
         ghostStats: this.ghostStats,
@@ -3424,7 +4513,9 @@ class PaperPortfolio {
       this.closedPnl = Number.isFinite(Number(data.closedPnl)) ? Number(data.closedPnl) : this.closedPnl;
 
       this.positions = new Map(Object.entries(data.positions || {}).map(([k, v]) => [k, Number(v)]));
+      this.positionMarkets = new Map(Object.entries(data.positionMarkets || {}).map(([k, v]) => [k, String(v)]));
       this.costBasis = new Map(Object.entries(data.costBasis || {}).map(([k, v]) => [k, Number(v)]));
+      this.latestMarks = new Map(Object.entries(data.latestMarks || {}).map(([k, v]) => [k, Number(v)]));
       this.strategyPnl = new Map(Object.entries(data.strategyPnl || {}).map(([k, v]) => [k, Number(v)]));
       this.ghostStats = data.ghostStats || this.ghostStats;
       this.fills = Array.isArray(data.fills) ? data.fills : [];
@@ -3433,6 +4524,13 @@ class PaperPortfolio {
         ...(data.executionTotals || {}),
       };
       this.executionEvents = Array.isArray(data.executionEvents) ? data.executionEvents : [];
+      for (const fill of this.fills) {
+        const tokenId = String(fill?.tokenId || '');
+        const marketId = String(fill?.marketId || '');
+        if (tokenId && marketId && !this.positionMarkets.has(tokenId)) {
+          this.positionMarkets.set(tokenId, marketId);
+        }
+      }
 
       info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity().toFixed(2)}`);
     } catch (e) {
@@ -3455,6 +4553,9 @@ class PaperOrder {
     this.expiresAt = Date.now() + signal.ttlMs;
     this.filledUsd = 0;
     this.metadata = signal.metadata || {};
+    this.placementAudit = signal.metadata?.paperPlacementAudit || null;
+    this.lastRealismBlockReason = null;
+    this.lastRealismBlockAt = 0;
   }
 
   remainingUsd() {
@@ -3477,6 +4578,162 @@ class RiskEngine {
     this.diagnostics = diagnostics;
     this.lastBlockReason = null;
     this.lastBlockDetails = null;
+    this.lastBtcBucketFullLog = new Map();
+  }
+
+  minSignalEdgeForSignal(signal) {
+    return minSignalEdgeForCandidate(signal, this.config);
+  }
+
+  exposureBreakdown(signal = null) {
+    const markPrices = this.portfolio.markPricesSnapshot();
+    const portfolioExposure = this.portfolio.portfolioExposureBreakdown(markPrices);
+    const btcOracleLedger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, Date.now());
+    const btcOraclePositionExposureUsd = Number(btcOracleLedger.currentPositionExposureUsd || 0);
+    const btcOracleOpenOrderExposureUsd = Number(btcOracleLedger.currentOpenOrderExposureUsd || 0);
+    const btcOracleTokenIds = new Set(
+      Array.isArray(btcOracleLedger.perTokenExposure)
+        ? btcOracleLedger.perTokenExposure.map((entry) => String(entry?.tokenId || '')).filter(Boolean)
+        : []
+    );
+    const positionEntries = this.portfolio.positionExposureEntries(markPrices);
+    const tradeability = this.portfolio.paperTokenTradeability instanceof Map
+      ? this.portfolio.paperTokenTradeability
+      : new Map();
+    const minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0));
+    let staleUntradeablePositionExposureUsd = 0;
+    let tradablePositionExposureUsd = 0;
+    let dustPositionExposureUsd = 0;
+    let staleUntradeablePositionCount = 0;
+    let tradablePositionCount = 0;
+    let dustPositionCount = 0;
+    let staleBtcOraclePositionExposureUsd = 0;
+    let tradableBtcOraclePositionExposureUsd = 0;
+    let staleNonBtcPositionExposureUsd = 0;
+    let tradableNonBtcPositionExposureUsd = 0;
+    for (const entry of positionEntries) {
+      const valueUsd = Number(entry?.valueUsd || 0);
+      if (!(valueUsd > 0)) continue;
+      const tokenId = String(entry?.tokenId || '');
+      const tokenTradeability = tradeability.get(String(entry.tokenId || '')) || null;
+      const staleStatus = String(tokenTradeability?.status || '');
+      const staleUntradeable = staleStatus === 'no_orderbook_404' || staleStatus === 'stale_token_cooldown';
+      const isBtcOraclePosition = btcOracleTokenIds.has(tokenId);
+      if (staleUntradeable) {
+        staleUntradeablePositionExposureUsd += valueUsd;
+        staleUntradeablePositionCount += 1;
+        if (isBtcOraclePosition) staleBtcOraclePositionExposureUsd += valueUsd;
+        else staleNonBtcPositionExposureUsd += valueUsd;
+      } else {
+        tradablePositionExposureUsd += valueUsd;
+        tradablePositionCount += 1;
+        if (isBtcOraclePosition) tradableBtcOraclePositionExposureUsd += valueUsd;
+        else tradableNonBtcPositionExposureUsd += valueUsd;
+      }
+      if (valueUsd < minOrderUsd) {
+        dustPositionExposureUsd += valueUsd;
+        dustPositionCount += 1;
+      }
+    }
+    const paperEntryExposureExclusionActive = (
+      this.config.enableLiveTrading !== true &&
+      String(signal?.side || '').toLowerCase() === 'buy'
+    );
+    const paperEntryExposureExclusionUsd = paperEntryExposureExclusionActive
+      ? staleUntradeablePositionExposureUsd
+      : 0;
+    const paperEntryBtcBucketExposureExclusionUsd = paperEntryExposureExclusionActive
+      ? staleBtcOraclePositionExposureUsd
+      : 0;
+    const paperEntryStandardBucketExposureExclusionUsd = paperEntryExposureExclusionActive
+      ? staleNonBtcPositionExposureUsd
+      : 0;
+    const rawTotalExposureUsd = Number(portfolioExposure.totalExposureUsd || 0);
+    const riskTotalExposureUsd = Math.max(0, rawTotalExposureUsd - paperEntryExposureExclusionUsd);
+    const candidateSizeUsd = Number(signal?.sizeUsd);
+    const buyDeltaUsd = signal?.side === 'buy' && Number.isFinite(candidateSizeUsd) ? candidateSizeUsd : 0;
+    return {
+      riskTotalExposureUsd,
+      rawTotalExposureUsd,
+      portfolioPositionExposureUsd: Number(portfolioExposure.positionExposureUsd || 0),
+      portfolioOpenOrderExposureUsd: Number(portfolioExposure.openOrderExposureUsd || 0),
+      staleUntradeablePositionExposureUsd,
+      tradablePositionExposureUsd,
+      dustPositionExposureUsd,
+      staleUntradeablePositionCount,
+      tradablePositionCount,
+      dustPositionCount,
+      staleBtcOraclePositionExposureUsd,
+      tradableBtcOraclePositionExposureUsd,
+      staleNonBtcPositionExposureUsd,
+      tradableNonBtcPositionExposureUsd,
+      paperEntryExposureExclusionActive,
+      paperEntryExposureExclusionUsd,
+      paperEntryBtcBucketExposureExclusionUsd,
+      paperEntryStandardBucketExposureExclusionUsd,
+      btcOraclePositionExposureUsd,
+      btcOracleOpenOrderExposureUsd,
+      nonBtcPositionExposureUsd: Number(portfolioExposure.positionExposureUsd || 0) - btcOraclePositionExposureUsd,
+      nonBtcOpenOrderExposureUsd: Number(portfolioExposure.openOrderExposureUsd || 0) - btcOracleOpenOrderExposureUsd,
+      maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
+      exposureAvailableUsd: Number(this.config.maxTotalExposureUsd || 0) - riskTotalExposureUsd,
+      candidateSizeUsd,
+      wouldTotalExposureUsd: riskTotalExposureUsd + buyDeltaUsd,
+    };
+  }
+
+  exposureBucketState(signal = null, exposureBreakdown = this.exposureBreakdown(signal)) {
+    const bucket = isBtcOracleStrategy(signal) ? 'btc' : 'standard';
+    const rawCurrentExposureUsd = bucket === 'btc'
+      ? Number(exposureBreakdown.btcOraclePositionExposureUsd || 0) + Number(exposureBreakdown.btcOracleOpenOrderExposureUsd || 0)
+      : Number(exposureBreakdown.nonBtcPositionExposureUsd || 0) + Number(exposureBreakdown.nonBtcOpenOrderExposureUsd || 0);
+    const bucketExposureExclusionUsd = bucket === 'btc'
+      ? Number(exposureBreakdown.paperEntryBtcBucketExposureExclusionUsd || 0)
+      : Number(exposureBreakdown.paperEntryStandardBucketExposureExclusionUsd || 0);
+    const currentExposureUsd = Math.max(0, rawCurrentExposureUsd - bucketExposureExclusionUsd);
+    const configuredShare = bucket === 'btc'
+      ? Number(this.config.btcExposureBucketShare ?? 0.5)
+      : Number(this.config.standardExposureBucketShare ?? 0.5);
+    const bucketShare = clamp(configuredShare, 0, 1);
+    const capUsd = Number(this.config.maxTotalExposureUsd || 0) * bucketShare;
+    const buyDeltaUsd = signal?.side === 'buy' && Number.isFinite(Number(signal?.sizeUsd))
+      ? Number(signal.sizeUsd)
+      : 0;
+    return {
+      strategyBucket: bucket,
+      strategyBucketCapUsd: capUsd,
+      strategyBucketExposureRawUsd: rawCurrentExposureUsd,
+      strategyBucketExposureExclusionUsd: bucketExposureExclusionUsd,
+      strategyBucketExposureUsd: currentExposureUsd,
+      strategyBucketWouldExposureUsd: currentExposureUsd + buyDeltaUsd,
+    };
+  }
+
+  logBtcBucketFull(action, bucketState = {}, extra = {}) {
+    const exposure = Number(bucketState?.strategyBucketExposureUsd || 0);
+    const projectedExposure = Number(bucketState?.strategyBucketWouldExposureUsd || exposure);
+    const cap = Number(bucketState?.strategyBucketCapUsd || 0);
+    if (!(cap > 0) || Math.max(exposure, projectedExposure) < cap - 1e-9) return;
+    const key = `${action}:${Math.round(exposure * 100)}:${Math.round(projectedExposure * 100)}:${Math.round(cap * 100)}`;
+    const now = Date.now();
+    const last = this.lastBtcBucketFullLog.get(key) || 0;
+    if (now - last < 30_000) return;
+    this.lastBtcBucketFullLog.set(key, now);
+    info(
+      `[BTC BUCKET FULL] exposure=${cleanLogValue(exposure)} cap=${cleanLogValue(cap)} action=${action} ` +
+      `projectedExposure=${cleanLogValue(projectedExposure)} ` +
+      `token=${shortId(extra?.tokenId)} sizeUsd=${cleanLogValue(extra?.sizeUsd)}`
+    );
+  }
+
+  sellReducesExistingExposure(signal, availableSellQty = null) {
+    if (!signal || signal.side !== 'sell') return false;
+    const availableQty = Number.isFinite(Number(availableSellQty))
+      ? Number(availableSellQty)
+      : this.portfolio.availablePositionQty(signal.tokenId);
+    if (!(availableQty > 0)) return false;
+    if (!Number.isFinite(Number(signal.price)) || Number(signal.price) <= 0) return false;
+    return true;
   }
 
   paperConfidenceProfile() {
@@ -3494,7 +4751,15 @@ class RiskEngine {
   }
 
   minOrderUsdForSignal(signal) {
-    if (isGabagoolStrategy(signal?.strategy) && this.config.enableGabagoolBtcImitation) {
+    const dustExitPolicy = gabagoolDustExitPolicy(signal, this.portfolio, this.config);
+    if (dustExitPolicy.eligible) {
+      return dustExitPolicy.minDustExitUsd;
+    }
+    const reduceOnlyExitPolicy = reduceOnlyPaperExitPolicy(signal, this.portfolio, this.config);
+    if (reduceOnlyExitPolicy.eligible) {
+      return reduceOnlyExitPolicy.minReduceOnlyExitUsd;
+    }
+    if (isGabagoolStrategy(signal) && this.config.enableGabagoolBtcImitation) {
       const gabagoolCap = Number(this.config.gabagoolMaxPaperOrderUsd);
       if (Number.isFinite(gabagoolCap) && gabagoolCap > 0) {
         return Math.max(0.5, Math.min(this.config.minOrderUsd, gabagoolCap));
@@ -3503,51 +4768,73 @@ class RiskEngine {
     return this.config.minOrderUsd;
   }
 
-  gabagoolPaperConfidenceOverride(signal, baseMinConfidence = this.config.minConfidence) {
-    const gabagool = signal?.metadata?.gabagool || {};
-    const deny = (reason) => ({
-      applied: false,
-      reason,
-    });
-
-    if (!isGabagoolStrategy(signal?.strategy)) return deny('not_gabagool_strategy');
-    if (String(signal.side || '').toLowerCase() !== 'buy') return deny('not_buy_signal');
-    if (!Number.isFinite(Number(signal.confidence)) || Number(signal.confidence) >= baseMinConfidence) {
-      return deny('base_confidence_passed');
-    }
-    if (this.config.enableLiveTrading === true) return deny('live_trading_enabled');
-    if (!Number.isFinite(Number(signal.expectedEdge)) || Number(signal.expectedEdge) < 0.08) {
-      return deny('expected_edge_below_paper_override_min');
-    }
-    if (Number(signal.confidence) < 0.50) return deny('confidence_below_paper_override_min');
-    if (!Number.isFinite(Number(signal.sizeUsd)) || Number(signal.sizeUsd) > 1) {
-      return deny('size_above_paper_override_max');
-    }
-    if (gabagool.oracleSignalFresh !== true) return deny('oracle_signal_not_fresh');
-    if (gabagool.validBook !== true) return deny('invalid_book');
-    if (gabagool.volatilityGuardPassed !== true) return deny('volatility_guard_blocked');
-    if (gabagool.lateEntryWindowPassed !== true) return deny('late_entry_window_blocked');
-
+  gabagoolConfidenceThreshold(signal, baseMinConfidence = this.config.minConfidence) {
+    if (!isGabagoolStrategy(signal)) return null;
+    const liveMode = this.config.enableLiveTrading === true;
+    const configuredMin = Number(liveMode ? this.config.gabagoolMinConfidenceLive : this.config.gabagoolMinConfidence);
+    const fallbackMin = liveMode ? Math.max(baseMinConfidence, 0.70) : baseMinConfidence;
+    const selectedMin = Number.isFinite(configuredMin) && configuredMin > 0
+      ? configuredMin
+      : fallbackMin;
+    const minConfidence = clamp(selectedMin, 0, 1);
     return {
-      applied: true,
-      reason: 'gabagool_btc_paper_override',
-      minConfidence: Math.min(baseMinConfidence, 0.50),
+      minConfidence,
+      confidenceProfile: this.paperConfidenceProfile(),
+      thresholdSource: liveMode ? 'GABAGOOL_MIN_CONFIDENCE_LIVE' : 'GABAGOOL_MIN_CONFIDENCE',
+      paperConfidenceOverrideEligible: liveMode ? false : true,
+      gabagoolConfidenceMode: liveMode ? 'live' : 'paper',
+      configuredGabagoolMinConfidence: Number(this.config.gabagoolMinConfidence),
+      configuredGabagoolMinConfidenceLive: Number(this.config.gabagoolMinConfidenceLive),
+      paperConfidenceOverrideReason: liveMode
+        ? 'gabagool_live_confidence_floor'
+        : 'gabagool_paper_confidence_floor',
     };
   }
 
   confidenceThreshold(signal) {
     const base = this.config.minConfidence;
     const profile = this.paperConfidenceProfile();
-    const gabagoolOverride = this.gabagoolPaperConfidenceOverride(signal, base);
+    const gabagoolThreshold = this.gabagoolConfidenceThreshold(signal, base);
 
-    if (gabagoolOverride.applied) {
-      return {
-        minConfidence: gabagoolOverride.minConfidence,
-        confidenceProfile: profile,
-        thresholdSource: 'GABAGOOL_BTC_PAPER_OVERRIDE',
-        paperConfidenceOverrideEligible: true,
-        paperConfidenceOverrideReason: gabagoolOverride.reason,
-      };
+    if (gabagoolThreshold) return gabagoolThreshold;
+
+    const strategy = resolveStrategyName(signal);
+    const paperProbation = signal?.metadata?.paperProbation || null;
+    if (
+      !this.config.enableLiveTrading &&
+      strategy === 'SpreadHunter' &&
+      String(signal?.side || '').toLowerCase() === 'buy' &&
+      paperProbation?.active === true
+    ) {
+      const probationMinConfidence = Number(paperProbation.minConfidence);
+      if (Number.isFinite(probationMinConfidence) && probationMinConfidence > 0) {
+        return {
+          minConfidence: clamp(probationMinConfidence, 0, 1),
+          confidenceProfile: profile,
+          thresholdSource: 'SPREADHUNTER_PAPER_PROBATION',
+          paperConfidenceOverrideEligible: true,
+          paperConfidenceOverrideReason: 'spreadhunter_paper_probation',
+          paperProbationActive: true,
+          paperProbationStrictMinConfidence: Number(paperProbation.strictMinConfidence || base),
+          paperProbationTrigger: String(paperProbation.trigger || 'unknown'),
+        };
+      }
+    }
+    const standardOverrideEligible = (
+      !this.config.enableLiveTrading &&
+      ['SpreadHunter', 'ComplementArb', 'TailEndMispricing', 'WhaleCopy'].includes(strategy)
+    );
+    if (standardOverrideEligible) {
+      const paperMin = Number(this.config.standardPaperMinConfidence);
+      if (Number.isFinite(paperMin) && paperMin > 0) {
+        return {
+          minConfidence: Math.min(base, paperMin),
+          confidenceProfile: profile,
+          thresholdSource: 'STANDARD_PAPER_MIN_CONFIDENCE',
+          paperConfidenceOverrideEligible: true,
+          paperConfidenceOverrideReason: 'mixed_mode_standard_paper_floor',
+        };
+      }
     }
 
     const overrideEligible = this.isPaperSpreadHunterOverrideEligible(signal);
@@ -3558,7 +4845,6 @@ class RiskEngine {
         confidenceProfile: profile,
         thresholdSource: 'MIN_CONFIDENCE',
         paperConfidenceOverrideEligible: false,
-        ...(isGabagoolStrategy(signal?.strategy) ? { paperConfidenceOverrideReason: gabagoolOverride.reason } : {}),
       };
     }
 
@@ -3595,11 +4881,14 @@ class RiskEngine {
       : 0;
     const currentPosQty = this.portfolio.position(signal.tokenId);
     const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId) + replaceSellQty;
-    const totalExposureUsd = this.portfolio.totalExposureUsd();
-    const marketExposureUsd = this.portfolio.marketExposureUsd(signal.marketId);
+    const exposureBreakdown = this.exposureBreakdown(signal);
+    const totalExposureUsd = exposureBreakdown.riskTotalExposureUsd;
+    const marketExposureUsd = this.portfolio.marketExposureUsd(signal.marketId, this.portfolio.markPricesSnapshot());
     const currentPosUsd = Number.isFinite(signal.price) ? currentPosQty * signal.price : NaN;
     const drawdownPct = this.portfolio.getDrawdownPct();
     const confidenceThreshold = this.confidenceThreshold(signal);
+    const minSignalEdge = this.minSignalEdgeForSignal(signal);
+    const bucketState = this.exposureBucketState(signal, exposureBreakdown);
 
     return {
       strategy: signal.strategy || null,
@@ -3609,13 +4898,16 @@ class RiskEngine {
       sizeUsd: Number(signal.sizeUsd),
       minOrderUsd,
       expectedEdge: Number(signal.expectedEdge),
-      minSignalEdge: this.config.minSignalEdge,
+      minSignalEdge,
       confidence: Number(signal.confidence),
       minConfidence: confidenceThreshold.minConfidence,
       configuredMinConfidence: this.config.minConfidence,
       confidenceProfile: confidenceThreshold.confidenceProfile,
       thresholdSource: confidenceThreshold.thresholdSource,
       paperConfidenceOverrideEligible: confidenceThreshold.paperConfidenceOverrideEligible,
+      gabagoolConfidenceMode: confidenceThreshold.gabagoolConfidenceMode || null,
+      configuredGabagoolMinConfidence: confidenceThreshold.configuredGabagoolMinConfidence,
+      configuredGabagoolMinConfidenceLive: confidenceThreshold.configuredGabagoolMinConfidenceLive,
       ...(confidenceThreshold.paperConfidenceOverrideReason
         ? { paperConfidenceOverrideReason: confidenceThreshold.paperConfidenceOverrideReason }
         : {}),
@@ -3624,11 +4916,21 @@ class RiskEngine {
       availableSellQty,
       currentPositionUsd: currentPosUsd,
       totalExposureUsd,
-      maxTotalExposureUsd: this.config.maxTotalExposureUsd,
+      rawTotalExposureUsd: Number(exposureBreakdown.rawTotalExposureUsd || totalExposureUsd),
+      staleExposureUsd: Number(exposureBreakdown.staleUntradeablePositionExposureUsd || 0),
+      tradableExposureUsd: Number(exposureBreakdown.tradablePositionExposureUsd || 0),
+      dustExposureUsd: Number(exposureBreakdown.dustPositionExposureUsd || 0),
+      staleExposureCount: Number(exposureBreakdown.staleUntradeablePositionCount || 0),
+      tradableExposureCount: Number(exposureBreakdown.tradablePositionCount || 0),
+      dustExposureCount: Number(exposureBreakdown.dustPositionCount || 0),
+      paperEntryExposureExclusionActive: exposureBreakdown.paperEntryExposureExclusionActive === true,
+      paperEntryExposureExclusionUsd: Number(exposureBreakdown.paperEntryExposureExclusionUsd || 0),
+      ...exposureBreakdown,
+      ...bucketState,
       marketExposureUsd,
       maxMarketExposureUsd: this.config.maxMarketExposureUsd,
       maxPositionUsdPerAsset: this.config.maxPositionUsdPerAsset,
-      totalOpenOrderUsd: this.portfolio.totalOpenOrderUsd(),
+      totalOpenOrderUsd: this.portfolio.openOrderExposureUsd(),
       maxTotalOpenOrderUsd: this.config.maxTotalOpenOrderUsd,
       openOrders: this.portfolio.openOrders.size,
       maxOpenOrders: this.config.maxOpenOrders,
@@ -3660,46 +4962,35 @@ class RiskEngine {
     if (this.portfolio.openOrders.size >= this.config.maxOpenOrders) return this.block(signal, 'max_open_orders');
 
     const isProtectiveExit = ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(signal.strategy);
-    if (!isProtectiveExit && signal.expectedEdge < this.config.minSignalEdge) return this.block(signal, 'edge_below_min');
+    const minSignalEdge = this.minSignalEdgeForSignal(signal);
+    if (!isProtectiveExit && signal.expectedEdge < minSignalEdge) return this.block(signal, 'edge_below_min', { minSignalEdge });
     const confidenceThreshold = this.confidenceThreshold(signal);
     if (
       !isProtectiveExit &&
-      isGabagoolStrategy(signal.strategy) &&
-      String(signal.side || '').toLowerCase() === 'buy' &&
+      isGabagoolStrategy(signal) &&
       Number.isFinite(Number(signal.confidence)) &&
       Number(signal.confidence) < this.config.minConfidence
     ) {
-      const overrideStatus = confidenceThreshold.paperConfidenceOverrideEligible ? 'ALLOWED' : 'DENIED';
-      const overrideMessage = [
-        `[PAPER CONFIDENCE OVERRIDE ${overrideStatus}]`,
+      const floorStatus = Number(signal.confidence) >= confidenceThreshold.minConfidence ? 'ALLOW' : 'BLOCK';
+      const floorMessage = [
+        `[GABAGOOL CONFIDENCE FLOOR ${floorStatus}]`,
         signal.strategy,
-        'BUY',
+        String(signal.side || '').toUpperCase() || 'UNKNOWN',
         shortId(signal.tokenId),
         `expectedEdge=${cleanLogValue(signal.expectedEdge)}`,
         `confidence=${cleanLogValue(signal.confidence)}`,
-        `minConfidence=${cleanLogValue(this.config.minConfidence)}`,
-        `sizeUsd=${cleanLogValue(signal.sizeUsd)}`,
-        `freshOracle=${signal.metadata?.gabagool?.oracleSignalFresh === true}`,
-        `validBook=${signal.metadata?.gabagool?.validBook === true}`,
-        `volatilityGuardPassed=${signal.metadata?.gabagool?.volatilityGuardPassed === true}`,
-        `lateEntryWindowPassed=${signal.metadata?.gabagool?.lateEntryWindowPassed === true}`,
-        `paperConfidenceOverrideEligible=${confidenceThreshold.paperConfidenceOverrideEligible === true}`,
+        `minConfidence=${cleanLogValue(confidenceThreshold.minConfidence)}`,
+        `globalMinConfidence=${cleanLogValue(this.config.minConfidence)}`,
+        `gabagoolMode=${confidenceThreshold.gabagoolConfidenceMode || 'paper'}`,
+        `gabagoolPaperMin=${cleanLogValue(this.config.gabagoolMinConfidence)}`,
+        `gabagoolLiveMin=${cleanLogValue(this.config.gabagoolMinConfidenceLive)}`,
         `reason=${confidenceThreshold.paperConfidenceOverrideReason || 'not_applicable'}`,
       ].join(' ');
-      info(overrideMessage);
+      info(floorMessage);
     }
     if (!isProtectiveExit && signal.confidence < confidenceThreshold.minConfidence) {
       return this.block(signal, 'confidence_below_min', confidenceThreshold);
     }
-
-    const openUsd = this.portfolio.totalOpenOrderUsd();
-    if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'max_total_open_order_usd');
-
-    const totalEx = this.portfolio.totalExposureUsd();
-    if (signal.side === 'buy' && totalEx + signal.sizeUsd > this.config.maxTotalExposureUsd) return this.block(signal, 'max_total_exposure');
-
-    const mktEx = this.portfolio.marketExposureUsd(signal.marketId);
-    if (signal.side === 'buy' && mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return this.block(signal, 'max_market_exposure');
 
     const matchingOrders = this.portfolio.findOpenOrdersBySignal(signal);
     const replaceCreditUsd = this.config.openOrderReplaceEnabled
@@ -3716,6 +5007,37 @@ class RiskEngine {
     const currentPosUsd = currentPosQty * signal.price;
 
     if (signal.side === 'buy') {
+      const openUsd = this.portfolio.openOrderExposureUsd();
+      if (openUsd + signal.sizeUsd > this.config.maxTotalOpenOrderUsd) return this.block(signal, 'max_total_open_order_usd');
+
+      const exposureBreakdown = this.exposureBreakdown(signal);
+      if (exposureBreakdown.wouldTotalExposureUsd > this.config.maxTotalExposureUsd) {
+        return this.block(signal, 'max_total_exposure', exposureBreakdown);
+      }
+      const bucketState = this.exposureBucketState(signal, exposureBreakdown);
+      if (
+        bucketState.strategyBucketCapUsd > 0 &&
+        bucketState.strategyBucketWouldExposureUsd > bucketState.strategyBucketCapUsd
+      ) {
+        const blockReason = bucketState.strategyBucket === 'btc'
+          ? 'btc_bucket_exposure'
+          : 'standard_bucket_exposure';
+        if (bucketState.strategyBucket === 'btc') {
+          this.logBtcBucketFull(
+            Number(bucketState.strategyBucketExposureUsd || 0) > 0 ? 'prioritize_exit' : 'block_new_entry',
+            bucketState,
+            { tokenId: signal.tokenId, sizeUsd: signal.sizeUsd }
+          );
+        }
+        return this.block(signal, blockReason, {
+          ...exposureBreakdown,
+          ...bucketState,
+        });
+      }
+
+      const mktEx = this.portfolio.marketExposureUsd(signal.marketId, this.portfolio.markPricesSnapshot());
+      if (mktEx + signal.sizeUsd > this.config.maxMarketExposureUsd) return this.block(signal, 'max_market_exposure');
+
       if (this.portfolio.availableCash() + replaceCreditUsd < signal.sizeUsd) return this.block(signal, 'cash_cap');
       if (currentPosUsd + signal.sizeUsd > this.config.maxPositionUsdPerAsset) return this.block(signal, 'max_position_per_asset');
     }
@@ -3725,7 +5047,98 @@ class RiskEngine {
       if (availableQty <= 0) return this.block(signal, 'no_available_position', { availableSellQty: availableQty });
       const maxSellUsd = availableQty * signal.price;
       signal.sizeUsd = Math.min(signal.sizeUsd, maxSellUsd);
-      if (signal.sizeUsd < minOrderUsd) return this.block(signal, 'sell_size_below_min', { availableSellQty: availableQty, maxSellUsd, minOrderUsd });
+      signal.metadata = {
+        ...(signal.metadata || {}),
+        availableSellQtyOverride: availableQty,
+      };
+      const reducesExistingExposure = this.sellReducesExistingExposure(signal, availableQty);
+      const requestedSellUsdBeforeDustBatch = Number(signal.sizeUsd || 0);
+      const remainingValueAfterSellUsd = Math.max(0, maxSellUsd - signal.sizeUsd);
+      if (
+        reducesExistingExposure &&
+        remainingValueAfterSellUsd > 0 &&
+        remainingValueAfterSellUsd < this.config.minOrderUsd
+      ) {
+        signal.sizeUsd = maxSellUsd;
+        signal.metadata = {
+          ...(signal.metadata || {}),
+          dust_exit_batch: true,
+          dust_exit_requested_below_min_usd: requestedSellUsdBeforeDustBatch < this.config.minOrderUsd,
+          dust_exit_batch_remaining_before_usd: remainingValueAfterSellUsd,
+        };
+      }
+      const sellDustExitPolicy = gabagoolDustExitPolicy(signal, this.portfolio, this.config);
+      const sellReduceOnlyPolicy = reduceOnlyPaperExitPolicy(signal, this.portfolio, this.config);
+      const sellMinOrderUsd = sellDustExitPolicy.eligible
+        ? sellDustExitPolicy.minDustExitUsd
+        : sellReduceOnlyPolicy.eligible
+          ? sellReduceOnlyPolicy.minReduceOnlyExitUsd
+          : minOrderUsd;
+      if (signal.sizeUsd < sellMinOrderUsd) {
+        return this.block(signal, 'sell_size_below_min', {
+          availableSellQty: availableQty,
+          maxSellUsd,
+          minOrderUsd: sellMinOrderUsd,
+        });
+      }
+      const gabagoolReduceOnlyExitMode = isGabagoolStrategy(signal) && reducesExistingExposure
+        ? String(signal.metadata?.gabagool?.exitMode || signal.metadata?.exitMode || '')
+        : '';
+      const gabagoolReduceOnlyExitAllowed = (
+        gabagoolReduceOnlyExitMode === 'loss_guard_reduce_only' ||
+        gabagoolReduceOnlyExitMode === 'exposure_cap_reduce_only'
+      );
+      if (gabagoolReduceOnlyExitAllowed) {
+        signal.metadata = {
+          ...(signal.metadata || {}),
+          exitMode: gabagoolReduceOnlyExitMode,
+          loss_guard_reduce_exit_allowed: gabagoolReduceOnlyExitMode === 'loss_guard_reduce_only',
+          exposure_cap_reduce_exit_allowed: gabagoolReduceOnlyExitMode === 'exposure_cap_reduce_only',
+          risk_exposure_reduce_allowed: true,
+        };
+        info(
+          `[GABAGOOL REDUCE EXIT ALLOWED] exitMode=${gabagoolReduceOnlyExitMode} ` +
+          `loss_guard_reduce_exit_allowed=${gabagoolReduceOnlyExitMode === 'loss_guard_reduce_only' ? 'true' : 'false'} ` +
+          `exposure_cap_reduce_exit_allowed=${gabagoolReduceOnlyExitMode === 'exposure_cap_reduce_only' ? 'true' : 'false'} ` +
+          `risk_exposure_reduce_allowed=true token=${shortId(signal.tokenId)} ` +
+          `sizeUsd=${cleanLogValue(signal.sizeUsd)} availableSellQty=${cleanLogValue(availableQty)}`
+        );
+      }
+      const dustExitPolicy = sellDustExitPolicy;
+      if (dustExitPolicy.eligible && signal.sizeUsd < this.config.minOrderUsd) {
+        signal.metadata = {
+          ...(signal.metadata || {}),
+          dust_exit_allowed: true,
+        };
+        info(
+          `[GABAGOOL DUST EXIT ALLOWED] dust_exit_allowed=true token=${shortId(signal.tokenId)} ` +
+          `sizeUsd=${cleanLogValue(signal.sizeUsd)} minOrderUsd=${cleanLogValue(this.config.minOrderUsd)} ` +
+          `dustFloorUsd=${cleanLogValue(dustExitPolicy.minDustExitUsd)}`
+        );
+      }
+      const exposureBreakdown = this.exposureBreakdown(signal);
+      const bucketState = this.exposureBucketState(signal, exposureBreakdown);
+      if (bucketState.strategyBucket === 'btc' && reducesExistingExposure) {
+        this.logBtcBucketFull('reduce_only', bucketState, {
+          tokenId: signal.tokenId,
+          sizeUsd: signal.sizeUsd,
+        });
+      }
+      if (
+        reducesExistingExposure &&
+        exposureBreakdown.riskTotalExposureUsd >= this.config.maxTotalExposureUsd
+      ) {
+        signal.metadata = {
+          ...(signal.metadata || {}),
+          risk_exposure_reduce_allowed: true,
+        };
+        info(
+          `[RISK EXPOSURE REDUCE ALLOWED] strategy=${signal.strategy || 'UNKNOWN'} ` +
+          `risk_exposure_reduce_allowed=true token=${shortId(signal.tokenId)} ` +
+          `sizeUsd=${cleanLogValue(signal.sizeUsd)} riskTotalExposureUsd=${cleanLogValue(exposureBreakdown.riskTotalExposureUsd)} ` +
+          `maxTotalExposureUsd=${cleanLogValue(this.config.maxTotalExposureUsd)}`
+        );
+      }
     }
 
     if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return this.block(signal, 'drawdown_limit');
@@ -3744,6 +5157,7 @@ class PaperExecutionEngine {
     this.portfolio = portfolio;
     this.cache = cache;
     this.diagnostics = diagnostics;
+    this.lastPlacementDecision = null;
     this.replaceSkipBatch = {
       windowStartedAt: Date.now(),
       ageSkips: 0,
@@ -3840,7 +5254,96 @@ class PaperExecutionEngine {
     }
   }
 
+  minOrderUsdForPlacement(signal) {
+    const dustExitPolicy = gabagoolDustExitPolicy(signal, this.portfolio, this.config);
+    if (dustExitPolicy.eligible) {
+      return dustExitPolicy.minDustExitUsd;
+    }
+    const reduceOnlyExitPolicy = reduceOnlyPaperExitPolicy(signal, this.portfolio, this.config);
+    if (reduceOnlyExitPolicy.eligible) {
+      return reduceOnlyExitPolicy.minReduceOnlyExitUsd;
+    }
+    if (isGabagoolStrategy(signal) && this.config.enableGabagoolBtcImitation) {
+      const gabagoolCap = Number(this.config.gabagoolMaxPaperOrderUsd);
+      if (Number.isFinite(gabagoolCap) && gabagoolCap > 0) {
+        return Math.max(0.5, Math.min(this.config.minOrderUsd, gabagoolCap));
+      }
+    }
+    return this.config.minOrderUsd;
+  }
+
+  minFillUsdForOrder(order) {
+    const dustExitPolicy = gabagoolDustExitPolicy(order?.signal || order, this.portfolio, this.config);
+    if (dustExitPolicy.eligible) {
+      return dustExitPolicy.minDustExitUsd;
+    }
+    const reduceOnlyExitPolicy = reduceOnlyPaperExitPolicy(order?.signal || order, this.portfolio, this.config);
+    if (reduceOnlyExitPolicy.eligible) {
+      return reduceOnlyExitPolicy.minReduceOnlyExitUsd;
+    }
+    return this.config.minFillUsd;
+  }
+
+  setPlacementDecision(signal, decision = {}) {
+    this.lastPlacementDecision = {
+      ts: Date.now(),
+      strategy: signal?.strategy || null,
+      tokenId: signal?.tokenId ? String(signal.tokenId) : null,
+      marketId: signal?.marketId ? String(signal.marketId) : null,
+      side: signal?.side ? String(signal.side).toLowerCase() : null,
+      price: Number.isFinite(Number(signal?.price)) ? Number(signal.price) : null,
+      sizeUsd: Number.isFinite(Number(signal?.sizeUsd)) ? Number(signal.sizeUsd) : null,
+      placed: decision.placed === true,
+      reason: decision.reason || null,
+      detail: decision.detail || null,
+      comparableOrders: Number.isFinite(Number(decision.comparableOrders)) ? Number(decision.comparableOrders) : 0,
+    };
+    return this.lastPlacementDecision;
+  }
+
+  recordRealismBlock(order, blockReason, audit = {}, now = Date.now()) {
+    if (!order || !blockReason) return;
+    if (
+      order.lastRealismBlockReason === blockReason &&
+      now - Number(order.lastRealismBlockAt || 0) < 30_000
+    ) {
+      return;
+    }
+    order.lastRealismBlockReason = blockReason;
+    order.lastRealismBlockAt = now;
+    this.portfolio.recordExecutionEvent('order_realism_block', {
+      ...order,
+      marketSlug: order.signal?.metadata?.marketSlug,
+      outcome: order.signal?.metadata?.outcome,
+      expectedEdge: order.signal?.expectedEdge,
+      confidence: order.signal?.confidence,
+      timeToFillSec: Math.max(0, (now - order.createdAt) / 1000),
+      fillDelayMs: Math.max(0, now - order.createdAt),
+      reason: blockReason,
+      ...audit,
+    });
+  }
+
   place(signal, book) {
+    this.lastPlacementDecision = null;
+    if (!signal) {
+      this.setPlacementDecision(signal, { placed: false, reason: 'final_gate_block', detail: 'missing_signal' });
+      return false;
+    }
+    if (!signal.tokenId) {
+      this.setPlacementDecision(signal, { placed: false, reason: 'no_valid_token' });
+      return false;
+    }
+    if (!Number.isFinite(Number(signal.price)) || Number(signal.price) <= 0 || Number(signal.price) >= 1) {
+      this.setPlacementDecision(signal, { placed: false, reason: 'no_valid_price' });
+      return false;
+    }
+    const minOrderUsd = this.minOrderUsdForPlacement(signal);
+    if (!Number.isFinite(Number(signal.sizeUsd)) || Number(signal.sizeUsd) < minOrderUsd) {
+      this.setPlacementDecision(signal, { placed: false, reason: 'order_size_below_min' });
+      return false;
+    }
+
     const comparableOrders = this.findComparableOpenOrders(signal);
     const maxComparable = Math.max(1, this.config.maxOpenOrdersPerTokenSideStrategy || 1);
 
@@ -3867,6 +5370,12 @@ class PaperExecutionEngine {
           scorePassed: true,
           blockReason: 'order_skip_duplicate',
         });
+        this.setPlacementDecision(signal, {
+          placed: false,
+          reason: 'duplicate_order',
+          detail: decision.reason || 'duplicate',
+          comparableOrders: comparableOrders.length,
+        });
         return false;
       }
 
@@ -3886,17 +5395,51 @@ class PaperExecutionEngine {
       }
     }
 
-    const order = new PaperOrder(signal);
-    this.portfolio.addOrder(order);
-    this.portfolio.recordExecutionEvent('order_placed', signal);
-    this.portfolio.recordGhostOrder(signal, book);
-    info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
-    this.diagnostics?.record({
-      strategy: signal.strategy,
-      scorePassed: true,
-      blockReason: 'order_placed',
-    });
-    return true;
+    try {
+      const placementBestBid = Number.isFinite(Number(book?.bestBid)) ? Number(book.bestBid) : null;
+      const placementBestAsk = Number.isFinite(Number(book?.bestAsk)) ? Number(book.bestAsk) : null;
+      const placementAudit = {
+        placedAtTs: Date.now(),
+        bestBidAtPlacement: placementBestBid,
+        bestAskAtPlacement: placementBestAsk,
+        bookAgeMs: Number.isFinite(Number(book?.cachedAt)) ? Math.max(0, Date.now() - Number(book.cachedAt)) : null,
+        orderPrice: Number(signal.price),
+        wasExecutableAtPlacement: bestBidAskExecutable(signal.side, signal.price, placementBestBid, placementBestAsk),
+      };
+      signal.metadata = {
+        ...(signal.metadata || {}),
+        paperPlacementAudit: placementAudit,
+      };
+      const order = new PaperOrder(signal);
+      this.portfolio.addOrder(order);
+      this.portfolio.recordExecutionEvent('order_placed', signal);
+      this.portfolio.recordGhostOrder(signal, book);
+      info(`[ORDER] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${signal.strategy}]`);
+      if (isStandardPaperStrategy(signal.strategy)) {
+        info(
+          `[STANDARD ORDER] strategy=${signal.strategy} side=${signal.side.toUpperCase()} token=${shortId(signal.tokenId)} ` +
+          `price=${fmtPrice(signal.price)} sizeUsd=${cleanLogValue(signal.sizeUsd)}`
+        );
+      }
+      this.diagnostics?.record({
+        strategy: signal.strategy,
+        scorePassed: true,
+        blockReason: 'order_placed',
+      });
+      this.setPlacementDecision(signal, { placed: true, reason: 'order_placed' });
+      return true;
+    } catch (error) {
+      warn(
+        `[PAPER ORDER BLOCK] ${String(signal.side || '').toUpperCase()} ${shortId(signal.tokenId)} ` +
+        `strategy=${signal.strategy} reason=unknown_placement_block error=${error.message}`
+      );
+      this.setPlacementDecision(signal, {
+        placed: false,
+        reason: 'unknown_placement_block',
+        detail: error.message,
+      });
+      return false;
+    }
   }
 
   processOpenOrders() {
@@ -3919,23 +5462,50 @@ class PaperExecutionEngine {
 
       const book = this.cache.getBook(order.tokenId);
       if (!isBookComplete(book)) continue;
+      this.portfolio.setMarkPrice(order.tokenId, book.midpoint);
 
-      const fill = this.computeFill(order, book);
-      if (!fill || fill.fillUsd < this.config.minFillUsd) continue;
+      const fill = this.computeFill(order, book, now);
+      const minFillUsd = this.minFillUsdForOrder(order);
+      if (!fill || fill.canFill !== true) {
+        if (fill?.blockReason) this.recordRealismBlock(order, fill.blockReason, fill, now);
+        continue;
+      }
+      if (fill.fillUsd < minFillUsd) continue;
+
+      order.lastRealismBlockReason = null;
+      order.lastRealismBlockAt = 0;
 
       const fillSize = fill.fillUsd / fill.price;
 
-      this.portfolio.recordFill({
+      const fillDetails = this.portfolio.recordFill({
         tokenId: order.tokenId,
         marketId: order.marketId,
+        marketSlug: order.signal?.metadata?.marketSlug,
+        outcome: order.signal?.metadata?.outcome,
         side: order.side,
         price: fill.price,
         size: fillSize,
         strategy: order.strategy,
+        ts: now,
+        fillSource: fill.fillSource,
+        fillDelayMs: fill.fillDelayMs,
+        bookAgeMs: fill.bookAgeMs,
+        bestBidAtPlacement: fill.bestBidAtPlacement,
+        bestAskAtPlacement: fill.bestAskAtPlacement,
+        bestBidAtFill: fill.bestBidAtFill,
+        bestAskAtFill: fill.bestAskAtFill,
+        orderPrice: fill.orderPrice,
+        wasExecutableAtPlacement: fill.wasExecutableAtPlacement,
+        wasExecutableAtFill: fill.wasExecutableAtFill,
+        queueHaircutApplied: fill.queueHaircutApplied,
+        slippageApplied: fill.slippageApplied,
+        adverseSelectionBufferApplied: fill.adverseSelectionBufferApplied,
+        fillInvalidReason: fill.fillInvalidReason,
       });
-      this.portfolio.recordExecutionEvent('fill', {
+      const fillEventBase = {
         ...order,
         timeToFillSec: Math.max(0, (now - order.createdAt) / 1000),
+        fillDelayMs: fill.fillDelayMs,
         filledUsd: fill.fillUsd,
         price: fill.price,
         sizeUsd: fill.fillUsd,
@@ -3943,56 +5513,211 @@ class PaperExecutionEngine {
         outcome: order.signal?.metadata?.outcome,
         expectedEdge: order.signal?.expectedEdge,
         confidence: order.signal?.confidence,
+        fillSource: fill.fillSource,
+        bookAgeMs: fill.bookAgeMs,
+        bestBidAtPlacement: fill.bestBidAtPlacement,
+        bestAskAtPlacement: fill.bestAskAtPlacement,
+        bestBidAtFill: fill.bestBidAtFill,
+        bestAskAtFill: fill.bestAskAtFill,
+        orderPrice: fill.orderPrice,
+        wasExecutableAtPlacement: fill.wasExecutableAtPlacement,
+        wasExecutableAtFill: fill.wasExecutableAtFill,
+        queueHaircutApplied: fill.queueHaircutApplied,
+        slippageApplied: fill.slippageApplied,
+        adverseSelectionBufferApplied: fill.adverseSelectionBufferApplied,
+        trustedFill: fillDetails?.trustedFill,
+        trustedPnl: fillDetails?.trustedPnl,
+        fillInvalid: fillDetails?.fillInvalid,
+        fillInvalidReason: fillDetails?.fillInvalidReason,
+        trustedRealizedPnl: fillDetails?.trustedRealizedPnl,
+        untrustedRealizedPnl: fillDetails?.untrustedRealizedPnl,
+      };
+      this.portfolio.recordExecutionEvent('fill', {
+        ...fillEventBase,
       });
+      let exitClassification = null;
       if (isBtcOracleStrategy(order.strategy)) {
         this.portfolio.recordExecutionEvent('gabagool_fill', {
-          ...order,
-          timeToFillSec: Math.max(0, (now - order.createdAt) / 1000),
-          filledUsd: fill.fillUsd,
-          price: fill.price,
-          sizeUsd: fill.fillUsd,
-          marketSlug: order.signal?.metadata?.marketSlug,
-          outcome: order.signal?.metadata?.outcome,
-          expectedEdge: order.signal?.expectedEdge,
-          confidence: order.signal?.confidence,
+          ...fillEventBase,
         });
         if (order.side === 'sell') {
-          this.portfolio.recordExecutionEvent('gabagool_exit', {
-            ...order,
-            timeToFillSec: Math.max(0, (now - order.createdAt) / 1000),
+          if (order.signal?.metadata?.gabagool?.exitMode === 'loss_guard_reduce_only') {
+            this.portfolio.recordExecutionEvent('gabagool_loss_guard_exit_filled', {
+              ...fillEventBase,
+              marketSlug: order.signal?.metadata?.marketSlug,
+              outcome: order.signal?.metadata?.outcome,
+              side: order.side,
+              price: fill.price,
+              sizeUsd: fill.fillUsd,
+              reason: 'loss_guard_reduce_only',
+              exitMode: 'loss_guard_reduce_only',
+            });
+          }
+          if (order.signal?.metadata?.gabagool?.exitMode === 'exposure_cap_reduce_only') {
+            this.portfolio.recordExecutionEvent('gabagool_reduce_only_exit_filled', {
+              ...fillEventBase,
+              marketSlug: order.signal?.metadata?.marketSlug,
+              outcome: order.signal?.metadata?.outcome,
+              side: order.side,
+              price: fill.price,
+              sizeUsd: fill.fillUsd,
+              reason: order.signal?.metadata?.gabagool?.exitTrigger || 'exposure_cap_reduce_only',
+              exitMode: 'exposure_cap_reduce_only',
+            });
+          }
+          let exitClassification = classifyGabagoolExit({
+            signal: order.signal,
             filledUsd: fill.fillUsd,
-            price: fill.price,
-            sizeUsd: fill.fillUsd,
-            marketSlug: order.signal?.metadata?.marketSlug,
-            outcome: order.signal?.metadata?.outcome,
-            expectedEdge: order.signal?.expectedEdge,
-            confidence: order.signal?.confidence,
+            avgEntryPrice: fillDetails?.avgEntryPrice,
+            sellPrice: fill.price,
+            realizedPnl: fillDetails?.realizedPnl,
+            positionQtyBefore: fillDetails?.positionQtyBefore,
+            positionQtyAfter: fillDetails?.positionQtyAfter,
+            minOrderUsd: Number(this.config.minOrderUsd || 0),
           });
+            if (
+              String(order?.side || '').toLowerCase() === 'sell' &&
+              (
+                order.signal?.metadata?.dust_exit_allowed === true ||
+                order.signal?.metadata?.dust_exit_requested_below_min_usd === true
+              )
+            ) {
+              exitClassification = 'dust_exit';
+            }
+
+          this.bot?.onGabagoolSellFill?.({
+            order,
+            fillDetails,
+            exitClassification,
+            now,
+          });
+          if (
+            order.signal?.metadata?.dust_exit_allowed === true ||
+            order.signal?.metadata?.dust_exit_requested_below_min_usd === true
+          ) {
+            this.portfolio.recordExecutionEvent('gabagool_dust_exit_allowed', {
+              ...order,
+              marketSlug: order.signal?.metadata?.marketSlug,
+              outcome: order.signal?.metadata?.outcome,
+              side: order.side,
+              price: fill.price,
+              sizeUsd: fill.fillUsd,
+              reason: order.signal?.metadata?.dust_exit_requested_below_min_usd === true ? 'dust_exit_batch_allowed' : 'dust_exit_allowed',
+              dustExitBatch: order.signal?.metadata?.dust_exit_requested_below_min_usd === true,
+            });
+          }
+          info(
+            `[GABAGOOL EXIT] class=${exitClassification} avgEntry=${fmtPrice(fillDetails?.avgEntryPrice)} ` +
+            `sellPrice=${fmtPrice(fill.price)} realizedPnl=${fmtMoney(fillDetails?.realizedPnl)} ` +
+            `qtyBefore=${fmtCount(fillDetails?.positionQtyBefore, 4)} qtyAfter=${fmtCount(fillDetails?.positionQtyAfter, 4)} ` +
+            `token=${shortId(order.tokenId)} fillSource=${fill.fillSource} trustedPnl=${fillDetails?.trustedPnl === true ? 'true' : 'false'}`
+          );
+          this.portfolio.recordExecutionEvent('gabagool_exit', {
+            ...fillEventBase,
+            reason: exitClassification,
+            avgEntryPrice: fillDetails?.avgEntryPrice,
+            realizedPnl: fillDetails?.realizedPnl,
+            positionQtyBefore: fillDetails?.positionQtyBefore,
+            positionQtyAfter: fillDetails?.positionQtyAfter,
+          });
+          const remainingQty = this.portfolio.position(order.tokenId);
+          const remainingValueUsd = Number.isFinite(Number(book?.bestBid)) ? remainingQty * Number(book.bestBid) : 0;
+          if (remainingQty > 0 && remainingValueUsd > 0 && remainingValueUsd < this.config.minOrderUsd) {
+            this.portfolio.recordExecutionEvent('gabagool_dust_position_remaining', {
+              ...order,
+              marketSlug: order.signal?.metadata?.marketSlug,
+              outcome: order.signal?.metadata?.outcome,
+              side: order.side,
+              price: book.bestBid,
+              sizeUsd: remainingValueUsd,
+              reason: 'dust_position_remaining',
+              source: 'post_exit_fill_remaining_inventory',
+              positionQty: remainingQty,
+              availableSellQty: remainingQty,
+              currentValueUsd: remainingValueUsd,
+              roundedExitSizeUsd: Math.round(remainingValueUsd * 100) / 100,
+            });
+            warn(
+              `[GABAGOOL DUST POSITION REMAINING] token=${shortId(order.tokenId)} ` +
+              `positionQty=${fmtCount(remainingQty, 6)} currentValueUsd=${fmtMoney(remainingValueUsd)} ` +
+              `dust_position_remaining=true`
+            );
+          }
         }
       }
 
       order.filledUsd += fill.fillUsd;
 
-      info(`[FILL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(fill.price)} usd=$${fill.fillUsd.toFixed(2)} [${order.strategy}]`);
+      info(
+        `[FILL] ${order.side.toUpperCase()} ${shortId(order.tokenId)} @ ${fmtPrice(fill.price)} ` +
+        `usd=$${fill.fillUsd.toFixed(2)} fillSource=${fill.fillSource} fillDelayMs=${Math.round(fill.fillDelayMs || 0)} ` +
+        `trustedPnl=${fillDetails?.trustedPnl === true ? 'true' : 'false'} [${order.strategy}]`
+      );
+      if (isStandardPaperStrategy(order.strategy)) {
+        info(
+          `[STANDARD FILL] strategy=${order.strategy} side=${order.side.toUpperCase()} token=${shortId(order.tokenId)} ` +
+          `price=${fmtPrice(fill.price)} filledUsd=${cleanLogValue(fill.fillUsd)} fillSource=${fill.fillSource} ` +
+          `trustedPnl=${fillDetails?.trustedPnl === true ? 'true' : 'false'}`
+        );
+      }
+      if (
+        String(order.side || '').toLowerCase() === 'sell' &&
+        (order.signal?.metadata?.dust_exit_allowed === true || order.signal?.metadata?.dust_exit_batch === true)
+      ) {
+        info(
+          `[DUST EXIT] token=${shortId(order.tokenId)} qty=${fmtCount(fillSize, 6)} ` +
+          `valueUsd=${fmtMoney(fill.fillUsd)} bid=${fmtPrice(fill.price)} action=filled`
+        );
+      }
+      this.bot?.updateStandardChurnCooldownOnFill?.({
+        order,
+        fillDetails,
+        fillPrice: fill.price,
+        now,
+        book,
+      });
 
-      if (this.paperUpdates && isGabagoolStrategy(order.strategy)) {
-        this.paperUpdates.record('fill', {
-          strategy: order.strategy,
-          marketSlug: order.signal?.metadata?.marketSlug,
-          marketQuestion: order.signal?.metadata?.marketQuestion,
-          tokenId: order.tokenId,
-          outcome: order.signal?.metadata?.outcome,
-          side: order.side,
-          price: fill.price,
-          sizeUsd: fill.fillUsd,
-          expectedEdge: order.signal?.expectedEdge,
-          confidence: order.signal?.confidence,
-          sophieDecision: order.signal?.metadata?.sophieExecution?.qualityDecision || 'ADMIT',
-          riskDecision: 'ADMIT',
-          oracleEventKey: order.signal?.metadata?.gabagool?.oracleEventKey || null,
-        });
+      if (this.paperUpdates && isGabagoolStrategy(order)) {
         if (order.side === 'sell') {
-          this.paperUpdates.record('exit', {
+          const remainingQty = Number(fillDetails?.positionQtyAfter || 0);
+          const remainingValueUsd = Number.isFinite(Number(book?.bestBid)) ? remainingQty * Number(book.bestBid) : 0;
+          const tradeCompleted = remainingQty <= 1e-9 || (remainingValueUsd > 0 && remainingValueUsd < this.config.minOrderUsd);
+          if (tradeCompleted) {
+            this.paperUpdates.record('trade_summary', {
+              strategy: order.strategy,
+              marketSlug: order.signal?.metadata?.marketSlug,
+              marketQuestion: order.signal?.metadata?.marketQuestion,
+              tokenId: order.tokenId,
+              outcome: order.signal?.metadata?.outcome,
+              side: order.side,
+              price: fill.price,
+              sizeUsd: fill.fillUsd,
+              expectedEdge: order.signal?.expectedEdge,
+              confidence: order.signal?.confidence,
+              avgEntryPrice: fillDetails?.avgEntryPrice,
+              realizedPnl: fillDetails?.realizedPnl,
+              exitClassification,
+              fillSource: fill.fillSource,
+              fillDelayMs: fill.fillDelayMs,
+              bookAgeMs: fill.bookAgeMs,
+              bestBidAtPlacement: fill.bestBidAtPlacement,
+              bestAskAtPlacement: fill.bestAskAtPlacement,
+              bestBidAtFill: fill.bestBidAtFill,
+              bestAskAtFill: fill.bestAskAtFill,
+              orderPrice: fill.orderPrice,
+              wasExecutableAtPlacement: fill.wasExecutableAtPlacement,
+              wasExecutableAtFill: fill.wasExecutableAtFill,
+              queueHaircutApplied: fill.queueHaircutApplied,
+              slippageApplied: fill.slippageApplied,
+              adverseSelectionBufferApplied: fill.adverseSelectionBufferApplied,
+              trustedPnl: fillDetails?.trustedPnl,
+              sophieDecision: order.signal?.metadata?.sophieExecution?.qualityDecision || 'ADMIT',
+              riskDecision: 'ADMIT',
+              oracleEventKey: order.signal?.metadata?.gabagool?.oracleEventKey || null,
+            });
+          }
+        } else {
+          this.paperUpdates.record('fill', {
             strategy: order.strategy,
             marketSlug: order.signal?.metadata?.marketSlug,
             marketQuestion: order.signal?.metadata?.marketQuestion,
@@ -4003,6 +5728,20 @@ class PaperExecutionEngine {
             sizeUsd: fill.fillUsd,
             expectedEdge: order.signal?.expectedEdge,
             confidence: order.signal?.confidence,
+            fillSource: fill.fillSource,
+            fillDelayMs: fill.fillDelayMs,
+            bookAgeMs: fill.bookAgeMs,
+            bestBidAtPlacement: fill.bestBidAtPlacement,
+            bestAskAtPlacement: fill.bestAskAtPlacement,
+            bestBidAtFill: fill.bestBidAtFill,
+            bestAskAtFill: fill.bestAskAtFill,
+            orderPrice: fill.orderPrice,
+            wasExecutableAtPlacement: fill.wasExecutableAtPlacement,
+            wasExecutableAtFill: fill.wasExecutableAtFill,
+            queueHaircutApplied: fill.queueHaircutApplied,
+            slippageApplied: fill.slippageApplied,
+            adverseSelectionBufferApplied: fill.adverseSelectionBufferApplied,
+            trustedPnl: fillDetails?.trustedPnl,
             sophieDecision: order.signal?.metadata?.sophieExecution?.qualityDecision || 'ADMIT',
             riskDecision: 'ADMIT',
             oracleEventKey: order.signal?.metadata?.gabagool?.oracleEventKey || null,
@@ -4010,7 +5749,7 @@ class PaperExecutionEngine {
         }
       }
 
-      if (order.remainingUsd() < this.config.minFillUsd) {
+      if (order.remainingUsd() < minFillUsd) {
         this.portfolio.cancelOrder(orderId);
       }
 
@@ -4020,38 +5759,113 @@ class PaperExecutionEngine {
     }
   }
 
-  computeFill(order, book) {
+  computeFill(order, book, now = Date.now()) {
     if (!isBookComplete(book)) return null;
 
     const remainingUsd = order.remainingUsd();
     if (remainingUsd <= 0) return null;
 
-    let executable = false;
-    let price = order.price;
-    let sideDepthUsd = 0;
+    const placementAudit = order?.placementAudit || order?.signal?.metadata?.paperPlacementAudit || {};
+    const bestBidAtPlacement = numericOrNull(placementAudit.bestBidAtPlacement);
+    const bestAskAtPlacement = numericOrNull(placementAudit.bestAskAtPlacement);
+    const bestBidAtFill = numericOrNull(book.bestBid);
+    const bestAskAtFill = numericOrNull(book.bestAsk);
+    const orderPrice = Number(order.price);
+    const fillDelayMs = Math.max(0, now - Number(order.createdAt || now));
+    const bookAgeMs = Number.isFinite(Number(book?.cachedAt)) ? Math.max(0, now - Number(book.cachedAt)) : null;
+    const wasExecutableAtPlacement = placementAudit.wasExecutableAtPlacement === true
+      ? true
+      : bestBidAskExecutable(order.side, orderPrice, bestBidAtPlacement, bestAskAtPlacement);
+    const wasExecutableAtFill = bestBidAskExecutable(order.side, orderPrice, bestBidAtFill, bestAskAtFill);
+    const tick = Number(book.tickSize || order.signal?.metadata?.tickSize || 0.01);
+    const touchEpsilon = Math.max(1e-9, tick / 2);
+    const oppositeDepthUsd = order.side === 'buy'
+      ? topDepthUsd(book.asks, 3)
+      : topDepthUsd(book.bids, 3);
 
-    if (order.side === 'buy') {
-      // Buy fills only if the limit crosses the ask or the market moves down into it.
-      executable = order.price >= book.bestAsk || book.bestBid <= order.price;
-      price = Math.min(order.price, book.bestAsk);
-      sideDepthUsd = topDepthUsd(book.asks, 3);
+    let fillSource = 'unknown';
+    if (wasExecutableAtPlacement) {
+      fillSource = 'crossed_bid_ask';
+    } else if (wasExecutableAtFill) {
+      const touchFill = order.side === 'buy'
+        ? Math.abs(Number(bestAskAtFill) - orderPrice) <= touchEpsilon
+        : Math.abs(Number(bestBidAtFill) - orderPrice) <= touchEpsilon;
+      const throughBuffer = order.side === 'buy'
+        ? Number(bestAskAtFill) < orderPrice - Number(this.config.adverseSelectionBuffer || 0)
+        : Number(bestBidAtFill) > orderPrice + Number(this.config.adverseSelectionBuffer || 0);
+      fillSource = throughBuffer ? 'resting_queue' : touchFill ? 'touch_fill' : 'unknown';
     }
 
-    if (order.side === 'sell') {
-      // Sell fills only if the limit crosses the bid or the market moves up into it.
-      executable = order.price <= book.bestBid || book.bestAsk >= order.price;
-      price = Math.max(order.price, book.bestBid);
-      sideDepthUsd = topDepthUsd(book.bids, 3);
+    const audit = {
+      fillSource,
+      fillDelayMs,
+      bookAgeMs,
+      bestBidAtPlacement,
+      bestAskAtPlacement,
+      bestBidAtFill,
+      bestAskAtFill,
+      orderPrice,
+      wasExecutableAtPlacement,
+      wasExecutableAtFill,
+      queueHaircutApplied: 0,
+      slippageApplied: 0,
+      adverseSelectionBufferApplied: 0,
+      fillInvalidReason: null,
+      blockReason: null,
+      canFill: false,
+    };
+
+    if (this.config.paperRealisticFills && Number.isFinite(bookAgeMs) && bookAgeMs > this.config.paperFillMaxBookAgeMs) {
+      audit.blockReason = 'stale_book';
+      audit.fillInvalidReason = 'stale_book';
+      return audit;
+    }
+    if (!wasExecutableAtFill) {
+      audit.blockReason = 'non_executable_bid_ask';
+      audit.fillInvalidReason = 'non_executable_bid_ask';
+      return audit;
+    }
+    if (!wasExecutableAtPlacement && fillDelayMs < Math.max(0, Number(this.config.paperFillMinDelayMs || 0))) {
+      audit.fillSource = 'instant_sim';
+      audit.blockReason = 'zero_delay_non_cross';
+      audit.fillInvalidReason = 'zero_delay_non_cross';
+      return audit;
+    }
+    if (this.config.paperRealisticFills && fillSource === 'unknown') {
+      audit.blockReason = 'unknown_fill_source';
+      audit.fillInvalidReason = 'unknown_fill_source';
+      return audit;
+    }
+    if (fillSource === 'touch_fill') {
+      audit.queueHaircutApplied = clamp(Number(this.config.paperQueueHaircutPct || 0) / 2, 0, 0.95);
+    } else if (fillSource === 'resting_queue') {
+      audit.queueHaircutApplied = clamp(Number(this.config.paperQueueHaircutPct || 0), 0, 0.95);
+      audit.adverseSelectionBufferApplied = Number(this.config.adverseSelectionBuffer || 0);
     }
 
-    if (!executable) return null;
-
-    const maxDepthFill = Math.max(0, sideDepthUsd * this.config.partialFillDepthFraction);
+    const queueMultiplier = 1 - clamp(Number(audit.queueHaircutApplied || 0), 0, 0.95);
+    const maxDepthFill = Math.max(0, oppositeDepthUsd * this.config.partialFillDepthFraction * queueMultiplier);
     const fillUsd = Math.min(remainingUsd, maxDepthFill);
+    if (fillUsd <= 0) {
+      audit.blockReason = 'no_fillable_depth';
+      audit.fillInvalidReason = 'no_fillable_depth';
+      return audit;
+    }
 
-    if (fillUsd <= 0) return null;
+    let price = orderPrice;
+    if (fillSource === 'crossed_bid_ask') {
+      if (String(order.side || '').toLowerCase() === 'buy') {
+        price = Math.min(orderPrice, Number(bestAskAtFill));
+        audit.slippageApplied = Math.max(0, price - orderPrice);
+      } else {
+        price = Math.max(orderPrice, Number(bestBidAtFill));
+        audit.slippageApplied = Math.max(0, orderPrice - price);
+      }
+    }
 
     return {
+      ...audit,
+      canFill: true,
       price: clamp(price, 0.01, 0.99),
       fillUsd,
     };
@@ -4120,6 +5934,7 @@ const GABAGOOL_TELEGRAM_EVENT_STATES = {
   order_placed: 'PAPER ONLY BTC GABAGOOL ORDER_PLACED',
   fill: 'PAPER ONLY BTC GABAGOOL FILL',
   exit: 'PAPER ONLY BTC GABAGOOL EXIT',
+  trade_summary: 'PAPER ONLY BTC GABAGOOL TRADE_SUMMARY',
 };
 
 class PaperTelegramUpdateRelay {
@@ -4128,6 +5943,10 @@ class PaperTelegramUpdateRelay {
     this.portfolio = portfolio;
     this.events = [];
     this.blockDedupe = new Map();
+    this.lastDigestAt = 0;
+    this.lastDigestKey = null;
+    this.lastDigestStatusKey = null;
+    this.lastDigestStatusAt = 0;
   }
 
   enabledForStrategy(strategy) {
@@ -4158,6 +5977,7 @@ class PaperTelegramUpdateRelay {
       'order_placed',
       'fill',
       'exit',
+      'trade_summary',
     ].includes(eventType);
   }
 
@@ -4168,6 +5988,7 @@ class PaperTelegramUpdateRelay {
     if (eventType === 'risk_blocked') return this.config.gabagoolTelegramNotifyRiskBlocks;
     if (eventType === 'order_placed') return this.config.gabagoolTelegramNotifyOrders;
     if (eventType === 'fill' || eventType === 'exit') return this.config.gabagoolTelegramNotifyFills;
+    if (eventType === 'trade_summary') return this.config.gabagoolTelegramNotifyFills;
     return false;
   }
 
@@ -4186,18 +6007,47 @@ class PaperTelegramUpdateRelay {
     ].join(':');
   }
 
-  isBlockDuplicate(record) {
-    const key = this.blockDedupeKey(record);
-    if (!key) return false;
-    const now = Date.now();
-    const dedupeMs = Math.max(1_000, Number(this.config.gabagoolTelegramBlockDedupeMs || 60_000));
-    for (const [existingKey, expiresAt] of this.blockDedupe.entries()) {
-      if (expiresAt <= now) this.blockDedupe.delete(existingKey);
+  blockDedupeMs(record) {
+    if (record.eventType === 'risk_blocked' && record.blockReason === 'max_total_exposure') {
+      return Math.max(1_000, Number(this.config.gabagoolTelegramRiskBlockDedupeMs || 120_000));
     }
-    const expiresAt = this.blockDedupe.get(key) || 0;
-    if (expiresAt > now) return true;
-    this.blockDedupe.set(key, now + dedupeMs);
-    return false;
+    return Math.max(1_000, Number(this.config.gabagoolTelegramBlockDedupeMs || 60_000));
+  }
+
+  consumeBlockDedupe(record) {
+    const key = this.blockDedupeKey(record);
+    if (!key) return { duplicate: false, repeatCount: 0, dedupeWindowMs: 0 };
+    const now = Date.now();
+    const dedupeMs = this.blockDedupeMs(record);
+    for (const [existingKey, entry] of this.blockDedupe.entries()) {
+      const expiresAt = Number(entry?.expiresAt || 0);
+      const lastSeenAt = Number(entry?.lastSeenAt || 0);
+      if ((expiresAt + (dedupeMs * 5)) <= now || (lastSeenAt + (dedupeMs * 5)) <= now) {
+        this.blockDedupe.delete(existingKey);
+      }
+    }
+    const entry = this.blockDedupe.get(key);
+    if (entry && Number(entry.expiresAt || 0) > now) {
+      entry.suppressedCount = Number(entry.suppressedCount || 0) + 1;
+      entry.lastSeenAt = now;
+      this.blockDedupe.set(key, entry);
+      return {
+        duplicate: true,
+        repeatCount: Number(entry.suppressedCount || 0),
+        dedupeWindowMs: dedupeMs,
+      };
+    }
+    const repeatCount = entry ? Number(entry.suppressedCount || 0) : 0;
+    this.blockDedupe.set(key, {
+      expiresAt: now + dedupeMs,
+      lastSeenAt: now,
+      suppressedCount: 0,
+    });
+    return {
+      duplicate: false,
+      repeatCount,
+      dedupeWindowMs: dedupeMs,
+    };
   }
 
   markSuppressed(record, reason) {
@@ -4227,14 +6077,93 @@ class PaperTelegramUpdateRelay {
       `paperCash=${record.paperCashUsd == null ? 'n/a' : record.paperCashUsd.toFixed(2)}`,
       `paperExposure=${record.paperExposureUsd == null ? 'n/a' : record.paperExposureUsd.toFixed(2)}`,
     ];
+    if (record.paperOpenOrderExposureUsd != null) {
+      lines.push(`paperOpenOrderExposure=${record.paperOpenOrderExposureUsd.toFixed(2)}`);
+    }
+    if (record.fillSource) lines.push(`fillSource=${record.fillSource}`);
+    if (record.fillDelayMs != null) lines.push(`fillDelayMs=${Math.round(Number(record.fillDelayMs))}`);
+    if (record.bookAgeMs != null) lines.push(`bookAgeMs=${Math.round(Number(record.bookAgeMs))}`);
+    if (record.orderPrice != null) lines.push(`orderPrice=${fmtPrice(record.orderPrice)}`);
+    if (record.bestBidAtPlacement != null || record.bestAskAtPlacement != null) {
+      lines.push(`placementBidAsk=${fmtPrice(record.bestBidAtPlacement)}/${fmtPrice(record.bestAskAtPlacement)}`);
+    }
+    if (record.bestBidAtFill != null || record.bestAskAtFill != null) {
+      lines.push(`fillBidAsk=${fmtPrice(record.bestBidAtFill)}/${fmtPrice(record.bestAskAtFill)}`);
+    }
+    if (record.wasExecutableAtPlacement != null) lines.push(`wasExecutableAtPlacement=${record.wasExecutableAtPlacement === true ? 'true' : 'false'}`);
+    if (record.wasExecutableAtFill != null) lines.push(`wasExecutableAtFill=${record.wasExecutableAtFill === true ? 'true' : 'false'}`);
+    if (record.queueHaircutApplied != null) lines.push(`queueHaircutApplied=${cleanLogValue(record.queueHaircutApplied)}`);
+    if (record.slippageApplied != null) lines.push(`slippageApplied=${cleanLogValue(record.slippageApplied)}`);
+    if (record.adverseSelectionBufferApplied != null) lines.push(`adverseSelectionBufferApplied=${cleanLogValue(record.adverseSelectionBufferApplied)}`);
+    if (record.trustedPnl != null) lines.push(`trustedPnl=${record.trustedPnl === true ? 'true' : 'false'}`);
+    if (record.avgEntryPrice != null) lines.push(`avgEntry=${fmtPrice(record.avgEntryPrice)}`);
+    if (record.realizedPnl != null) lines.push(`realizedPnl=${fmtMoney(record.realizedPnl)}`);
+    if (record.exitClassification) lines.push(`exitClassification=${record.exitClassification}`);
     if (record.blockReason) lines.push(`blocked=${record.blockReason}`);
+    if (record.fillInvalidReason) lines.push(`fillInvalidReason=${record.fillInvalidReason}`);
+    if (record.blockRepeatCount > 0) {
+      lines.push(`repeatCount=${record.blockRepeatCount}`);
+      lines.push(`repeatWindowMs=${record.blockRepeatWindowMs || 0}`);
+    }
+    const exposureKeys = [
+      'riskTotalExposureUsd',
+      'portfolioPositionExposureUsd',
+      'portfolioOpenOrderExposureUsd',
+      'btcOraclePositionExposureUsd',
+      'btcOracleOpenOrderExposureUsd',
+      'nonBtcPositionExposureUsd',
+      'nonBtcOpenOrderExposureUsd',
+      'strategyBucketExposureRawUsd',
+      'strategyBucketExposureExclusionUsd',
+      'strategyBucketExposureUsd',
+      'strategyBucketWouldExposureUsd',
+      'maxTotalExposureUsd',
+      'exposureAvailableUsd',
+      'candidateSizeUsd',
+      'wouldTotalExposureUsd',
+    ];
+    for (const key of exposureKeys) {
+      if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+      const value = record[key];
+      if (value == null || !Number.isFinite(Number(value))) continue;
+      lines.push(`${key}=${value == null || !Number.isFinite(Number(value)) ? 'n/a' : Number(value).toFixed(2)}`);
+    }
     return lines.join('\n');
   }
 
-  sendToTelegram(message) {
-    if (!this.config.telegramBotToken || !this.config.telegramChatId) return;
+  logDigestStatus(sent, reason, extra = {}) {
+    const now = Date.now();
+    const key = [
+      sent === true ? 'true' : 'false',
+      reason || 'unknown',
+      extra.windowMin || 'na',
+      extra.btcOrders || 'na',
+      extra.standardOrders || 'na',
+      extra.dustSuppressed || 'na',
+    ].join(':');
+    if (this.lastDigestStatusKey === key && now - this.lastDigestStatusAt < 60_000) return;
+    this.lastDigestStatusKey = key;
+    this.lastDigestStatusAt = now;
+    const fields = [
+      `[TELEGRAM DIGEST] sent=${sent === true ? 'true' : 'false'}`,
+      `reason=${reason || 'unknown'}`,
+    ];
+    for (const [name, value] of Object.entries(extra)) {
+      if (value == null) continue;
+      fields.push(`${name}=${cleanLogValue(value)}`);
+    }
+    info(fields.join(' '));
+  }
+
+  sendToTelegram(message, options = {}) {
+    if (!this.config.telegramBotToken || !this.config.telegramChatId) {
+      if (options.logDigest === true) {
+        this.logDigestStatus(false, 'missing_telegram_config', options.metrics || {});
+      }
+      return Promise.resolve(false);
+    }
     const url = `https://api.telegram.org/bot${this.config.telegramBotToken}/sendMessage`;
-    fetch(url, {
+    return fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -4242,9 +6171,118 @@ class PaperTelegramUpdateRelay {
         text: message,
         disable_web_page_preview: true,
       }),
+    }).then(() => {
+      if (options.logDigest === true) {
+        this.logDigestStatus(true, 'sent', options.metrics || {});
+      }
+      return true;
     }).catch((error) => {
       warn(`[GABAGOOL TELEGRAM] send failed: ${error.message}`);
+      if (options.logDigest === true) {
+        this.logDigestStatus(false, 'send_failed', {
+          ...(options.metrics || {}),
+          error: error.message,
+        });
+      }
+      return false;
     });
+  }
+
+  buildDigest(now = Date.now()) {
+    const windowMs = Math.max(60_000, Number(this.config.paperTelegramDigestEveryMs || 300_000));
+    const since = now - windowMs;
+    const recentEvents = this.portfolio.executionEvents.filter((event) => Number(event.ts) >= since);
+    const countType = (type, matcher = null) => recentEvents.filter((event) => (
+      event.type === type && (typeof matcher === 'function' ? matcher(event) : true)
+    )).length;
+    const recentOrders = recentEvents.filter((event) => event.type === 'order_placed');
+    const strategyCounts = new Map();
+    for (const event of recentOrders) {
+      const strategy = event.strategy || 'UNKNOWN';
+      strategyCounts.set(strategy, (strategyCounts.get(strategy) || 0) + 1);
+    }
+    const strategyMix = [...strategyCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([strategy, count]) => `${strategy}:${count}`)
+      .join(', ') || 'none';
+    const markPrices = this.portfolio.markPricesSnapshot();
+    const dust = this.portfolio.dustSummary(markPrices);
+    const health = this.portfolio.executionHealth(now);
+    const btcLedger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
+    const standardLedger = this.portfolio.strategyLedger((strategy) => !isBtcOracleStrategy(strategy), markPrices, now);
+    const totalPnl = Number(this.portfolio.equity(markPrices) - this.portfolio.startingCash);
+    const openPnl = totalPnl - Number(this.portfolio.closedPnl || 0);
+    const btcOrders = countType('order_placed', (event) => isBtcOracleStrategy(event.strategy));
+    const standardOrders = countType('order_placed', (event) => !isBtcOracleStrategy(event.strategy));
+    const dustSuppressed = countType('dust_exit_blocked');
+    const telegramSuppressed = countType('gabagool_telegram_suppressed');
+    const key = [
+      Math.round(since / 1000),
+      btcOrders,
+      standardOrders,
+      recentOrders.length,
+      dustSuppressed,
+      telegramSuppressed,
+      dust.count,
+      roundMoney(dust.valueUsd),
+      roundMoney(this.portfolio.closedPnl),
+      roundMoney(totalPnl),
+      strategyMix,
+    ].join('|');
+    const lines = [
+      'PAPER ONLY MIXED MODE DIGEST',
+      `windowMin=${Math.round(windowMs / 60_000)}`,
+      `btcOrders=${btcOrders} standardOrders=${standardOrders} totalOrders=${recentOrders.length}`,
+      `btcExposure=${fmtMoney(btcLedger.totalExposureUsd)} standardExposure=${fmtMoney(standardLedger.totalExposureUsd)}`,
+      `pnlClosed=${fmtMoney(this.portfolio.closedPnl)} pnlOpen=${fmtMoney(openPnl)} pnlNet=${fmtMoney(totalPnl)}`,
+      `dustCount=${dust.count} dustValue=${fmtMoney(dust.valueUsd)} suppressed=${dustSuppressed} telegramSuppressed=${telegramSuppressed}`,
+      `probationAdmissions=${health.probationAdmissionsLastHour || 0} probationBlocks=${health.probationBlocksLastHour || 0}`,
+      `topBlockReasons=${health.topBlockReasonsLastHour || 'none'}`,
+      recentOrders.length === 0 ? `whyTotalOrdersZero=${health.whyTotalOrdersZeroLastHour || 'none'}` : null,
+      `strategyMix=${strategyMix}`,
+    ].filter(Boolean);
+    return {
+      key,
+      message: lines.join('\n'),
+      metrics: {
+        windowMin: Math.round(windowMs / 60_000),
+        btcOrders,
+        standardOrders,
+        totalOrders: recentOrders.length,
+        dustCount: dust.count,
+        dustSuppressed,
+        telegramSuppressed,
+      },
+    };
+  }
+
+  maybeSendDigest(now = Date.now()) {
+    if (!this.config.gabagoolTelegramUpdates) {
+      this.logDigestStatus(false, 'telegram_updates_disabled');
+      return false;
+    }
+    if (!this.config.paperTelegramDigestEnabled) {
+      this.logDigestStatus(false, 'digest_disabled');
+      return false;
+    }
+    const intervalMs = Math.max(60_000, Number(this.config.paperTelegramDigestEveryMs || 300_000));
+    if (now - this.lastDigestAt < intervalMs) return false;
+    const digest = this.buildDigest(now);
+    this.lastDigestAt = now;
+    if (!digest?.message) {
+      this.logDigestStatus(false, 'empty_digest');
+      return false;
+    }
+    if (digest.key === this.lastDigestKey) {
+      this.logDigestStatus(false, 'duplicate_digest', digest.metrics || {});
+      return false;
+    }
+    this.lastDigestKey = digest.key;
+    this.sendToTelegram(digest.message, {
+      logDigest: true,
+      metrics: digest.metrics || {},
+    });
+    return true;
   }
 
   record(eventType, payload = {}) {
@@ -4263,6 +6301,24 @@ class PaperTelegramUpdateRelay {
       sizeUsd: payload.sizeUsd != null && Number.isFinite(Number(payload.sizeUsd)) ? Number(payload.sizeUsd) : null,
       expectedEdge: payload.expectedEdge != null && Number.isFinite(Number(payload.expectedEdge)) ? Number(payload.expectedEdge) : null,
       confidence: payload.confidence != null && Number.isFinite(Number(payload.confidence)) ? Number(payload.confidence) : null,
+      fillSource: payload.fillSource == null ? null : normalizePaperFillSource(payload.fillSource),
+      fillDelayMs: numericOrNull(payload.fillDelayMs),
+      bookAgeMs: numericOrNull(payload.bookAgeMs),
+      bestBidAtPlacement: numericOrNull(payload.bestBidAtPlacement),
+      bestAskAtPlacement: numericOrNull(payload.bestAskAtPlacement),
+      bestBidAtFill: numericOrNull(payload.bestBidAtFill),
+      bestAskAtFill: numericOrNull(payload.bestAskAtFill),
+      orderPrice: numericOrNull(payload.orderPrice),
+      wasExecutableAtPlacement: payload.wasExecutableAtPlacement === true ? true : payload.wasExecutableAtPlacement === false ? false : null,
+      wasExecutableAtFill: payload.wasExecutableAtFill === true ? true : payload.wasExecutableAtFill === false ? false : null,
+      queueHaircutApplied: numericOrNull(payload.queueHaircutApplied),
+      slippageApplied: numericOrNull(payload.slippageApplied),
+      adverseSelectionBufferApplied: numericOrNull(payload.adverseSelectionBufferApplied),
+      trustedPnl: payload.trustedPnl === true ? true : payload.trustedPnl === false ? false : null,
+      fillInvalidReason: payload.fillInvalidReason ? String(payload.fillInvalidReason) : null,
+      avgEntryPrice: payload.avgEntryPrice != null && Number.isFinite(Number(payload.avgEntryPrice)) ? Number(payload.avgEntryPrice) : null,
+      realizedPnl: payload.realizedPnl != null && Number.isFinite(Number(payload.realizedPnl)) ? Number(payload.realizedPnl) : null,
+      exitClassification: payload.exitClassification ? String(payload.exitClassification) : null,
       sophieDecision: payload.sophieDecision || 'NOT_RUN',
       riskDecision: payload.riskDecision || 'NOT_RUN',
       blockReason: payload.blockReason || null,
@@ -4272,15 +6328,36 @@ class PaperTelegramUpdateRelay {
       paperCashUsd: account.cashUsd,
       paperExposureUsd: account.exposureUsd,
       paperOpenOrderExposureUsd: account.openOrderExposureUsd,
+      riskTotalExposureUsd: numericOrNull(payload.riskTotalExposureUsd),
+      portfolioPositionExposureUsd: numericOrNull(payload.portfolioPositionExposureUsd),
+      portfolioOpenOrderExposureUsd: numericOrNull(payload.portfolioOpenOrderExposureUsd),
+      btcOraclePositionExposureUsd: numericOrNull(payload.btcOraclePositionExposureUsd),
+      btcOracleOpenOrderExposureUsd: numericOrNull(payload.btcOracleOpenOrderExposureUsd),
+      nonBtcPositionExposureUsd: numericOrNull(payload.nonBtcPositionExposureUsd),
+      nonBtcOpenOrderExposureUsd: numericOrNull(payload.nonBtcOpenOrderExposureUsd),
+      strategyBucketExposureRawUsd: numericOrNull(payload.strategyBucketExposureRawUsd),
+      strategyBucketExposureExclusionUsd: numericOrNull(payload.strategyBucketExposureExclusionUsd),
+      strategyBucketExposureUsd: numericOrNull(payload.strategyBucketExposureUsd),
+      strategyBucketWouldExposureUsd: numericOrNull(payload.strategyBucketWouldExposureUsd),
+      maxTotalExposureUsd: numericOrNull(payload.maxTotalExposureUsd),
+      exposureAvailableUsd: numericOrNull(payload.exposureAvailableUsd),
+      candidateSizeUsd: numericOrNull(payload.candidateSizeUsd),
+      wouldTotalExposureUsd: numericOrNull(payload.wouldTotalExposureUsd),
+      riskExposureReduceAllowed: payload.risk_exposure_reduce_allowed === true,
+      blockRepeatCount: 0,
+      blockRepeatWindowMs: 0,
     };
     if (!this.shouldRecordEvent(eventType)) {
       this.markSuppressed(record, 'record_disabled');
       return null;
     }
-    if (this.isBlockDuplicate(record)) {
+    const dedupeState = this.consumeBlockDedupe(record);
+    if (dedupeState.duplicate) {
       this.markSuppressed(record, 'dedupe_window');
       return null;
     }
+    record.blockRepeatCount = dedupeState.repeatCount;
+    record.blockRepeatWindowMs = dedupeState.dedupeWindowMs;
     const shouldNotify = this.shouldNotifyEvent(eventType);
     if (!shouldNotify) {
       record.suppressionReason = 'notify_disabled';
@@ -4316,6 +6393,7 @@ class BotEngine {
     this.whaleTracker = config.enableWhaleTracking ? new AsyncWhaleWatcher(config) : null;
     this.paperUpdates = new PaperTelegramUpdateRelay(config, this.portfolio);
     this.execution.paperUpdates = this.paperUpdates;
+    this.execution.bot = this;
 
     this.research = new ResearchEngine(this.poly, this.cache, config);
     this.assets = [];
@@ -4343,7 +6421,12 @@ class BotEngine {
     this.sophieLowQualitySummary = { windowStartedAt: Date.now(), blocked: 0, qualities: [], tokenIds: new Set() };
     this.sophieRepeatCandidateCooldownUntil = new Map();
     this.sophieRepeatCandidateLogs = new Map();
+    this.paperProbationTraceLastLogged = new Map();
     this.assetBookSkipLastLogged = new Map();
+    this.standardQualifiedCandidateKeysThisScan = new Set();
+    this.lastMixedModePaceLog = { key: null, ts: 0 };
+    this.standardChurnCooldowns = new Map();
+    this.standardChurnLastLogged = new Map();
     this.gabagoolBehaviorModel = null;
     this.gabagoolOracleEventSeen = new Map();
     this.gabagoolPresophieBlockLogged = new Map();
@@ -4352,7 +6435,34 @@ class BotEngine {
     this.lastGabagoolBooks = { up: null, down: null };
     this.lastGabagoolBlockedReason = null;
     this.lastGabagoolConfirmCheck = null;
+    this.lastGabagoolSophieBlockReason = null;
+    this.lastGabagoolRiskBlockReason = null;
+    this.lastGabagoolPlacementBlockReason = null;
+    this.lastGabagoolPlacementDecision = null;
     this.gabagoolOracleSignalHistory = [];
+    this.gabagoolExitSizingLogged = new Map();
+    this.gabagoolTokenEntryGuards = new Map();
+    this.gabagoolMarketLockouts = new Map();
+    this.lastGabagoolMarketLockoutReason = null;
+    this.gabagoolBlockedLossExitDedupe = new Map();
+    this.currentGabagoolCycle = {
+      ts: Date.now(),
+      startedAt: new Date().toISOString(),
+      decision: null,
+      idleReason: null,
+      positionsScanned: 0,
+      positionsClosable: 0,
+      exitsAttempted: 0,
+      exitsPlaced: 0,
+      exitBlockedReason: null,
+      dominantExitBlockedReason: null,
+      blockedReasonSummary: 'none',
+      noExitReason: null,
+      exitMode: null,
+      exposureCapWaitingForExit: false,
+      exitUnfreezeReason: null,
+      largestExposurePositions: [],
+    };
     this.lastBtcOracleReportAt = 0;
     this.lastBtcOracleReportTelegramAt = 0;
     this.lastBtcOracleReportKey = null;
@@ -4369,13 +6479,31 @@ class BotEngine {
     ];
   }
 
+  syncPortfolioMarks(markPrices = this.cache.markPrices()) {
+    this.portfolio.setMarkPrices(markPrices);
+    return markPrices;
+  }
+
   async start() {
     banner();
     info('Starting Polymarket MoneyMaker V3 (Paper)...');
+    const sourceMtime = (() => {
+      try {
+        return fs.statSync(__filename).mtime.toISOString();
+      } catch {
+        return 'unknown';
+      }
+    })();
+    info(
+      `[PATCH STAMP] staleExposureV2=true gabagoolPrefetchUsesGetGabagoolBook=true ` +
+      `paperProbationV2=true sourceMtime=${sourceMtime} ` +
+      `liveTrading=${this.config.enableLiveTrading === true ? 'true' : 'false'}`
+    );
     info(
       `[CONFIDENCE CONFIG] profile=${this.risk.paperConfidenceProfile()} ` +
       `minConfidence=${this.config.minConfidence} ` +
-      `spreadHunterPaperMin=${this.config.spreadHunterMinConfidencePaper}`
+      `spreadHunterPaperMin=${this.config.spreadHunterMinConfidencePaper} ` +
+      `standardPaperMin=${this.config.standardPaperMinConfidence}`
     );
 
     if (this.config.enableGabagoolBtcImitation) {
@@ -4519,6 +6647,7 @@ class BotEngine {
   }
 
   recordBtcOracleExposureSample(markPrices = this.cache.markPrices(), now = Date.now()) {
+    this.syncPortfolioMarks(markPrices);
     const ledger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
     this.btcOracleExposureSamples.push({
       ts: now,
@@ -4614,6 +6743,786 @@ class BotEngine {
     };
   }
 
+  gabagoolLossGuardExitMode() {
+    const mode = String(this.config.gabagoolLossGuardExitMode || 'reduce_only').trim().toLowerCase();
+    return mode === 'reduce_only' ? mode : 'reduce_only';
+  }
+
+  resetGabagoolCurrentCycle(now = Date.now()) {
+    this.currentGabagoolCycle = {
+      ts: now,
+      startedAt: new Date(now).toISOString(),
+      decision: null,
+      idleReason: null,
+      positionsScanned: 0,
+      positionsClosable: 0,
+      exitsAttempted: 0,
+      exitsPlaced: 0,
+      exitBlockedReason: null,
+      dominantExitBlockedReason: null,
+      blockedReasonSummary: 'none',
+      noExitReason: null,
+      exitMode: this.gabagoolLossGuardExitMode(),
+      exposureCapWaitingForExit: false,
+      exitUnfreezeReason: null,
+      largestExposurePositions: [],
+    };
+    return this.currentGabagoolCycle;
+  }
+
+  updateGabagoolCurrentCycle(fields = {}) {
+    this.currentGabagoolCycle = {
+      ...(this.currentGabagoolCycle || this.resetGabagoolCurrentCycle()),
+      ...fields,
+    };
+    return this.currentGabagoolCycle;
+  }
+
+  gabagoolPositionContext(tokenId, marketId = '') {
+    const key = String(tokenId || '');
+    const fallbackTarget = this.lastGabagoolOracleTarget || null;
+    let resolvedMarketId = String(marketId || this.portfolio.positionMarketId(key) || '');
+    let marketSlug = '';
+    let marketQuestion = '';
+    let outcome = null;
+    let marketSlugSource = '';
+    let outcomeSource = '';
+    let lastEvidenceTs = 0;
+    for (let i = this.portfolio.executionEvents.length - 1; i >= 0; i -= 1) {
+      const event = this.portfolio.executionEvents[i];
+      if (!isBtcOracleStrategy(event?.strategy)) continue;
+      if (String(event?.tokenId || '') !== key) continue;
+      if (!resolvedMarketId && String(event?.marketId || '')) resolvedMarketId = String(event.marketId);
+      if (!marketSlug && String(event?.marketSlug || '')) {
+        marketSlug = String(event.marketSlug);
+        marketSlugSource = 'execution_event';
+      }
+      if (!outcome && String(event?.outcome || '')) {
+        outcome = String(event.outcome);
+        outcomeSource = 'execution_event';
+      }
+      lastEvidenceTs = Math.max(lastEvidenceTs, Number(event?.ts || 0));
+      break;
+    }
+    for (let i = this.portfolio.fills.length - 1; i >= 0 && (!marketSlug || !outcome); i -= 1) {
+      const fill = this.portfolio.fills[i];
+      if (String(fill?.tokenId || '') !== key) continue;
+      if (!resolvedMarketId && String(fill?.marketId || '')) resolvedMarketId = String(fill.marketId);
+      if (!marketSlug && String(fill?.marketSlug || '')) {
+        marketSlug = String(fill.marketSlug);
+        marketSlugSource = 'fill';
+      }
+      if (!outcome && String(fill?.outcome || '')) {
+        outcome = String(fill.outcome);
+        outcomeSource = 'fill';
+      }
+      lastEvidenceTs = Math.max(lastEvidenceTs, Number(fill?.ts || 0));
+    }
+    if (fallbackTarget) {
+      if (!marketSlug && String(fallbackTarget.slug || '')) {
+        marketSlug = String(fallbackTarget.slug);
+        marketSlugSource = 'fallback_target';
+      }
+      if (!marketQuestion && String(fallbackTarget.question || '')) marketQuestion = String(fallbackTarget.question);
+      const upToken = String(fallbackTarget.BTC_UP_TOKEN_ID || '');
+      const downToken = String(fallbackTarget.BTC_DOWN_TOKEN_ID || '');
+      if (!outcome && key && key === upToken) {
+        outcome = 'Up';
+        outcomeSource = 'fallback_target';
+      }
+      if (!outcome && key && key === downToken) {
+        outcome = 'Down';
+        outcomeSource = 'fallback_target';
+      }
+    }
+    if (!marketSlug) {
+      marketSlug = resolvedMarketId || key;
+      marketSlugSource = resolvedMarketId ? 'position_market_id' : 'token_fallback';
+    }
+    return {
+      tokenId: key,
+      marketId: resolvedMarketId || marketSlug || key,
+      marketSlug,
+      marketQuestion: marketQuestion || marketSlug || 'Gabagool BTC market',
+      outcome: outcome || 'Unknown',
+      marketSlugSource: marketSlugSource || 'unknown',
+      outcomeSource: outcomeSource || 'unknown',
+      directMarketEvidence: marketSlugSource === 'execution_event' || marketSlugSource === 'fill',
+      directOutcomeEvidence: outcomeSource === 'execution_event' || outcomeSource === 'fill',
+      lastEvidenceTs,
+    };
+  }
+
+  buildGabagoolSyntheticAssetFromContext(context = {}) {
+    const tokenId = String(context.tokenId || '');
+    if (!tokenId) return null;
+    const marketId = String(context.marketId || context.marketSlug || tokenId);
+    const marketSlug = String(context.marketSlug || marketId || tokenId);
+    const marketQuestion = String(context.marketQuestion || marketSlug || 'Gabagool BTC market');
+    return {
+      tokenId,
+      outcome: String(context.outcome || 'Unknown'),
+      market: {
+        marketId,
+        question: marketQuestion,
+        marketSlug,
+        eventSlug: marketSlug,
+        volume24h: 10_000,
+        liquidity: 10_000,
+        endDate: new Date(Date.now() + 5 * 60_000).toISOString(),
+      },
+    };
+  }
+
+  gabagoolMarketStartSec(marketSlug = '') {
+    const match = String(marketSlug || '').match(/btc-updown-5m-(\d+)/i);
+    if (!match) return null;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  gabagoolMarketWindowState(marketSlug = '', now = Date.now()) {
+    const startSec = this.gabagoolMarketStartSec(marketSlug);
+    const secondsIntoWindow = Number.isFinite(startSec)
+      ? Math.max(0, Math.floor(now / 1000) - startSec)
+      : null;
+    return {
+      startSec,
+      secondsIntoWindow,
+      staleMarket: Number.isFinite(secondsIntoWindow) && secondsIntoWindow >= 300,
+    };
+  }
+
+  gabagoolExposureCleanupState(context = {}, now = Date.now()) {
+    const windowState = this.gabagoolMarketWindowState(context.marketSlug, now);
+    const lastEvidenceTs = Number(context.lastEvidenceTs || 0);
+    const lastEvidenceAgeMs = lastEvidenceTs > 0 ? Math.max(0, now - lastEvidenceTs) : null;
+    const staleEvidence = Number.isFinite(lastEvidenceAgeMs) && lastEvidenceAgeMs >= 10 * 60_000;
+    return {
+      ...windowState,
+      lastEvidenceAgeMs,
+      staleEvidence,
+      staleOrExpired: windowState.staleMarket || staleEvidence,
+    };
+  }
+
+  gabagoolProfitBufferBypassAllowed(signal = null) {
+    return (
+      this.gabagoolExplicitLossExitAllowed(signal) ||
+      signal?.metadata?.exitMode === 'exposure_cap_reduce_only' ||
+      signal?.metadata?.gabagool?.exitMode === 'exposure_cap_reduce_only' ||
+      signal?.metadata?.gabagool?.exitTrigger === 'exposure_cap_reduce_only'
+    );
+  }
+
+  async getGabagoolBook(tokenId, books = new Map()) {
+    const key = String(tokenId || '');
+    if (!key) return null;
+    if (books.has(key)) return books.get(key);
+    if (!(this.portfolio.paperTokenTradeability instanceof Map)) {
+      this.portfolio.paperTokenTradeability = new Map();
+    }
+    if (!(this.gabagoolBookFetchLastLogged instanceof Map)) {
+      this.gabagoolBookFetchLastLogged = new Map();
+    }
+    try {
+      const book = await this.cache.getFreshBook(key, 0);
+      this.cache.setBook(key, book);
+      books.set(key, book);
+      this.portfolio.setMarkPrice(key, book?.midpoint);
+      this.portfolio.paperTokenTradeability.set(key, {
+        status: Number.isFinite(Number(book?.bestBid)) && Number(book.bestBid) > 0
+          ? 'tradable'
+          : 'no_bid',
+        tokenId: key,
+        ts: Date.now(),
+        bestBid: Number.isFinite(Number(book?.bestBid)) ? Number(book.bestBid) : null,
+        midpoint: Number.isFinite(Number(book?.midpoint)) ? Number(book.midpoint) : null,
+      });
+      if (Number.isFinite(Number(book?.midpoint))) {
+        this.volGuard.update(key, Number(book.midpoint));
+        this.consensus.recordMid(key, Number(book.midpoint));
+      }
+      return book;
+    } catch (error) {
+      const status = String(error?.mmBookFetchStatus || '');
+      const cooldownMsRemaining = Math.max(0, Number(error?.mmCooldownMsRemaining || 0));
+      if (status === 'no_orderbook_404' || status === 'stale_token_cooldown') {
+        this.portfolio.paperTokenTradeability.set(key, {
+          status,
+          tokenId: key,
+          ts: Date.now(),
+          expiresAt: cooldownMsRemaining > 0 ? Date.now() + cooldownMsRemaining : null,
+          cooldownMsRemaining,
+          source: status === 'no_orderbook_404' ? 'confirmed_404' : 'negative_cache',
+          message: String(error?.message || ''),
+        });
+        const logKey = `${key}:${status}`;
+        const lastLoggedAt = this.gabagoolBookFetchLastLogged.get(logKey) || 0;
+        const logCooldownMs = status === 'no_orderbook_404' ? 60_000 : 300_000;
+        if (Date.now() - lastLoggedAt >= logCooldownMs) {
+          this.gabagoolBookFetchLastLogged.set(logKey, Date.now());
+          warn(
+            `[GABAGOOL BOOK FETCH FAILED] token=${shortId(key)} reason=${status} ` +
+            `cooldownSec=${Math.round(cooldownMsRemaining / 1000)} error=${error.message}`
+          );
+        }
+        return null;
+      }
+      warn(`[GABAGOOL BOOK FETCH FAILED] token=${shortId(key)} error=${error.message}`);
+      return null;
+    }
+  }
+
+  dominantGabagoolLossGuardReason(reasonCounts = new Map()) {
+    const ranked = [...reasonCounts.entries()]
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        return a[0].localeCompare(b[0]);
+      });
+    return ranked[0]?.[0] || null;
+  }
+
+  shouldLogPaperProbationTrace(signal, stage = 'unknown', cooldownMs = 30_000) {
+    const key = [
+      stage,
+      signal?.tokenId || 'unknown',
+      String(signal?.side || '').toLowerCase() || 'unknown',
+      resolveStrategyName(signal) || 'unknown',
+    ].join(':');
+    const now = Date.now();
+    const last = this.paperProbationTraceLastLogged.get(key) || 0;
+    if (now - last < cooldownMs) return false;
+    this.paperProbationTraceLastLogged.set(key, now);
+    return true;
+  }
+
+  logPaperProbationTrace(signal, details = {}, stage = 'unknown') {
+    if (!signal) return;
+    if (this.config.enableLiveTrading === true) return;
+    if (resolveStrategyName(signal) !== 'SpreadHunter') return;
+    if (String(signal?.side || '').toLowerCase() !== 'buy') return;
+    if (this.portfolio.openOrders.size !== 0) return;
+    const health = this.portfolio.executionHealth(Date.now());
+    if (Number(health.paperOrdersPlacedLastHour || 0) !== 0) return;
+    const minEdge = minSignalEdgeForCandidate(signal, this.config);
+    if (Number(signal?.expectedEdge || 0) < minEdge) return;
+    const paperProbation = signal?.metadata?.paperProbation || null;
+    const traceFloor = Number(
+      paperProbation?.minConfidence ??
+      Math.max(
+        0.30,
+        Number(this.config.paperMakerRecoveryMinConfidence || 0.35) - 0.01
+      )
+    );
+    const confidence = Number(signal?.confidence || 0);
+    const nearProbationFloor = paperProbation?.active === true ||
+      (confidence >= Math.max(0, traceFloor - 0.05) && confidence <= Math.min(1, traceFloor + 0.05));
+    if (!nearProbationFloor) return;
+    if (!this.shouldLogPaperProbationTrace(signal, stage)) return;
+    info(
+      `[PAPER PROBATION TRACE] stage=${stage} strategy=${resolveStrategyName(signal)} token=${shortId(signal.tokenId)} ` +
+      `edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
+      `probationEligible=${details.probationEligible === true ? 'true' : 'false'} ` +
+      `probationActive=${details.probationActive === true ? 'true' : 'false'} ` +
+      `hasPaperProbationMetadata=${paperProbation?.active === true ? 'true' : 'false'} ` +
+      `repeatCooldownBypassed=${details.repeatCooldownBypassed === true ? 'true' : 'false'} ` +
+      `repeatCooldownBlocked=${details.repeatCooldownBlocked === true ? 'true' : 'false'} ` +
+      `reason=${details.reason || 'none'}`
+    );
+  }
+
+  async buildGabagoolLossGuardExitScan({ model, books = new Map(), now = Date.now() } = {}) {
+    const lossGuard = this.gabagoolLossGuardState(this.cache.markPrices(), now);
+    const exitMode = this.gabagoolLossGuardExitMode();
+    const scan = {
+      active: lossGuard.paused && exitMode === 'reduce_only',
+      reason: lossGuard.reason,
+      exitMode,
+      positionsScanned: 0,
+      positionsClosable: 0,
+      candidates: [],
+      noExitReason: null,
+      blockedReasons: new Map(),
+      lossGuard,
+    };
+    if (!scan.active) return scan;
+
+    const positions = (lossGuard.ledger?.perTokenExposure || [])
+      .filter((item) => Number(item.qty || 0) > 0);
+    if (positions.length === 0) {
+      scan.noExitReason = 'no_position_inventory';
+      this.recordGabagoolMetric('gabagool_loss_guard_exit_scan', {
+        reason: scan.noExitReason,
+        positionsScanned: 0,
+        positionsClosable: 0,
+        source: scan.noExitReason,
+        exitMode,
+      });
+      this.updateGabagoolCurrentCycle({
+        positionsScanned: 0,
+        positionsClosable: 0,
+        noExitReason: scan.noExitReason,
+        exitMode,
+      });
+      return scan;
+    }
+
+    const noteBlockedReason = (reason) => {
+      if (!reason) return;
+      scan.blockedReasons.set(reason, (scan.blockedReasons.get(reason) || 0) + 1);
+    };
+
+    for (const position of positions) {
+      scan.positionsScanned += 1;
+      const context = this.gabagoolPositionContext(position.tokenId, position.marketId);
+      const availableSellQty = this.portfolio.availablePositionQty(position.tokenId);
+      const commonDetails = {
+        tokenId: String(position.tokenId),
+        marketId: context.marketId,
+        marketSlug: context.marketSlug,
+        outcome: context.outcome,
+        positionQty: Number(position.qty || 0),
+        availableSellQty,
+      };
+      if (!(availableSellQty > 0)) {
+        noteBlockedReason('inventory_validation_failed');
+        continue;
+      }
+
+      const book = await this.getGabagoolBook(position.tokenId, books);
+      if (!book) {
+        noteBlockedReason('no_bid_available');
+        continue;
+      }
+      if (!Number.isFinite(Number(book.bestBid))) {
+        noteBlockedReason('no_bid_available');
+        continue;
+      }
+      if (!(Number(book.bestBid) > 0) || Number(book.bestBid) >= 1) {
+        noteBlockedReason('exit_price_invalid');
+        continue;
+      }
+
+      const currentValueUsd = availableSellQty * Number(book.bestBid);
+      const roundedExitSizeUsd = Math.max(0, Math.round(currentValueUsd * 100) / 100);
+      const minDustExitUsd = Math.max(0.01, Number(this.config.gabagoolMinDustExitUsd || 0.01));
+      if (!(currentValueUsd > 0) || !(roundedExitSizeUsd > 0) || roundedExitSizeUsd < minDustExitUsd) {
+        const tinyReason = 'position_value_below_dust_min';
+        this.recordGabagoolTinyExitState('gabagool_dust_position_remaining', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          book,
+          reason: 'dust_exit_below_min',
+          source: 'loss_guard_position_value_below_dust_floor',
+          currentValueUsd,
+          roundedExitSizeUsd,
+        }, {
+          skipPresophieBlock: true,
+        });
+        this.recordGabagoolMetric('gabagool_loss_guard_dust_remaining', {
+          ...commonDetails,
+          side: 'sell',
+          price: Number(book.bestBid),
+          sizeUsd: roundedExitSizeUsd,
+          currentValueUsd,
+          roundedExitSizeUsd,
+          reason: tinyReason,
+          source: 'loss_guard_position_value_below_dust_floor',
+          exitMode,
+        });
+        noteBlockedReason(tinyReason);
+        continue;
+      }
+
+      scan.positionsClosable += 1;
+      const asset = this.buildGabagoolSyntheticAssetFromContext(context);
+      const signal = new Signal({
+        strategy: 'GabagoolBtcOracleStrategy',
+        tokenId: String(position.tokenId),
+        marketId: context.marketId,
+        side: 'sell',
+        price: round(Number(book.bestBid)),
+        sizeUsd: roundedExitSizeUsd,
+        expectedEdge: round(Math.max(Number(this.config.minSignalEdge || 0), Math.abs(Number(book.bestBid) - Number(position.avgEntryPrice || 0)))),
+        confidence: round(clamp(Number(position.mark || book.midpoint || book.bestBid) >= Number(position.avgEntryPrice || 0) ? 0.68 : 0.62, 0.35, 0.95)),
+        reason: 'gabagool loss guard reduce-only exit',
+        exitPlan: 'Reduce-only inventory cleanup while loss guard is active',
+        ttlMs: 10_000,
+        maxHoldMs: 20_000,
+        metadata: {
+          marketSlug: context.marketSlug,
+          marketQuestion: context.marketQuestion,
+          outcome: context.outcome,
+          reduceOnly: true,
+          exitMode,
+          loss_guard_reduce_exit_allowed: true,
+          gabagool: {
+            oracleSignalFresh: false,
+            exitIntent: true,
+            exitTrigger: 'loss_guard_reduce_only',
+            exitMode,
+            lossGuardReduceExitAllowed: true,
+            sourceWallet: model?.source?.resolvedProxyWallet || DEFAULT_PROXY_WALLET,
+          },
+        },
+      });
+      scan.candidates.push({ signal, asset, book, context, currentValueUsd, roundedExitSizeUsd });
+      this.recordGabagoolMetric('gabagool_loss_guard_exit_candidate', {
+        ...commonDetails,
+        side: 'sell',
+        price: signal.price,
+        sizeUsd: signal.sizeUsd,
+        expectedEdge: signal.expectedEdge,
+        confidence: signal.confidence,
+        currentValueUsd,
+        roundedExitSizeUsd,
+        reason: 'loss_guard_reduce_only',
+        exitMode,
+      });
+    }
+
+    if (!scan.noExitReason && scan.positionsClosable === 0) {
+      scan.noExitReason = this.dominantGabagoolLossGuardReason(scan.blockedReasons) || 'all_exits_blocked';
+    }
+    this.recordGabagoolMetric('gabagool_loss_guard_exit_scan', {
+      reason: scan.noExitReason || 'scan_complete',
+      positionsScanned: scan.positionsScanned,
+      positionsClosable: scan.positionsClosable,
+      source: scan.noExitReason,
+      exitMode,
+    });
+    this.updateGabagoolCurrentCycle({
+      positionsScanned: scan.positionsScanned,
+      positionsClosable: scan.positionsClosable,
+      noExitReason: scan.noExitReason,
+      exitMode,
+    });
+    return scan;
+  }
+
+  async buildGabagoolExposureCapExitScan({ model, books = new Map(), now = Date.now() } = {}) {
+    const markPrices = this.cache.markPrices();
+    const ledger = this.gabagoolLedger(markPrices, now);
+    const riskExposure = this.risk.exposureBreakdown();
+    const maxTotalExposureUsd = Math.max(0, Number(this.config.maxTotalExposureUsd || 0));
+    const totalExposureUsd = Math.max(
+      Number(ledger.totalExposureUsd || 0),
+      Number(riskExposure.riskTotalExposureUsd || 0)
+    );
+    const excessExposureUsd = maxTotalExposureUsd > 0
+      ? Math.max(0, totalExposureUsd - maxTotalExposureUsd)
+      : 0;
+    const positions = (ledger.perTokenExposure || [])
+      .filter((item) => Number(item.qty || 0) > 0)
+      .sort((a, b) => Number(b.totalExposureUsd || 0) - Number(a.totalExposureUsd || 0));
+    const largestExposurePositions = positions.slice(0, 5).map((item) => ({
+      tokenId: String(item.tokenId || ''),
+      marketSlug: String(item.marketSlug || ''),
+      outcome: item.outcome || this.gabagoolPositionContext(item.tokenId, item.marketId).outcome || 'Unknown',
+      totalExposureUsd: Number(item.totalExposureUsd || 0),
+      positionExposureUsd: Number(item.positionExposureUsd || 0),
+      openOrderExposureUsd: Number(item.openOrderExposureUsd || 0),
+      avgEntryPrice: Number.isFinite(Number(item.avgEntryPrice)) ? Number(item.avgEntryPrice) : null,
+      mark: Number.isFinite(Number(item.mark)) ? Number(item.mark) : null,
+      qty: Number(item.qty || 0),
+    }));
+    const scan = {
+      active: excessExposureUsd > 1e-9 && positions.length > 0,
+      reason: excessExposureUsd > 1e-9 ? 'exposure_cap_waiting_for_exit' : null,
+      exitMode: 'exposure_cap_reduce_only',
+      positionsScanned: 0,
+      positionsClosable: 0,
+      candidates: [],
+      noExitReason: null,
+      blockedReasons: new Map(),
+      totalExposureUsd,
+      maxTotalExposureUsd,
+      excessExposureUsd,
+      largestExposurePositions,
+      unfreezeReasonLast: null,
+    };
+    if (!scan.active) return scan;
+
+    const noteBlockedReason = (reason) => {
+      if (!reason) return;
+      scan.blockedReasons.set(reason, (scan.blockedReasons.get(reason) || 0) + 1);
+    };
+    const recordExposureCapBlocked = (reason, details = {}) => {
+      noteBlockedReason(reason);
+      this.recordGabagoolMetric('gabagool_reduce_only_exit_blocked', {
+        reason,
+        exitMode: scan.exitMode,
+        ...details,
+      });
+    };
+    const minDustExitUsd = Math.max(0.01, Number(this.config.gabagoolMinDustExitUsd || 0.01));
+    const minReduceOnlyExitUsd = Math.max(0.01, Number(this.config.reduceOnlyMinExitUsd || 0.01));
+    let remainingExcessUsd = excessExposureUsd;
+
+    for (const position of positions) {
+      scan.positionsScanned += 1;
+      const context = this.gabagoolPositionContext(position.tokenId, position.marketId);
+      const asset = this.buildGabagoolSyntheticAssetFromContext(context);
+      const book = await this.getGabagoolBook(position.tokenId, books);
+      const availableSellQty = this.portfolio.availablePositionQty(position.tokenId);
+      const avgEntryPrice = Number(position.avgEntryPrice || this.portfolio.positionCostDetails(position.tokenId).avgEntryPrice || 0);
+      const commonDetails = {
+        tokenId: String(position.tokenId),
+        marketId: context.marketId,
+        marketSlug: context.marketSlug,
+        marketQuestion: context.marketQuestion,
+        outcome: context.outcome,
+        positionQty: Number(position.qty || 0),
+        availableSellQty,
+      };
+      if (!(availableSellQty > 0)) {
+        recordExposureCapBlocked('valid_but_risk_or_execution_blocked', {
+          ...commonDetails,
+          source: 'inventory_validation_failed',
+        });
+        continue;
+      }
+      const tradeability = this.portfolio.paperTokenTradeability instanceof Map
+        ? this.portfolio.paperTokenTradeability.get(String(position.tokenId || ''))
+        : null;
+      if (!book) {
+        const tradeabilityStatus = String(tradeability?.status || '');
+        const blockedReason = tradeabilityStatus === 'no_orderbook_404'
+          ? '404_no_orderbook'
+          : tradeabilityStatus === 'stale_token_cooldown'
+            ? 'stale_token_cooldown'
+            : 'no_bid';
+        recordExposureCapBlocked(blockedReason, {
+          ...commonDetails,
+          source: tradeabilityStatus || 'book_fetch_failed',
+          cooldownSec: Math.max(0, Math.round(Number(tradeability?.cooldownMsRemaining || 0) / 1000)),
+        });
+        continue;
+      }
+      if (!Number.isFinite(Number(book.bestBid)) || !(Number(book.bestBid) > 0) || Number(book.bestBid) >= 1) {
+        recordExposureCapBlocked('no_bid', {
+          ...commonDetails,
+          source: 'best_bid_missing_or_invalid',
+          price: Number.isFinite(Number(book?.bestBid)) ? Number(book.bestBid) : null,
+        });
+        continue;
+      }
+      if (!(avgEntryPrice > 0)) {
+        recordExposureCapBlocked('valid_but_risk_or_execution_blocked', {
+          ...commonDetails,
+          source: 'invalid_avg_cost',
+          price: Number(book.bestBid),
+        });
+        continue;
+      }
+
+      const cleanupState = this.gabagoolExposureCleanupState(context, now);
+      const currentValueUsd = availableSellQty * Number(book.bestBid);
+      const roundedExitSizeUsd = Math.max(0, Math.round(currentValueUsd * 100) / 100);
+      const minProfitPrice = avgEntryPrice + Math.max(0, Number(this.config.gabagoolMinProfitBuffer || 0));
+      if (!(currentValueUsd > 0) || !(roundedExitSizeUsd > 0)) {
+        this.recordGabagoolTinyExitState('gabagool_zero_size_blocked', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          book,
+          reason: 'zero_size_candidate',
+          source: !(currentValueUsd > 0) ? 'position_value_non_positive' : 'position_value_rounds_to_zero',
+          currentValueUsd,
+          roundedExitSizeUsd,
+        }, {
+          skipPresophieBlock: true,
+        });
+        recordExposureCapBlocked('dust', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          currentValueUsd,
+          roundedExitSizeUsd,
+          source: !(currentValueUsd > 0) ? 'position_value_non_positive' : 'position_value_rounds_to_zero',
+        });
+        continue;
+      }
+      if (roundedExitSizeUsd < minDustExitUsd) {
+        this.recordGabagoolTinyExitState('gabagool_dust_position_remaining', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          book,
+          reason: 'dust_exit_below_min',
+          source: cleanupState.staleOrExpired === true
+            ? 'stale_market_position_value_below_dust_floor'
+            : 'exposure_cap_position_value_below_dust_floor',
+          currentValueUsd,
+          roundedExitSizeUsd,
+        }, {
+          skipPresophieBlock: true,
+        });
+        recordExposureCapBlocked('dust', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          currentValueUsd,
+          roundedExitSizeUsd,
+          source: cleanupState.staleOrExpired === true
+            ? 'stale_market_position_value_below_dust_floor'
+            : 'exposure_cap_position_value_below_dust_floor',
+        });
+        continue;
+      }
+
+      const profitableAtCost = Number(book.bestBid) >= avgEntryPrice - 1e-9;
+      const profitableWithBuffer = Number(book.bestBid) >= minProfitPrice - 1e-9;
+      if (!profitableAtCost) {
+        this.recordGabagoolBlockedLossExit({
+          ...commonDetails,
+          side: 'sell',
+          price: Number(book.bestBid),
+          sizeUsd: roundedExitSizeUsd,
+          avgEntryPrice,
+          minProfitPrice,
+          source: cleanupState.staleOrExpired ? 'exposure_cap_stale_market_blocked_loss_exit' : 'exposure_cap_blocked_loss_exit',
+        }, now);
+        recordExposureCapBlocked('valid_but_risk_or_execution_blocked', {
+          ...commonDetails,
+          side: 'sell',
+          price: Number(book.bestBid),
+          sizeUsd: roundedExitSizeUsd,
+          avgEntryPrice,
+          minProfitPrice,
+          source: cleanupState.staleOrExpired ? 'exposure_cap_stale_market_blocked_loss_exit' : 'exposure_cap_blocked_loss_exit',
+        });
+        continue;
+      }
+
+      let candidateReason = null;
+      let candidateSizeUsd = roundedExitSizeUsd;
+      if (profitableWithBuffer) {
+        candidateReason = cleanupState.staleOrExpired ? 'stale_market_profit_exit' : 'executable_profit_exit';
+      } else if (cleanupState.staleOrExpired) {
+        candidateReason = 'stale_market_cleanup';
+      } else if (roundedExitSizeUsd < Math.max(0.01, Number(this.config.minOrderUsd || 0))) {
+        candidateReason = 'reduce_only_dust_exit';
+      } else if (remainingExcessUsd > 0) {
+        candidateReason = 'exposure_cap_inventory_reduce';
+        candidateSizeUsd = Math.max(minReduceOnlyExitUsd, Math.min(currentValueUsd, remainingExcessUsd));
+        candidateSizeUsd = Math.round(candidateSizeUsd * 100) / 100;
+        const remainingAfterSellUsd = Math.max(0, currentValueUsd - candidateSizeUsd);
+        if (remainingAfterSellUsd > 0 && remainingAfterSellUsd < minReduceOnlyExitUsd) {
+          candidateSizeUsd = roundedExitSizeUsd;
+        }
+      } else {
+        recordExposureCapBlocked('valid_but_risk_or_execution_blocked', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          currentValueUsd,
+          roundedExitSizeUsd,
+          avgEntryPrice,
+          minProfitPrice,
+          source: 'profit_buffer_not_met',
+        });
+        continue;
+      }
+
+      if (!(candidateSizeUsd > 0) || candidateSizeUsd < minReduceOnlyExitUsd) {
+        recordExposureCapBlocked('dust', {
+          ...commonDetails,
+          price: Number(book.bestBid),
+          sizeUsd: candidateSizeUsd,
+          currentValueUsd,
+          roundedExitSizeUsd,
+          source: 'reduce_only_exit_below_min',
+        });
+        continue;
+      }
+
+      const signal = new Signal({
+        strategy: 'GabagoolBtcOracleStrategy',
+        tokenId: String(position.tokenId),
+        marketId: context.marketId,
+        side: 'sell',
+        price: round(Number(book.bestBid)),
+        sizeUsd: candidateSizeUsd,
+        expectedEdge: round(Math.max(Number(this.config.minSignalEdge || 0), Math.abs(Number(book.bestBid) - avgEntryPrice))),
+        confidence: round(clamp(
+          candidateReason === 'executable_profit_exit' || candidateReason === 'stale_market_profit_exit' ? 0.74 :
+            candidateReason === 'stale_market_cleanup' ? 0.68 :
+              candidateReason === 'reduce_only_dust_exit' ? 0.66 : 0.64,
+          0.35,
+          0.95
+        )),
+        reason: `gabagool exposure-cap exit reason=${candidateReason}`,
+        exitPlan: `Reduce-only exposure relief while max exposure is exceeded (${candidateReason})`,
+        ttlMs: 10_000,
+        maxHoldMs: 20_000,
+        metadata: {
+          marketSlug: context.marketSlug,
+          marketQuestion: context.marketQuestion,
+          outcome: context.outcome,
+          exitMode: 'exposure_cap_reduce_only',
+          gabagool: {
+            oracleSignalFresh: false,
+            exitIntent: true,
+            exitTrigger: candidateReason,
+            exitMode: 'exposure_cap_reduce_only',
+            exposureCapWaitingForExit: true,
+            sourceWallet: model?.source?.resolvedProxyWallet || DEFAULT_PROXY_WALLET,
+          },
+        },
+      });
+      scan.positionsClosable += 1;
+      scan.unfreezeReasonLast = candidateReason;
+      scan.candidates.push({
+        signal,
+        asset,
+        book,
+        context,
+        currentValueUsd,
+        roundedExitSizeUsd,
+        candidateReason,
+      });
+      this.recordGabagoolMetric('gabagool_reduce_only_exit_candidate', {
+        ...commonDetails,
+        side: 'sell',
+        price: signal.price,
+        sizeUsd: signal.sizeUsd,
+        expectedEdge: signal.expectedEdge,
+        confidence: signal.confidence,
+        reason: candidateReason,
+        exitMode: scan.exitMode,
+        currentValueUsd,
+        roundedExitSizeUsd,
+        positionsScanned: scan.positionsScanned,
+        positionsClosable: scan.positionsClosable,
+        exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
+        riskTotalExposureUsd: totalExposureUsd,
+        maxTotalExposureUsd,
+      });
+      remainingExcessUsd = Math.max(0, remainingExcessUsd - candidateSizeUsd);
+    }
+
+    if (!scan.noExitReason && scan.positionsClosable === 0) {
+      scan.noExitReason = this.dominantGabagoolLossGuardReason(scan.blockedReasons) || 'all_exits_blocked';
+    }
+    this.recordGabagoolMetric('gabagool_reduce_only_exit_scan', {
+      reason: scan.noExitReason || 'scan_complete',
+      positionsScanned: scan.positionsScanned,
+      positionsClosable: scan.positionsClosable,
+      exitMode: scan.exitMode,
+      riskTotalExposureUsd: totalExposureUsd,
+      maxTotalExposureUsd,
+      exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
+      blockedReasonSummary: [...scan.blockedReasons.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([reason, count]) => `${reason}:${count}`)
+        .join(',') || 'none',
+      source: scan.noExitReason,
+    });
+    scan.dominantBlockedReason = this.dominantGabagoolLossGuardReason(scan.blockedReasons) || null;
+    scan.blockedReasonSummary = [...scan.blockedReasons.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => `${reason}:${count}`)
+      .join(',') || 'none';
+    return scan;
+  }
+
   lastStrategyFillTs(tokenId, strategy) {
     const fills = this.portfolio.fills
       .filter((fill) => String(fill.tokenId || '') === String(tokenId) && fill.strategy === strategy)
@@ -4630,6 +7539,952 @@ class BotEngine {
       strategy: 'GabagoolBtcOracleStrategy',
       ...details,
     });
+  }
+
+  recordGabagoolBlockedLossExit(details = {}, now = Date.now()) {
+    const payload = {
+      tokenId: details.tokenId ? String(details.tokenId) : null,
+      marketId: details.marketId ? String(details.marketId) : null,
+      marketSlug: details.marketSlug ? String(details.marketSlug) : null,
+      marketQuestion: details.marketQuestion ? String(details.marketQuestion) : null,
+      outcome: details.outcome ? String(details.outcome) : null,
+      side: details.side || 'sell',
+      price: Number.isFinite(Number(details.price)) ? Number(details.price) : null,
+      sizeUsd: Number.isFinite(Number(details.sizeUsd)) ? Number(details.sizeUsd) : null,
+      expectedEdge: Number.isFinite(Number(details.expectedEdge)) ? Number(details.expectedEdge) : null,
+      confidence: Number.isFinite(Number(details.confidence)) ? Number(details.confidence) : null,
+      avgEntryPrice: Number.isFinite(Number(details.avgEntryPrice)) ? Number(details.avgEntryPrice) : null,
+      minProfitPrice: Number.isFinite(Number(details.minProfitPrice)) ? Number(details.minProfitPrice) : null,
+      oracleEventKey: details.oracleEventKey || null,
+      source: details.source || null,
+    };
+    const suppression = this.consumeBlockedLossExitSuppression({
+      tokenId: payload.tokenId,
+      marketSlug: payload.marketSlug,
+      outcome: payload.outcome,
+    }, now);
+
+    this.recordGabagoolMetric('gabagool_blocked_loss_exit', {
+      ...payload,
+      reason: 'blocked_loss_exit',
+    });
+    if (suppression.suppressed) {
+      this.recordGabagoolMetric('gabagool_blocked_loss_exit_repeat', {
+        ...payload,
+        reason: 'blocked_loss_exit',
+        source: details.source || 'suppressed_repeat',
+      });
+    } else {
+      this.emitGabagoolUpdate('risk_blocked', {
+        strategy: 'GabagoolBtcOracleStrategy',
+        marketSlug: payload.marketSlug,
+        marketQuestion: payload.marketQuestion,
+        tokenId: payload.tokenId,
+        outcome: payload.outcome,
+        side: payload.side,
+        price: payload.price,
+        sizeUsd: payload.sizeUsd,
+        expectedEdge: payload.expectedEdge,
+        confidence: payload.confidence,
+        blockReason: 'blocked_loss_exit',
+        avgEntryPrice: payload.avgEntryPrice,
+        sophieDecision: 'NOT_RUN',
+        riskDecision: 'BLOCK:blocked_loss_exit',
+        oracleEventKey: payload.oracleEventKey,
+      });
+      warn(
+        `[GABAGOOL CAPITAL PROTECTION] reason=blocked_loss_exit token=${shortId(payload.tokenId)} ` +
+        `marketSlug=${payload.marketSlug || 'unknown'} avgEntry=${fmtPrice(payload.avgEntryPrice)} ` +
+        `sellPrice=${fmtPrice(payload.price)} minProfitPrice=${fmtPrice(payload.minProfitPrice)}`
+      );
+    }
+    return suppression;
+  }
+
+  consumeBlockedLossExitSuppression(payload = {}, now = Date.now()) {
+    const marketSlug = String(payload.marketSlug || 'unknown');
+    const tokenId = String(payload.tokenId || 'unknown');
+    const outcome = String(payload.outcome || 'unknown');
+    const key = `${marketSlug}:${tokenId}:${outcome}`;
+    const cooldownMs = Math.max(1_000, Number(this.config.gabagoolTelegramRiskBlockDedupeMs || 120_000));
+    const current = this.gabagoolBlockedLossExitDedupe.get(key) || null;
+    if (current && Number(current.expiresAt || 0) > now) {
+      current.repeatCount = Number(current.repeatCount || 0) + 1;
+      current.lastSeenAt = now;
+      this.gabagoolBlockedLossExitDedupe.set(key, current);
+      return {
+        suppressed: true,
+        repeatCount: current.repeatCount,
+        cooldownMs,
+      };
+    }
+    const repeatCount = current ? Number(current.repeatCount || 0) : 0;
+    this.gabagoolBlockedLossExitDedupe.set(key, {
+      expiresAt: now + cooldownMs,
+      lastSeenAt: now,
+      repeatCount: 0,
+    });
+    return {
+      suppressed: false,
+      repeatCount,
+      cooldownMs,
+    };
+  }
+
+  gabagoolLedger(markPrices = this.cache.markPrices(), now = Date.now()) {
+    this.syncPortfolioMarks(markPrices);
+    return this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
+  }
+
+  gabagoolNetPnl(ledger = null) {
+    const selectedLedger = ledger || this.gabagoolLedger();
+    return Number(
+      selectedLedger?.netAfterFeesEstimate ??
+      ((Number(selectedLedger?.realizedPnl || 0)) + (Number(selectedLedger?.unrealizedPnl || 0)))
+    );
+  }
+
+  gabagoolDrawdownPct(ledger = null) {
+    const netPnl = this.gabagoolNetPnl(ledger);
+    const baseCapitalUsd = Math.max(1, Number(this.config.initialCash || 0));
+    return Math.max(0, (-netPnl / baseCapitalUsd) * 100);
+  }
+
+  gabagoolLossGuardState(markPrices = this.cache.markPrices(), now = Date.now()) {
+    const ledger = this.gabagoolLedger(markPrices, now);
+    const closedPnl = Number(ledger.closedPnl || 0);
+    const closedLossUsd = Math.max(0, -closedPnl);
+    const drawdownPct = this.gabagoolDrawdownPct(ledger);
+    const pauseOnLoss = this.config.gabagoolPauseEntriesOnLoss === true;
+    const maxDrawdownPct = Math.max(0, Number(this.config.gabagoolMaxPaperDrawdownPct || 0));
+    const maxClosedLossUsd = Math.max(0, Number(this.config.gabagoolMaxPaperClosedLossUsd || 0));
+    const reasons = [];
+    if (pauseOnLoss && drawdownPct > maxDrawdownPct) reasons.push('drawdown_pct_exceeded');
+    if (pauseOnLoss && closedLossUsd > maxClosedLossUsd) reasons.push('closed_loss_exceeded');
+    return {
+      paused: pauseOnLoss && reasons.length > 0,
+      reason: pauseOnLoss && reasons.length > 0 ? 'gabagool_loss_guard' : null,
+      reasons,
+      ledger,
+      drawdownPct,
+      closedPnl,
+      closedLossUsd,
+      unrealizedPnl: Number(ledger.unrealizedPnl || 0),
+      netPnl: this.gabagoolNetPnl(ledger),
+      maxDrawdownPct,
+      maxClosedLossUsd,
+    };
+  }
+
+  gabagoolNormalizeOutcome(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'up') return 'Up';
+    if (normalized === 'down') return 'Down';
+    return value ? String(value) : null;
+  }
+
+  gabagoolKnownOutcome(value) {
+    const normalized = this.gabagoolNormalizeOutcome(value);
+    return normalized === 'Up' || normalized === 'Down' ? normalized : null;
+  }
+
+  gabagoolMarketSlugForSignal(signal = null) {
+    return String(signal?.metadata?.marketSlug || signal?.marketSlug || signal?.marketId || '');
+  }
+
+  gabagoolTargetOutcomeForToken(tokenId, marketSlug = '') {
+    const target = this.lastGabagoolOracleTarget || null;
+    if (!target || !tokenId) return null;
+    const targetSlug = String(target.slug || '');
+    if (targetSlug && marketSlug && String(marketSlug) !== targetSlug) return null;
+    const key = String(tokenId || '');
+    if (key === String(target.BTC_UP_TOKEN_ID || '')) return 'Up';
+    if (key === String(target.BTC_DOWN_TOKEN_ID || '')) return 'Down';
+    return null;
+  }
+
+  gabagoolTokenGuardKey(marketSlug, tokenId) {
+    const slug = String(marketSlug || '');
+    const token = String(tokenId || '');
+    if (!slug || !token) return '';
+    return `${slug}:${token}`;
+  }
+
+  pruneGabagoolSafetyGuards(now = Date.now()) {
+    const retentionMs = 2 * 60 * 60_000;
+    for (const [key, entry] of this.gabagoolTokenEntryGuards.entries()) {
+      const expiresAt = Number(entry?.expiresAt || 0);
+      const ts = Number(entry?.ts || 0);
+      const permanent = entry?.permanent === true;
+      if (!permanent && expiresAt > 0 && expiresAt <= now) {
+        this.gabagoolTokenEntryGuards.delete(key);
+        continue;
+      }
+      if (ts > 0 && (now - ts) > retentionMs) {
+        this.gabagoolTokenEntryGuards.delete(key);
+      }
+    }
+    for (const [key, entry] of this.gabagoolMarketLockouts.entries()) {
+      const ts = Number(entry?.ts || 0);
+      if (ts > 0 && (now - ts) > retentionMs) {
+        this.gabagoolMarketLockouts.delete(key);
+      }
+    }
+  }
+
+  rememberGabagoolTokenEntryGuard({
+    marketSlug,
+    tokenId,
+    reason,
+    outcome = null,
+    expiresAt = 0,
+    permanent = false,
+    ts = Date.now(),
+  } = {}) {
+    const key = this.gabagoolTokenGuardKey(marketSlug, tokenId);
+    if (!key) return null;
+    const nextEntry = {
+      marketSlug: String(marketSlug || ''),
+      tokenId: String(tokenId || ''),
+      reason: reason || 'guarded',
+      outcome: this.gabagoolNormalizeOutcome(outcome),
+      expiresAt: Number.isFinite(Number(expiresAt)) ? Number(expiresAt) : 0,
+      permanent: permanent === true,
+      ts,
+    };
+    const previous = this.gabagoolTokenEntryGuards.get(key);
+    if (previous?.permanent === true && nextEntry.permanent !== true) {
+      return previous;
+    }
+    this.gabagoolTokenEntryGuards.set(key, nextEntry);
+    return nextEntry;
+  }
+
+  rememberGabagoolMarketLockout({
+    marketSlug,
+    reason,
+    tokenId = null,
+    outcome = null,
+    ts = Date.now(),
+    notify = false,
+  } = {}) {
+    const slug = String(marketSlug || '');
+    if (!slug) return false;
+    const prior = this.gabagoolMarketLockouts.get(slug) || null;
+    const nextEntry = {
+      marketSlug: slug,
+      reason: reason || 'market_lockout',
+      tokenId: tokenId ? String(tokenId) : null,
+      outcome: this.gabagoolNormalizeOutcome(outcome),
+      ts,
+    };
+    const changed = !prior ||
+      prior.reason !== nextEntry.reason ||
+      prior.tokenId !== nextEntry.tokenId ||
+      prior.outcome !== nextEntry.outcome;
+    this.gabagoolMarketLockouts.set(slug, nextEntry);
+    this.lastGabagoolMarketLockoutReason = nextEntry.reason;
+    if (!changed) return false;
+
+    this.recordGabagoolMetric('gabagool_market_lockout_set', {
+      tokenId: nextEntry.tokenId,
+      marketSlug: slug,
+      outcome: nextEntry.outcome,
+      side: 'buy',
+      reason: nextEntry.reason,
+    });
+    if (notify) {
+      this.emitGabagoolUpdate('risk_blocked', {
+        strategy: 'GabagoolBtcOracleStrategy',
+        marketSlug: slug,
+        tokenId: nextEntry.tokenId,
+        outcome: nextEntry.outcome,
+        side: 'buy',
+        blockReason: nextEntry.reason,
+        sophieDecision: 'NOT_RUN',
+        riskDecision: `BLOCK:${nextEntry.reason}`,
+      });
+    }
+    return true;
+  }
+
+  gabagoolActiveMarketDirections(marketSlug = '', markPrices = this.cache.markPrices()) {
+    const targetSlug = String(marketSlug || '');
+    if (!targetSlug) {
+      return {
+        outcomes: [],
+        tokenIds: [],
+        ignoredStaleDust: [],
+        ignoredUnknownDirection: [],
+      };
+    }
+    const outcomes = new Set();
+    const tokenIds = new Set();
+    const ignoredStaleDust = [];
+    const ignoredUnknownDirection = [];
+    const minDustUsd = Math.max(0.01, Number(this.config.gabagoolMinDustExitUsd || 0.01));
+
+    const resolveKnownOutcome = (tokenId, rawOutcome) => {
+      const directOutcome = this.gabagoolKnownOutcome(rawOutcome);
+      if (directOutcome) return { outcome: directOutcome, source: 'direct' };
+      const derivedOutcome = this.gabagoolTargetOutcomeForToken(tokenId, targetSlug);
+      if (derivedOutcome) return { outcome: derivedOutcome, source: 'target_token_match' };
+      return { outcome: null, source: 'unknown' };
+    };
+
+    for (const order of this.portfolio.openOrders.values()) {
+      if (!isGabagoolStrategy(order?.strategy)) continue;
+      if (this.gabagoolMarketSlugForSignal(order?.signal || order) !== targetSlug) continue;
+      const resolvedOutcome = resolveKnownOutcome(
+        order?.tokenId,
+        order?.signal?.metadata?.outcome || order?.metadata?.outcome
+      );
+      if (!resolvedOutcome.outcome) {
+        ignoredUnknownDirection.push({
+          tokenId: String(order?.tokenId || ''),
+          marketSlug: targetSlug,
+          outcome: this.gabagoolNormalizeOutcome(order?.signal?.metadata?.outcome || order?.metadata?.outcome) || 'Unknown',
+          source: 'open_order_unknown_direction',
+          outcomeSource: resolvedOutcome.source,
+        });
+        continue;
+      }
+      outcomes.add(resolvedOutcome.outcome);
+      if (order?.tokenId) tokenIds.add(String(order.tokenId));
+    }
+
+    for (const [tokenId, qty] of this.portfolio.positions.entries()) {
+      if (!(Number(qty) > 0)) continue;
+      const hasGabagoolHistory =
+        this.portfolio.executionEvents.some((event) => (
+          isBtcOracleStrategy(event?.strategy) &&
+          String(event?.tokenId || '') === String(tokenId)
+        )) ||
+        this.portfolio.fills.some((fill) => (
+          isBtcOracleStrategy(fill?.strategy) &&
+          String(fill?.tokenId || '') === String(tokenId)
+        ));
+      if (!hasGabagoolHistory) continue;
+      const context = this.gabagoolPositionContext(tokenId, this.portfolio.positionMarketId(tokenId));
+      if (String(context.marketSlug || '') !== targetSlug) continue;
+      const mark = Number(this.portfolio.markPriceForExposure(tokenId, markPrices));
+      const currentValueUsd = Number(qty) * (Number.isFinite(mark) && mark > 0 ? mark : 0);
+      if (!(currentValueUsd > minDustUsd + 1e-9)) {
+        ignoredStaleDust.push({
+          tokenId: String(tokenId),
+          marketSlug: targetSlug,
+          outcome: this.gabagoolNormalizeOutcome(context.outcome) || 'Unknown',
+          currentValueUsd,
+          positionQty: Number(qty),
+          marketSlugSource: context.marketSlugSource,
+          outcomeSource: context.outcomeSource,
+          reason: context.directMarketEvidence === true
+            ? 'same_market_dust_position'
+            : 'stale_or_unconfirmed_dust_position',
+        });
+        if (
+          context.directMarketEvidence !== true ||
+          !this.gabagoolKnownOutcome(context.outcome)
+        ) {
+          ignoredUnknownDirection.push({
+            tokenId: String(tokenId),
+            marketSlug: targetSlug,
+            outcome: this.gabagoolNormalizeOutcome(context.outcome) || 'Unknown',
+            currentValueUsd,
+            positionQty: Number(qty),
+            marketSlugSource: context.marketSlugSource,
+            outcomeSource: context.outcomeSource,
+            reason: 'dust_position_unknown_or_unconfirmed_direction',
+          });
+        }
+        continue;
+      }
+      if (context.directMarketEvidence !== true) {
+        ignoredUnknownDirection.push({
+          tokenId: String(tokenId),
+          marketSlug: targetSlug,
+          outcome: this.gabagoolNormalizeOutcome(context.outcome) || 'Unknown',
+          currentValueUsd,
+          positionQty: Number(qty),
+          marketSlugSource: context.marketSlugSource,
+          outcomeSource: context.outcomeSource,
+          reason: 'same_market_unconfirmed_direction',
+        });
+        continue;
+      }
+      const resolvedOutcome = resolveKnownOutcome(tokenId, context.outcome);
+      if (!resolvedOutcome.outcome) {
+        ignoredUnknownDirection.push({
+          tokenId: String(tokenId),
+          marketSlug: targetSlug,
+          outcome: this.gabagoolNormalizeOutcome(context.outcome) || 'Unknown',
+          currentValueUsd,
+          positionQty: Number(qty),
+          marketSlugSource: context.marketSlugSource,
+          outcomeSource: context.outcomeSource,
+          reason: 'same_market_unknown_direction',
+        });
+        continue;
+      }
+      outcomes.add(resolvedOutcome.outcome);
+      tokenIds.add(String(tokenId));
+    }
+
+    return {
+      outcomes: [...outcomes],
+      tokenIds: [...tokenIds],
+      ignoredStaleDust,
+      ignoredUnknownDirection,
+    };
+  }
+
+  gabagoolExplicitLossExitAllowed(signal = null) {
+    return (
+      signal?.metadata?.reduceOnly === true ||
+      signal?.metadata?.exitMode === 'loss_guard_reduce_only' ||
+      signal?.metadata?.gabagool?.exitMode === 'loss_guard_reduce_only' ||
+      signal?.metadata?.gabagool?.exitTrigger === 'loss_guard_reduce_only'
+    );
+  }
+
+  gabagoolExitGuard(signal, now = Date.now()) {
+    if (!isGabagoolStrategy(signal) || String(signal?.side || '').toLowerCase() !== 'sell') {
+      return { blocked: false, reason: null };
+    }
+
+    const tokenId = String(signal?.tokenId || '');
+    const marketSlug = this.gabagoolMarketSlugForSignal(signal);
+    const outcome = this.gabagoolNormalizeOutcome(signal?.metadata?.outcome);
+    const sellPrice = Number(signal?.price);
+    const positionCost = this.portfolio.positionCostDetails(tokenId);
+    const avgEntryPrice = Number(positionCost?.avgEntryPrice || this.portfolio.avgCost(tokenId) || 0);
+    const minProfitBuffer = Math.max(0, Number(this.config.gabagoolMinProfitBuffer || 0));
+    const minProfitPrice = avgEntryPrice + minProfitBuffer;
+    const explicitLossExitAllowed = this.gabagoolExplicitLossExitAllowed(signal);
+    const profitBufferBypassAllowed = this.gabagoolProfitBufferBypassAllowed(signal);
+
+    if (!(avgEntryPrice > 0) || !Number.isFinite(sellPrice) || sellPrice <= 0) {
+      return { blocked: false, reason: null };
+    }
+    if (!explicitLossExitAllowed && sellPrice < avgEntryPrice - 1e-9) {
+      return {
+        blocked: true,
+        reason: 'blocked_loss_exit',
+        marketSlug,
+        tokenId,
+        outcome,
+        avgEntryPrice,
+        sellPrice,
+        minProfitPrice,
+        minProfitBuffer,
+      };
+    }
+    if (!profitBufferBypassAllowed && sellPrice < minProfitPrice - 1e-9) {
+      return {
+        blocked: true,
+        reason: 'profit_buffer_not_met',
+        marketSlug,
+        tokenId,
+        outcome,
+        avgEntryPrice,
+        sellPrice,
+        minProfitPrice,
+        minProfitBuffer,
+      };
+    }
+    return {
+      blocked: false,
+      reason: null,
+      marketSlug,
+      tokenId,
+      outcome,
+      avgEntryPrice,
+      sellPrice,
+      minProfitPrice,
+      minProfitBuffer,
+      explicitLossExitAllowed,
+      profitBufferBypassAllowed,
+      forcedLossExit: explicitLossExitAllowed && sellPrice < avgEntryPrice - 1e-9,
+    };
+  }
+
+  gabagoolLifecycleConflictGuard(signal, now = Date.now()) {
+    if (!isGabagoolStrategy(signal)) return { blocked: false, reason: null };
+    this.pruneGabagoolSafetyGuards(now);
+
+    const tokenId = String(signal?.tokenId || '');
+    const marketSlug = this.gabagoolMarketSlugForSignal(signal);
+    const side = String(signal?.side || '').toLowerCase();
+    if (!tokenId || !marketSlug || !side) return { blocked: false, reason: null };
+
+    const opposingOrder = [...this.portfolio.openOrders.values()].find((order) => (
+      isGabagoolStrategy(order?.strategy) &&
+      String(order?.tokenId || '') === tokenId &&
+      this.gabagoolMarketSlugForSignal(order?.signal || order) === marketSlug &&
+      String(order?.side || '').toLowerCase() !== side
+    ));
+    if (!opposingOrder) return { blocked: false, reason: null };
+
+    return {
+      blocked: true,
+      reason: side === 'buy' ? 'gabagool_reentry_guard' : 'gabagool_lifecycle_overlap',
+      guardType: 'opposing_open_order',
+      tokenId,
+      marketSlug,
+      opposingSide: String(opposingOrder.side || '').toLowerCase(),
+    };
+  }
+
+  onGabagoolSellPlaced(signal, now = Date.now()) {
+    const exitGuard = this.gabagoolExitGuard(signal, now);
+    if (exitGuard.forcedLossExit) {
+      this.rememberGabagoolMarketLockout({
+        marketSlug: exitGuard.marketSlug,
+        reason: 'loss_exit_market_lockout',
+        tokenId: exitGuard.tokenId,
+        outcome: exitGuard.outcome,
+        ts: now,
+        notify: true,
+      });
+    }
+  }
+
+  onGabagoolSellFill({ order, fillDetails, exitClassification, now = Date.now() } = {}) {
+    if (!order || !fillDetails) return null;
+    const marketSlug = this.gabagoolMarketSlugForSignal(order.signal || order);
+    const tokenId = String(order.tokenId || '');
+    const outcome = this.gabagoolNormalizeOutcome(order.signal?.metadata?.outcome);
+    const cooldownMs = Math.max(0, Number(this.config.gabagoolReenterCooldownMs || 0));
+    const expiresAt = cooldownMs > 0 ? now + cooldownMs : now;
+
+    if (marketSlug && tokenId) {
+      this.rememberGabagoolTokenEntryGuard({
+        marketSlug,
+        tokenId,
+        outcome,
+        reason: 'recent_sell_cooldown',
+        expiresAt,
+        permanent: false,
+        ts: now,
+      });
+    }
+
+    const positionQtyAfter = Number(fillDetails.positionQtyAfter || 0);
+    const remainingMark = Number(this.portfolio.markPriceForExposure(tokenId));
+    const remainingValueUsd = positionQtyAfter * (
+      Number.isFinite(remainingMark) && remainingMark > 0
+        ? remainingMark
+        : Number(fillDetails?.sellPrice || order?.price || 0)
+    );
+    const completedRoundTrip = (
+      positionQtyAfter <= 1e-9 ||
+      (remainingValueUsd > 0 && remainingValueUsd < Math.max(0.01, Number(this.config.minOrderUsd || 0)))
+    );
+    if (completedRoundTrip && marketSlug && tokenId) {
+      this.rememberGabagoolTokenEntryGuard({
+        marketSlug,
+        tokenId,
+        outcome,
+        reason: this.config.gabagoolAllowMarketReentry === true
+          ? 'recent_sell_cooldown'
+          : 'round_trip_reentry_disabled',
+        expiresAt,
+        permanent: this.config.gabagoolAllowMarketReentry !== true,
+        ts: now,
+      });
+    }
+
+    if (exitClassification === 'loss_exit' || exitClassification === 'blocked_loss_exit') {
+      this.rememberGabagoolMarketLockout({
+        marketSlug,
+        reason: 'loss_exit_market_lockout',
+        tokenId,
+        outcome,
+        ts: now,
+        notify: true,
+      });
+      if (marketSlug && tokenId) {
+        this.rememberGabagoolTokenEntryGuard({
+          marketSlug,
+          tokenId,
+          outcome,
+          reason: 'loss_exit_market_lockout',
+          expiresAt,
+          permanent: true,
+          ts: now,
+        });
+      }
+    }
+
+    return {
+      marketSlug,
+      tokenId,
+      outcome,
+      cooldownMs,
+    };
+  }
+
+  recordGabagoolSameMarketIgnores(signal, activeDirections = {}) {
+    if (!signal || !activeDirections) return;
+    if (!signal.metadata || typeof signal.metadata !== 'object') signal.metadata = {};
+    if (!signal.metadata.gabagool || typeof signal.metadata.gabagool !== 'object') {
+      signal.metadata.gabagool = {};
+    }
+    if (signal.metadata.gabagool.sameMarketIgnoreMetricsRecorded === true) return;
+
+    const common = {
+      tokenId: signal?.tokenId,
+      marketId: signal?.marketId,
+      marketSlug: this.gabagoolMarketSlugForSignal(signal),
+      outcome: signal?.metadata?.outcome,
+      side: signal?.side,
+      price: signal?.price,
+      sizeUsd: signal?.sizeUsd,
+      expectedEdge: signal?.expectedEdge,
+      confidence: signal?.confidence,
+    };
+
+    for (const ignored of activeDirections.ignoredStaleDust || []) {
+      this.recordGabagoolMetric('gabagool_stale_dust_ignored', {
+        ...common,
+        sourceTokenId: ignored.tokenId,
+        sourceOutcome: ignored.outcome,
+        sourceCurrentValueUsd: ignored.currentValueUsd,
+        sourcePositionQty: ignored.positionQty,
+        marketSlugSource: ignored.marketSlugSource,
+        outcomeSource: ignored.outcomeSource,
+        reason: ignored.reason || 'same_market_stale_dust_ignored',
+      });
+    }
+    for (const ignored of activeDirections.ignoredUnknownDirection || []) {
+      this.recordGabagoolMetric('gabagool_same_market_unknown_direction_ignored', {
+        ...common,
+        sourceTokenId: ignored.tokenId,
+        sourceOutcome: ignored.outcome,
+        sourceCurrentValueUsd: ignored.currentValueUsd,
+        sourcePositionQty: ignored.positionQty,
+        marketSlugSource: ignored.marketSlugSource,
+        outcomeSource: ignored.outcomeSource,
+        reason: ignored.reason || 'same_market_unknown_direction_ignored',
+      });
+    }
+
+    signal.metadata.gabagool.sameMarketIgnoreMetricsRecorded = true;
+  }
+
+  gabagoolRoundTripState(tokenId, marketId, markPrices = this.cache.markPrices(), now = Date.now()) {
+    const ledger = this.gabagoolLedger(markPrices, now);
+    const roundTrips = (ledger.roundTrips || [])
+      .filter((trip) => String(trip.tokenId || '') === String(tokenId || ''))
+      .filter((trip) => String(trip.marketId || '') === String(marketId || ''))
+      .sort((a, b) => Number(a.exitTs || 0) - Number(b.exitTs || 0));
+    const realizedPnl = roundTrips.reduce((sum, trip) => sum + Number(trip.realizedPnl || 0), 0);
+    const lastTrip = roundTrips[roundTrips.length - 1] || null;
+    const lastTripImprovedRealizedPnl = Number(lastTrip?.realizedPnl || 0) > 0;
+    const lastExitAgeMs = lastTrip ? Math.max(0, now - Number(lastTrip.exitTs || 0)) : null;
+    const withinCooldown = lastExitAgeMs != null && lastExitAgeMs < Math.max(0, Number(this.config.gabagoolReenterCooldownMs || 0));
+    const roundTripCapReached = roundTrips.length >= Math.max(1, Number(this.config.gabagoolMaxRoundTripsPerTokenPerMarket || 1));
+    return {
+      ledger,
+      roundTrips,
+      realizedPnl,
+      lastTrip,
+      lastTripImprovedRealizedPnl,
+      lastExitAgeMs,
+      withinCooldown,
+      roundTripCapReached,
+    };
+  }
+
+  gabagoolEntryGuard(signal, markPrices = this.cache.markPrices(), now = Date.now()) {
+    if (!isGabagoolStrategy(signal) || String(signal?.side || '').toLowerCase() !== 'buy') {
+      return { blocked: false, reason: null };
+    }
+
+    this.pruneGabagoolSafetyGuards(now);
+
+    const marketSlug = this.gabagoolMarketSlugForSignal(signal);
+    const tokenId = String(signal?.tokenId || '');
+    const outcome = this.gabagoolNormalizeOutcome(signal?.metadata?.outcome);
+    const tokenGuardKey = this.gabagoolTokenGuardKey(marketSlug, tokenId);
+    const marketLockout = marketSlug ? (this.gabagoolMarketLockouts.get(marketSlug) || null) : null;
+    if (marketLockout) {
+      return {
+        blocked: true,
+        reason: 'gabagool_market_lockout',
+        guardType: 'market_lockout',
+        tokenId,
+        marketSlug,
+        outcome,
+        marketLockoutReason: marketLockout.reason,
+      };
+    }
+
+    const tokenGuard = tokenGuardKey ? (this.gabagoolTokenEntryGuards.get(tokenGuardKey) || null) : null;
+    if (
+      tokenGuard &&
+      (
+        tokenGuard.permanent === true ||
+        Number(tokenGuard.expiresAt || 0) > now
+      )
+    ) {
+      return {
+        blocked: true,
+        reason: 'gabagool_reentry_guard',
+        guardType: tokenGuard.permanent === true ? 'round_trip_lockout' : 'recent_sell_cooldown',
+        tokenId,
+        marketSlug,
+        outcome,
+        reenterCooldownMs: Math.max(0, Number(this.config.gabagoolReenterCooldownMs || 0)),
+        guardReason: tokenGuard.reason,
+        expiresAt: Number(tokenGuard.expiresAt || 0),
+      };
+    }
+
+    const activeDirections = this.gabagoolActiveMarketDirections(marketSlug, markPrices);
+    this.recordGabagoolSameMarketIgnores(signal, activeDirections);
+    if (
+      outcome &&
+      activeDirections.outcomes.length > 0 &&
+      activeDirections.outcomes.some((value) => value && value !== outcome)
+    ) {
+      return {
+        blocked: true,
+        reason: 'gabagool_same_market_direction_guard',
+        guardType: 'same_market_direction',
+        tokenId,
+        marketSlug,
+        outcome,
+        activeDirections: activeDirections.outcomes.join('|'),
+        ignoredStaleDustCount: (activeDirections.ignoredStaleDust || []).length,
+        ignoredUnknownDirectionCount: (activeDirections.ignoredUnknownDirection || []).length,
+      };
+    }
+
+    const lossGuard = this.gabagoolLossGuardState(markPrices, now);
+    if (lossGuard.paused) {
+      return {
+        blocked: true,
+        reason: 'gabagool_loss_guard',
+        guardType: 'loss_guard',
+        gabagoolEntriesPaused: true,
+        gabagoolEntryPauseReason: 'gabagool_loss_guard',
+        gabagool_entries_paused_loss_guard: true,
+        drawdownPct: lossGuard.drawdownPct,
+        closedLossUsd: lossGuard.closedLossUsd,
+        closedPnl: lossGuard.closedPnl,
+        unrealizedPnl: lossGuard.unrealizedPnl,
+        netPnl: lossGuard.netPnl,
+        maxDrawdownPct: lossGuard.maxDrawdownPct,
+        maxClosedLossUsd: lossGuard.maxClosedLossUsd,
+        lossGuardReasons: lossGuard.reasons.join('|'),
+      };
+    }
+
+    const roundTripState = this.gabagoolRoundTripState(signal.tokenId, signal.marketId, markPrices, now);
+    if (
+      roundTripState.lastTrip &&
+      roundTripState.withinCooldown &&
+      !roundTripState.lastTripImprovedRealizedPnl
+    ) {
+      return {
+        blocked: true,
+        reason: 'gabagool_churn_guard',
+        guardType: 'reenter_cooldown',
+        tokenId,
+        marketSlug,
+        outcome,
+        roundTrips: roundTripState.roundTrips.length,
+        realizedPnl: roundTripState.realizedPnl,
+        lastRoundTripPnl: Number(roundTripState.lastTrip.realizedPnl || 0),
+        lastExitAgeMs: roundTripState.lastExitAgeMs,
+        reenterCooldownMs: Math.max(0, Number(this.config.gabagoolReenterCooldownMs || 0)),
+      };
+    }
+    if (roundTripState.roundTripCapReached && roundTripState.realizedPnl <= 0) {
+      return {
+        blocked: true,
+        reason: 'gabagool_churn_guard',
+        guardType: 'round_trip_cap',
+        tokenId,
+        marketSlug,
+        outcome,
+        roundTrips: roundTripState.roundTrips.length,
+        realizedPnl: roundTripState.realizedPnl,
+        maxRoundTripsPerTokenPerMarket: Math.max(1, Number(this.config.gabagoolMaxRoundTripsPerTokenPerMarket || 1)),
+      };
+    }
+
+    const paceState = this.mixedModePaceState(now);
+    this.logMixedModePace(paceState);
+    if (paceState.blocked) {
+      return {
+        blocked: true,
+        reason: 'gabagool_mixed_mode_pace',
+        guardType: 'mixed_mode_pace',
+        tokenId,
+        marketSlug,
+        outcome,
+        btcOrdersLastHour: paceState.btcOrdersLastHour,
+        standardOrdersLastHour: paceState.standardOrdersLastHour,
+        projectedBtcShare: paceState.projectedBtcShare,
+        mixedModeBtcOrderShareCap: paceState.mixedModeBtcOrderShareCap,
+        standardExposureUsd: paceState.standardExposureUsd,
+        standardExposureCapUsd: paceState.standardExposureCapUsd,
+        standardQualifiedCandidatesThisScan: paceState.standardQualifiedCandidatesThisScan,
+      };
+    }
+
+    if (
+      Number.isFinite(Number(signal.price)) &&
+      Number(signal.price) > Number(this.config.gabagoolMaxEntryPrice || 0.85) &&
+      Number(signal.expectedEdge || 0) < Number(this.config.gabagoolAllowHighPriceEntryEdge || 0.20)
+    ) {
+      return {
+        blocked: true,
+        reason: 'gabagool_high_price_entry_guard',
+        guardType: 'high_price_entry',
+        price: Number(signal.price),
+        maxEntryPrice: Number(this.config.gabagoolMaxEntryPrice || 0.85),
+        expectedEdge: Number(signal.expectedEdge || 0),
+        allowHighPriceEntryEdge: Number(this.config.gabagoolAllowHighPriceEntryEdge || 0.20),
+      };
+    }
+
+    return { blocked: false, reason: null };
+  }
+
+  shouldLogGabagoolExitSizingState(key, ttlMs = 60_000) {
+    const now = Date.now();
+    for (const [existingKey, expiresAt] of this.gabagoolExitSizingLogged.entries()) {
+      if (Number(expiresAt || 0) <= now) this.gabagoolExitSizingLogged.delete(existingKey);
+    }
+    if (this.gabagoolExitSizingLogged.has(key)) return false;
+    this.gabagoolExitSizingLogged.set(key, now + ttlMs);
+    return true;
+  }
+
+  recordGabagoolTinyExitState(
+    type,
+    details = {},
+    { oracleTarget = null, oracleSignal = null, oracleEventKey = null, skipPresophieBlock = false } = {}
+  ) {
+    const tokenId = String(details.tokenId || '');
+    const marketSlug = details.marketSlug || oracleTarget?.target?.slug || null;
+    const outcome = details.outcome || (String(oracleTarget?.target?.BTC_UP_TOKEN_ID || '') === tokenId ? 'Up' : 'Down');
+    const stateKey = [
+      type,
+      marketSlug || 'unknown',
+      tokenId || 'unknown',
+      cleanLogValue(details.positionQty),
+      cleanLogValue(details.currentValueUsd),
+      details.source || details.reason || 'unknown',
+    ].join(':');
+    if (!this.shouldLogGabagoolExitSizingState(stateKey)) return false;
+
+    const payload = {
+      tokenId,
+      marketId: details.marketId || String(oracleTarget?.target?.rawMarketId || oracleTarget?.target?.slug || ''),
+      marketSlug,
+      outcome,
+      side: 'sell',
+      price: details.price,
+      sizeUsd: details.roundedExitSizeUsd ?? details.currentValueUsd ?? 0,
+      expectedEdge: details.expectedEdge,
+      confidence: details.confidence,
+      reason: details.reason,
+      source: details.source,
+      positionQty: details.positionQty,
+      availableSellQty: details.availableSellQty,
+      currentValueUsd: details.currentValueUsd,
+      roundedExitSizeUsd: details.roundedExitSizeUsd,
+    };
+    this.recordGabagoolMetric(type, payload);
+
+    if (type === 'gabagool_zero_size_blocked') {
+      warn(
+        `[GABAGOOL ZERO SIZE PREVENTED] source=${payload.source || 'unknown'} token=${shortId(payload.tokenId)} ` +
+        `positionQty=${fmtCount(payload.positionQty, 6)} availableSellQty=${fmtCount(payload.availableSellQty, 6)} ` +
+        `currentValueUsd=${fmtMoney(payload.currentValueUsd)} roundedExitSizeUsd=${fmtMoney(payload.roundedExitSizeUsd)} ` +
+        `reason=${payload.reason || 'zero_size_candidate'}`
+      );
+    } else if (type === 'gabagool_dust_position_remaining') {
+      warn(
+        `[GABAGOOL DUST POSITION REMAINING] source=${payload.source || 'unknown'} token=${shortId(payload.tokenId)} ` +
+        `positionQty=${fmtCount(payload.positionQty, 6)} availableSellQty=${fmtCount(payload.availableSellQty, 6)} ` +
+        `currentValueUsd=${fmtMoney(payload.currentValueUsd)} roundedExitSizeUsd=${fmtMoney(payload.roundedExitSizeUsd)} ` +
+        `reason=${payload.reason || 'dust_exit_below_min'} dust_position_remaining=true`
+      );
+    }
+
+    if (!skipPresophieBlock) {
+      this.logGabagoolPresophieBlock(payload.reason || type, this.gabagoolPresophiePayload({
+        oracleTarget,
+        oracleSignal,
+        book: details.book || null,
+        side: 'sell',
+        price: payload.price,
+        sizeUsd: payload.sizeUsd,
+        expectedEdge: payload.expectedEdge,
+        oracleEventKey,
+      }));
+    }
+    return true;
+  }
+
+  gabagoolNoPlacementReasonFromRisk(reason, signal = null) {
+    switch (String(reason || '')) {
+      case 'max_total_exposure':
+        return 'risk_total_exposure_cap';
+      case 'max_market_exposure':
+        return 'risk_market_exposure_cap';
+      case 'max_position_per_asset':
+        return 'risk_position_cap';
+      case 'invalid_size':
+      case 'sell_size_below_min':
+        return 'order_size_below_min';
+      case 'invalid_price':
+        return 'no_valid_price';
+      case 'invalid_signal':
+        return signal?.tokenId ? 'final_gate_block' : 'no_valid_token';
+      case 'confidence_below_min':
+        return 'risk_confidence_below_min';
+      case 'cash_cap':
+      case 'max_total_open_order_usd':
+      case 'max_open_orders':
+      case 'no_available_position':
+      case 'drawdown_limit':
+      case 'edge_below_min':
+      case 'invalid_side':
+        return 'final_gate_block';
+      default:
+        return 'final_gate_block';
+    }
+  }
+
+  gabagoolNoPlacementReasonFromExecution(decision = {}, signal = null) {
+    switch (String(decision?.reason || '')) {
+      case 'paper_trading_disabled':
+        return 'paper_trading_disabled';
+      case 'duplicate_order':
+        return 'duplicate_order';
+      case 'order_size_below_min':
+        return 'order_size_below_min';
+      case 'no_valid_price':
+        return 'no_valid_price';
+      case 'no_valid_token':
+        return 'no_valid_token';
+      case 'final_gate_block':
+        return 'final_gate_block';
+      case 'unknown_placement_block':
+        return 'unknown_placement_block';
+      default:
+        if (!signal?.tokenId) return 'no_valid_token';
+        if (!Number.isFinite(Number(signal?.price)) || Number(signal?.price) <= 0 || Number(signal?.price) >= 1) {
+          return 'no_valid_price';
+        }
+        return 'unknown_placement_block';
+    }
   }
 
   rememberGabagoolOracleSignal(oracleSignal, oracleTarget = null, now = Date.now()) {
@@ -4852,6 +8707,8 @@ class BotEngine {
     oracleSignal = null,
     book = null,
     side = 'buy',
+    price = null,
+    sizeUsd = null,
     expectedEdge = null,
     oracleEventKey = null,
     confirmCheck = null,
@@ -4863,14 +8720,16 @@ class BotEngine {
       tokenId: oracleSignal?.token_id || null,
       outcome: this.gabagoolOutcomeForSignal(oracleSignal, oracleTarget),
       side,
-      price: Number.isFinite(Number(book?.bestAsk))
-        ? Number(book.bestAsk)
-        : Number.isFinite(Number(oracleSignal?.book_after_persistence?.best_ask))
+      price: Number.isFinite(Number(price))
+        ? Number(price)
+        : Number.isFinite(Number(book?.bestAsk))
+          ? Number(book.bestAsk)
+          : Number.isFinite(Number(oracleSignal?.book_after_persistence?.best_ask))
           ? Number(oracleSignal.book_after_persistence.best_ask)
           : Number.isFinite(Number(oracleSignal?.book_after_persistence?.midpoint))
             ? Number(oracleSignal.book_after_persistence.midpoint)
             : null,
-      sizeUsd: this.config.gabagoolMaxPaperOrderUsd,
+      sizeUsd: Number.isFinite(Number(sizeUsd)) ? Number(sizeUsd) : this.config.gabagoolMaxPaperOrderUsd,
       expectedEdge: expectedEdge != null && Number.isFinite(Number(expectedEdge))
         ? Number(expectedEdge)
         : deriveOracleExpectedEdge(oracleSignal),
@@ -4953,6 +8812,7 @@ class BotEngine {
     const oracleSignal = loadOracleSignalFile(this.config.gabagoolSignalPath);
     const oracleTarget = loadOracleTargetFile(this.config.gabagoolTargetPath);
     const now = Date.now();
+    this.resetGabagoolCurrentCycle(now);
     this.lastGabagoolOracleTarget = oracleTarget?.target
       ? JSON.parse(JSON.stringify(oracleTarget.target))
       : null;
@@ -5092,24 +8952,409 @@ class BotEngine {
     const books = new Map();
 
     for (const tokenId of targetTokenIds) {
-      try {
-        const book = await this.cache.getFreshBook(tokenId, 0);
-        this.cache.setBook(tokenId, book);
-        books.set(String(tokenId), book);
-        this.volGuard.update(tokenId, book.midpoint);
-        this.consensus.recordMid(tokenId, book.midpoint);
-      } catch (error) {
-        warn(`[GABAGOOL BOOK FETCH FAILED] token=${shortId(tokenId)} error=${error.message}`);
-      }
+      const book = await this.getGabagoolBook(tokenId, books);
+      if (!book) continue;
+      this.portfolio.setMarkPrice(tokenId, book.midpoint);
+      this.volGuard.update(tokenId, book.midpoint);
+      this.consensus.recordMid(tokenId, book.midpoint);
     }
     this.lastGabagoolBooks = {
       up: books.get(String(oracleTarget.target.BTC_UP_TOKEN_ID || '')) || null,
       down: books.get(String(oracleTarget.target.BTC_DOWN_TOKEN_ID || '')) || null,
     };
+    const lossGuardExitScan = await this.buildGabagoolLossGuardExitScan({ model, books, now });
+    const exposureCapExitScan = await this.buildGabagoolExposureCapExitScan({ model, books, now });
 
     const entryTokenId = String(eligibleOracleSignal?.token_id || '');
     const entryBook = books.get(entryTokenId);
     const entryAsset = this.buildGabagoolSyntheticAsset(oracleTarget, entryTokenId);
+    const idleSignalFallback = eligibleOracleSignal
+      ? {
+        tokenId: eligibleOracleSignal.token_id || null,
+        metadata: {
+          marketSlug: oracleTarget?.target?.slug || null,
+        },
+      }
+      : null;
+    const exitSignals = [];
+    const attemptGabagoolExits = () => {
+      const useLossGuardExitMode = lossGuardExitScan.active;
+      const useExposureCapExitMode = !useLossGuardExitMode && exposureCapExitScan.active;
+      const activeExitScan = useLossGuardExitMode
+        ? lossGuardExitScan
+        : useExposureCapExitMode
+          ? exposureCapExitScan
+          : null;
+      const candidates = activeExitScan ? activeExitScan.candidates : exitSignals;
+      let attempts = 0;
+      let placed = 0;
+      let lastBlockedReason = null;
+      for (const candidate of candidates) {
+        attempts += 1;
+        if (useLossGuardExitMode) {
+          this.recordGabagoolMetric('gabagool_loss_guard_exit_attempted', {
+            tokenId: candidate.signal.tokenId,
+            marketId: candidate.signal.marketId,
+            marketSlug: candidate.signal.metadata?.marketSlug,
+            outcome: candidate.signal.metadata?.outcome,
+            side: candidate.signal.side,
+            price: candidate.signal.price,
+            sizeUsd: candidate.signal.sizeUsd,
+            expectedEdge: candidate.signal.expectedEdge,
+            confidence: candidate.signal.confidence,
+            reason: 'loss_guard_reduce_only',
+            exitMode: lossGuardExitScan.exitMode,
+          });
+        }
+        if (useExposureCapExitMode) {
+          this.recordGabagoolMetric('gabagool_reduce_only_exit_attempted', {
+            tokenId: candidate.signal.tokenId,
+            marketId: candidate.signal.marketId,
+            marketSlug: candidate.signal.metadata?.marketSlug,
+            outcome: candidate.signal.metadata?.outcome,
+            side: candidate.signal.side,
+            price: candidate.signal.price,
+            sizeUsd: candidate.signal.sizeUsd,
+            expectedEdge: candidate.signal.expectedEdge,
+            confidence: candidate.signal.confidence,
+            reason: candidate.candidateReason || candidate.signal.metadata?.gabagool?.exitTrigger || 'exposure_cap_reduce_only',
+            exitMode: exposureCapExitScan.exitMode,
+          });
+        }
+        this.execution.lastPlacementDecision = null;
+        this.trySignal(candidate.signal, candidate.asset, candidate.book);
+        const placedThisAttempt = this.execution.lastPlacementDecision?.placed === true;
+        if (placedThisAttempt) {
+          placed += 1;
+          continue;
+        }
+        lastBlockedReason = this.lastGabagoolPlacementBlockReason ||
+          this.lastGabagoolRiskBlockReason ||
+          this.lastGabagoolSophieBlockReason ||
+          this.lastGabagoolBlockedReason ||
+          'all_exits_blocked';
+        if (useLossGuardExitMode) {
+          this.recordGabagoolMetric('gabagool_loss_guard_exit_blocked', {
+            tokenId: candidate.signal.tokenId,
+            marketId: candidate.signal.marketId,
+            marketSlug: candidate.signal.metadata?.marketSlug,
+            outcome: candidate.signal.metadata?.outcome,
+            side: candidate.signal.side,
+            price: candidate.signal.price,
+            sizeUsd: candidate.signal.sizeUsd,
+            expectedEdge: candidate.signal.expectedEdge,
+            confidence: candidate.signal.confidence,
+            reason: lastBlockedReason,
+            exitMode: lossGuardExitScan.exitMode,
+          });
+        }
+        if (useExposureCapExitMode) {
+          this.recordGabagoolMetric('gabagool_reduce_only_exit_blocked', {
+            tokenId: candidate.signal.tokenId,
+            marketId: candidate.signal.marketId,
+            marketSlug: candidate.signal.metadata?.marketSlug,
+            outcome: candidate.signal.metadata?.outcome,
+            side: candidate.signal.side,
+            price: candidate.signal.price,
+            sizeUsd: candidate.signal.sizeUsd,
+            expectedEdge: candidate.signal.expectedEdge,
+            confidence: candidate.signal.confidence,
+            reason: lastBlockedReason,
+            exitMode: exposureCapExitScan.exitMode,
+          });
+        }
+      }
+      const noExitReason = activeExitScan
+        ? (
+          candidates.length === 0
+            ? (activeExitScan.noExitReason || 'no_position_inventory')
+            : placed > 0
+              ? null
+              : 'all_exits_blocked'
+        )
+        : null;
+      const dominantBlockedReason = activeExitScan?.dominantBlockedReason || null;
+      const blockedReasonSummary = activeExitScan?.blockedReasonSummary || 'none';
+      if (useLossGuardExitMode) {
+        this.updateGabagoolCurrentCycle({
+          decision: placed > 0 ? 'LOSS_GUARD_EXIT_ORDER_PLACED' : 'IDLE:gabagool_loss_guard',
+          idleReason: placed > 0 ? null : 'gabagool_loss_guard',
+          positionsScanned: lossGuardExitScan.positionsScanned,
+          positionsClosable: lossGuardExitScan.positionsClosable,
+          exitsAttempted: attempts,
+          exitsPlaced: placed,
+          exitBlockedReason: lastBlockedReason,
+          dominantExitBlockedReason: dominantBlockedReason,
+          blockedReasonSummary,
+          noExitReason,
+          exitMode: lossGuardExitScan.exitMode,
+        });
+      }
+      if (useExposureCapExitMode) {
+        this.updateGabagoolCurrentCycle({
+          decision: placed > 0 ? 'EXPOSURE_CAP_EXIT_ORDER_PLACED' : 'IDLE:exposure_cap_waiting_for_exit',
+          idleReason: placed > 0 ? null : 'exposure_cap_waiting_for_exit',
+          positionsScanned: exposureCapExitScan.positionsScanned,
+          positionsClosable: exposureCapExitScan.positionsClosable,
+          exitsAttempted: attempts,
+          exitsPlaced: placed,
+          exitBlockedReason: lastBlockedReason,
+          dominantExitBlockedReason: dominantBlockedReason,
+          blockedReasonSummary,
+          noExitReason,
+          exitMode: exposureCapExitScan.exitMode,
+          exposureCapWaitingForExit: true,
+          exitUnfreezeReason: exposureCapExitScan.unfreezeReasonLast,
+          largestExposurePositions: exposureCapExitScan.largestExposurePositions,
+        });
+      }
+      return {
+        attempts,
+        placed,
+        lastBlockedReason,
+        dominantBlockedReason,
+        blockedReasonSummary,
+        noExitReason,
+        activeLossGuardExitMode: useLossGuardExitMode,
+        activeExposureCapExitMode: useExposureCapExitMode,
+        positionsScanned: activeExitScan?.positionsScanned || 0,
+        positionsClosable: activeExitScan?.positionsClosable || 0,
+        exitMode: activeExitScan?.exitMode || null,
+        exitUnfreezeReason: useExposureCapExitMode ? exposureCapExitScan.unfreezeReasonLast : null,
+        largestExposurePositions: useExposureCapExitMode ? exposureCapExitScan.largestExposurePositions : [],
+        totalExposureUsd: useExposureCapExitMode ? exposureCapExitScan.totalExposureUsd : null,
+        maxTotalExposureUsd: useExposureCapExitMode ? exposureCapExitScan.maxTotalExposureUsd : null,
+        excessExposureUsd: useExposureCapExitMode ? exposureCapExitScan.excessExposureUsd : null,
+      };
+    };
+    const maybeLogLossGuardIdle = (exitAttemptSummary, rawSignal = null) => {
+      if (!exitAttemptSummary?.activeLossGuardExitMode || exitAttemptSummary.placed > 0) return;
+      const tokenForLog = rawSignal?.tokenId || lossGuardExitScan.candidates[0]?.signal?.tokenId || null;
+      const marketSlugForLog = rawSignal?.metadata?.marketSlug ||
+        lossGuardExitScan.candidates[0]?.signal?.metadata?.marketSlug ||
+        'unknown';
+      warn(
+        `[GABAGOOL IDLE] reason=gabagool_loss_guard token=${shortId(tokenForLog)} ` +
+        `marketSlug=${marketSlugForLog} exitMode=${lossGuardExitScan.exitMode} ` +
+        `positionsScanned=${exitAttemptSummary.positionsScanned} positionsClosable=${exitAttemptSummary.positionsClosable} ` +
+        `exitsAttempted=${exitAttemptSummary.attempts} noExitReason=${exitAttemptSummary.noExitReason || 'none'} ` +
+        `exitBlockedReason=${exitAttemptSummary.lastBlockedReason || 'none'} ` +
+        `dominantBlockedReason=${exitAttemptSummary.dominantBlockedReason || 'none'} ` +
+        `blockedReasonSummary=${exitAttemptSummary.blockedReasonSummary || 'none'} ` +
+        `closedLossUsd=${cleanLogValue(lossGuardExitScan.lossGuard.closedLossUsd)} ` +
+        `maxClosedLossUsd=${cleanLogValue(lossGuardExitScan.lossGuard.maxClosedLossUsd)}`
+      );
+    };
+    const maybeLogExposureCapIdle = (exitAttemptSummary, rawSignal = null) => {
+      if (!exitAttemptSummary?.activeExposureCapExitMode || exitAttemptSummary.placed > 0) return;
+      const anchorPosition = exitAttemptSummary.largestExposurePositions?.[0] || exposureCapExitScan.largestExposurePositions[0] || null;
+      const tokenForLog = rawSignal?.tokenId || anchorPosition?.tokenId || null;
+      const marketSlugForLog = rawSignal?.metadata?.marketSlug || anchorPosition?.marketSlug || 'unknown';
+      warn(
+        `[GABAGOOL EXPOSURE STALL] reason=exposure_cap_waiting_for_exit token=${shortId(tokenForLog)} ` +
+        `marketSlug=${marketSlugForLog} totalExposureUsd=${fmtMoney(exitAttemptSummary.totalExposureUsd)} ` +
+        `maxTotalExposureUsd=${fmtMoney(exitAttemptSummary.maxTotalExposureUsd)} excessExposureUsd=${fmtMoney(exitAttemptSummary.excessExposureUsd)} ` +
+        `positionsScanned=${exitAttemptSummary.positionsScanned} positionsClosable=${exitAttemptSummary.positionsClosable} ` +
+        `exitsAttempted=${exitAttemptSummary.attempts} exitsPlaced=${exitAttemptSummary.placed} ` +
+        `noExitReason=${exitAttemptSummary.noExitReason || 'none'} ` +
+        `exitBlockedReason=${exitAttemptSummary.lastBlockedReason || 'none'} ` +
+        `dominantBlockedReason=${exitAttemptSummary.dominantBlockedReason || 'none'} ` +
+        `blockedReasonSummary=${exitAttemptSummary.blockedReasonSummary || 'none'} ` +
+        `exitUnfreezeReason=${exitAttemptSummary.exitUnfreezeReason || 'none'}`
+      );
+    };
+    const maybeLogActiveExitIdle = (exitAttemptSummary, rawSignal = null) => {
+      maybeLogLossGuardIdle(exitAttemptSummary, rawSignal);
+      maybeLogExposureCapIdle(exitAttemptSummary, rawSignal);
+    };
+
+    for (const tokenId of targetTokenIds) {
+      const qty = this.portfolio.position(tokenId);
+      if (qty <= 0) continue;
+      const book = books.get(String(tokenId));
+      const asset = this.buildGabagoolSyntheticAsset(oracleTarget, tokenId);
+      if (!book || !asset) continue;
+      const availableSellQty = this.portfolio.availablePositionQty(tokenId);
+      const currentValueUsd = Number.isFinite(Number(book.bestBid)) ? availableSellQty * Number(book.bestBid) : 0;
+      const roundedExitSizeUsd = Math.max(0, Math.round(currentValueUsd * 100) / 100);
+      const minDustExitUsd = Math.max(0.01, Number(this.config.gabagoolMinDustExitUsd || 0.01));
+      const commonSizingDetails = {
+        tokenId: String(tokenId),
+        marketId: String(oracleTarget?.target?.rawMarketId || oracleTarget?.target?.slug || ''),
+        marketSlug: oracleTarget?.target?.slug || null,
+        outcome: String(oracleTarget?.target?.BTC_UP_TOKEN_ID || '') === String(tokenId) ? 'Up' : 'Down',
+        price: Number.isFinite(Number(book.bestBid)) ? Number(book.bestBid) : null,
+        book,
+        positionQty: qty,
+        availableSellQty,
+        currentValueUsd,
+        roundedExitSizeUsd,
+      };
+      if (!(currentValueUsd > 0) || !(roundedExitSizeUsd > 0)) {
+        this.recordGabagoolTinyExitState('gabagool_zero_size_blocked', {
+          ...commonSizingDetails,
+          reason: 'zero_size_candidate',
+          source: !(currentValueUsd > 0) ? 'position_value_non_positive' : 'position_value_rounds_to_zero',
+        }, {
+          oracleTarget,
+          oracleSignal,
+          oracleEventKey: eligibleOracleEventKey,
+        });
+        continue;
+      }
+      if (roundedExitSizeUsd < minDustExitUsd) {
+        this.recordGabagoolTinyExitState('gabagool_dust_position_remaining', {
+          ...commonSizingDetails,
+          reason: 'dust_exit_below_min',
+          source: 'position_value_below_dust_floor',
+        }, {
+          oracleTarget,
+          oracleSignal,
+          oracleEventKey: eligibleOracleEventKey,
+        });
+        continue;
+      }
+
+      const exitPlanResult = buildExitPlan({
+        model,
+        tokenId,
+        positionQty: qty,
+        avgCost: this.portfolio.positionCostDetails(tokenId).avgEntryPrice,
+        lastFillTs: this.lastStrategyFillTs(tokenId, 'GabagoolBtcOracleStrategy'),
+        oracleSignal,
+        oracleTarget,
+        book,
+        now: Date.now(),
+        minEdge: this.config.minSignalEdge,
+        minProfitBuffer: this.config.gabagoolMinProfitBuffer,
+        allowDustExit: this.config.gabagoolAllowDustExits === true,
+        minDustExitUsd: this.config.gabagoolMinDustExitUsd,
+      });
+
+      if (!exitPlanResult.plan) {
+        if (exitPlanResult.blockReason === 'blocked_loss_exit') {
+          this.lastGabagoolBlockedReason = 'blocked_loss_exit';
+          this.lastGabagoolPlacementDecision = 'IDLE:blocked_loss_exit';
+          const blockedLossExitPayload = {
+            tokenId: String(tokenId),
+            marketSlug: commonSizingDetails.marketSlug,
+            outcome: commonSizingDetails.outcome,
+          };
+          const suppression = this.consumeBlockedLossExitSuppression(blockedLossExitPayload, Date.now());
+          this.recordGabagoolMetric('gabagool_blocked_loss_exit', {
+            ...commonSizingDetails,
+            side: 'sell',
+            sizeUsd: roundedExitSizeUsd,
+            reason: 'blocked_loss_exit',
+            avgEntryPrice: exitPlanResult.avgEntryPrice,
+            price: exitPlanResult.sellPrice,
+          });
+          if (suppression.suppressed) {
+            this.recordGabagoolMetric('gabagool_blocked_loss_exit_repeat', {
+              ...commonSizingDetails,
+              side: 'sell',
+              sizeUsd: roundedExitSizeUsd,
+              reason: 'blocked_loss_exit',
+              avgEntryPrice: exitPlanResult.avgEntryPrice,
+              price: exitPlanResult.sellPrice,
+              source: 'suppressed_repeat',
+            });
+          }
+          this.recordGabagoolMetric('gabagool_placement_decision', {
+            tokenId: String(tokenId),
+            marketId: commonSizingDetails.marketId,
+            marketSlug: commonSizingDetails.marketSlug,
+            outcome: commonSizingDetails.outcome,
+            side: 'sell',
+            price: exitPlanResult.sellPrice,
+            sizeUsd: roundedExitSizeUsd,
+            reason: this.lastGabagoolPlacementDecision,
+          });
+          if (!suppression.suppressed) {
+            warn(
+              `[GABAGOOL CAPITAL PROTECTION] reason=blocked_loss_exit token=${shortId(tokenId)} ` +
+              `marketSlug=${commonSizingDetails.marketSlug || 'unknown'} avgEntry=${fmtPrice(exitPlanResult.avgEntryPrice)} ` +
+              `sellPrice=${fmtPrice(exitPlanResult.sellPrice)} minProfitPrice=${fmtPrice(exitPlanResult.minProfitPrice)}`
+            );
+            this.emitGabagoolUpdate('risk_blocked', {
+              strategy: 'GabagoolBtcOracleStrategy',
+              marketSlug: commonSizingDetails.marketSlug,
+              marketQuestion: asset?.market?.question || null,
+              tokenId: String(tokenId),
+              outcome: commonSizingDetails.outcome,
+              side: 'sell',
+              price: exitPlanResult.sellPrice,
+              sizeUsd: roundedExitSizeUsd,
+              blockReason: 'blocked_loss_exit',
+              avgEntryPrice: exitPlanResult.avgEntryPrice,
+              sophieDecision: 'NOT_RUN',
+              riskDecision: 'BLOCK:blocked_loss_exit',
+              oracleEventKey: eligibleOracleEventKey,
+            });
+          }
+        }
+        if (exitPlanResult.blockReason === 'zero_size_candidate' || exitPlanResult.blockReason === 'dust_exit_below_min') {
+          const commonBlockDetails = {
+            ...commonSizingDetails,
+            reason: exitPlanResult.blockReason,
+            source: exitPlanResult.source || null,
+            currentValueUsd: Number.isFinite(Number(exitPlanResult.currentValueUsd))
+              ? Number(exitPlanResult.currentValueUsd)
+              : currentValueUsd,
+            roundedExitSizeUsd: Number.isFinite(Number(exitPlanResult.roundedExitSizeUsd))
+              ? Number(exitPlanResult.roundedExitSizeUsd)
+              : roundedExitSizeUsd,
+          };
+          if (exitPlanResult.blockReason === 'zero_size_candidate') {
+            this.recordGabagoolTinyExitState('gabagool_zero_size_blocked', commonBlockDetails, {
+              oracleTarget,
+              oracleSignal,
+              oracleEventKey: eligibleOracleEventKey,
+            });
+          }
+          if (exitPlanResult.blockReason === 'dust_exit_below_min') {
+            this.recordGabagoolTinyExitState('gabagool_dust_position_remaining', commonBlockDetails, {
+              oracleTarget,
+              oracleSignal,
+              oracleEventKey: eligibleOracleEventKey,
+            });
+          }
+        }
+        continue;
+      }
+
+      exitSignals.push({
+        signal: new Signal({
+          strategy: 'GabagoolBtcOracleStrategy',
+          tokenId: exitPlanResult.plan.tokenId,
+          marketId: exitPlanResult.plan.marketId,
+          side: exitPlanResult.plan.side,
+          price: exitPlanResult.plan.price,
+          sizeUsd: exitPlanResult.plan.sizeUsd,
+          expectedEdge: exitPlanResult.plan.expectedEdge,
+          confidence: exitPlanResult.plan.confidence,
+          reason: exitPlanResult.plan.reason,
+          exitPlan: exitPlanResult.plan.exitPlan,
+          ttlMs: exitPlanResult.plan.ttlMs,
+          maxHoldMs: exitPlanResult.plan.maxHoldMs,
+          metadata: {
+            marketSlug: exitPlanResult.plan.marketSlug,
+            marketQuestion: exitPlanResult.plan.marketQuestion,
+            outcome: exitPlanResult.plan.outcome,
+            gabagool: {
+              oracleSignalFresh: Date.parse(String(oracleSignal?.expires_at || '')) > Date.now(),
+              direction: exitPlanResult.plan.metadata.direction,
+              secondsIntoWindow: exitPlanResult.plan.metadata.secondsIntoWindow,
+              exitIntent: true,
+              exitTrigger: exitPlanResult.plan.metadata.trigger,
+              sourceWallet: exitPlanResult.plan.metadata.sourceWallet,
+            },
+          },
+        }),
+        asset,
+        book,
+      });
+    }
 
     if (eligibleOracleSignal) {
       const currentPositionUsd = entryBook && Number.isFinite(Number(entryBook.midpoint))
@@ -5126,7 +9371,9 @@ class BotEngine {
         minEdge: this.config.minSignalEdge,
         minExpectedEdge: this.config.gabagoolMinExpectedEdge,
         minPrice: this.config.gabagoolMinPrice,
+        maxEntryPrice: this.config.gabagoolMaxEntryPrice,
         maxPrice: this.config.gabagoolMaxPrice,
+        allowHighPriceEntryEdge: this.config.gabagoolAllowHighPriceEntryEdge,
         maxSpread: Math.min(this.config.hunterMaxSpread, 0.12),
         depthFloorUsd: Math.max(this.config.hunterMinTopDepthUsd, 5),
       });
@@ -5173,23 +9420,175 @@ class BotEngine {
           expectedEdge: rawSignal.expectedEdge,
           confidence: rawSignal.confidence,
         });
-        this.emitGabagoolUpdate('candidate_ready', {
-          strategy: rawSignal.strategy,
-          marketSlug: entryPlanResult.plan.marketSlug,
-          marketQuestion: entryPlanResult.plan.marketQuestion,
-          tokenId: rawSignal.tokenId,
-          outcome: entryPlanResult.plan.outcome,
-          side: rawSignal.side,
-          price: rawSignal.price,
-          sizeUsd: rawSignal.sizeUsd,
-          expectedEdge: rawSignal.expectedEdge,
-          confidence: rawSignal.confidence,
-          sophieDecision: 'NOT_RUN',
-          riskDecision: 'NOT_RUN',
-          oracleEventKey: eligibleOracleEventKey,
-        });
-        this.trySignal(rawSignal, entryAsset, entryBook);
+        const entryGuard = this.gabagoolEntryGuard(rawSignal, this.cache.markPrices(), now);
+        if (entryGuard.blocked) {
+          const exitAttemptSummary = attemptGabagoolExits();
+          this.lastGabagoolBlockedReason = entryGuard.reason;
+          this.lastGabagoolPlacementDecision = `IDLE:${entryGuard.reason}`;
+          if (entryGuard.reason === 'gabagool_loss_guard') {
+            this.recordGabagoolMetric('gabagool_entry_paused', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: entryGuard.reason,
+            });
+          } else if (entryGuard.reason === 'gabagool_same_market_direction_guard') {
+            this.recordGabagoolMetric('gabagool_same_market_direction_blocked', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: entryGuard.reason,
+            });
+          } else if (entryGuard.reason === 'gabagool_reentry_guard' || entryGuard.reason === 'gabagool_market_lockout') {
+            this.recordGabagoolMetric('gabagool_reentry_blocked', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: entryGuard.reason,
+            });
+          } else if (entryGuard.reason === 'gabagool_churn_guard') {
+            this.recordGabagoolMetric('gabagool_churn_blocked', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: entryGuard.reason,
+            });
+          } else if (entryGuard.reason === 'gabagool_high_price_entry_guard') {
+            this.recordGabagoolMetric('gabagool_high_price_entry_blocked', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: entryGuard.reason,
+            });
+          } else if (entryGuard.reason === 'gabagool_mixed_mode_pace') {
+            this.recordGabagoolMetric('gabagool_placement_blocked', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: entryGuard.reason,
+            });
+          }
+          this.recordGabagoolMetric('gabagool_placement_decision', {
+            tokenId: rawSignal.tokenId,
+            marketId: rawSignal.marketId,
+            marketSlug: rawSignal.metadata?.marketSlug,
+            outcome: rawSignal.metadata?.outcome,
+            side: rawSignal.side,
+            price: rawSignal.price,
+            sizeUsd: rawSignal.sizeUsd,
+            expectedEdge: rawSignal.expectedEdge,
+            confidence: rawSignal.confidence,
+            reason: this.lastGabagoolPlacementDecision,
+          });
+          warn(
+            `[GABAGOOL IDLE] reason=${entryGuard.reason} token=${shortId(rawSignal.tokenId)} ` +
+            `marketSlug=${rawSignal.metadata?.marketSlug || 'unknown'} exitsAttempted=${exitAttemptSummary.attempts} ` +
+            `${Object.entries(entryGuard)
+              .filter(([key, value]) => !['blocked', 'reason'].includes(key) && value != null)
+              .map(([key, value]) => `${key}=${cleanLogValue(value)}`)
+              .join(' ')}`
+          );
+          maybeLogActiveExitIdle(exitAttemptSummary, rawSignal);
+        } else {
+          const exposureBreakdown = this.risk.exposureBreakdown(rawSignal);
+          if (exposureBreakdown.wouldTotalExposureUsd > this.config.maxTotalExposureUsd) {
+            const exitAttemptSummary = attemptGabagoolExits();
+            this.lastGabagoolBlockedReason = 'exposure_cap_waiting_for_exit';
+            this.lastGabagoolRiskBlockReason = 'max_total_exposure';
+            this.lastGabagoolPlacementDecision = 'IDLE:exposure_cap_waiting_for_exit';
+            this.recordGabagoolMetric('gabagool_placement_decision', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: this.lastGabagoolPlacementDecision,
+              ...exposureBreakdown,
+            });
+            warn(
+              `[GABAGOOL IDLE] reason=exposure_cap_waiting_for_exit token=${shortId(rawSignal.tokenId)} ` +
+              `marketSlug=${rawSignal.metadata?.marketSlug || 'unknown'} exitsAttempted=${exitAttemptSummary.attempts} ` +
+              `${formatRiskBlockDetails(exposureBreakdown)}`
+            );
+            maybeLogActiveExitIdle(exitAttemptSummary, rawSignal);
+          } else {
+            this.emitGabagoolUpdate('candidate_ready', {
+              strategy: rawSignal.strategy,
+              marketSlug: entryPlanResult.plan.marketSlug,
+              marketQuestion: entryPlanResult.plan.marketQuestion,
+              tokenId: rawSignal.tokenId,
+              outcome: entryPlanResult.plan.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              sophieDecision: 'NOT_RUN',
+              riskDecision: 'NOT_RUN',
+              oracleEventKey: eligibleOracleEventKey,
+            });
+            this.trySignal(rawSignal, entryAsset, entryBook);
+            maybeLogActiveExitIdle(
+          attemptGabagoolExits(),
+          rawSignal || idleSignalFallback
+        );
+          }
+        }
       } else if (entryPlanResult.blockReason) {
+        if (entryPlanResult.blockReason === 'gabagool_high_price_entry_guard') {
+          this.recordGabagoolMetric('gabagool_high_price_entry_blocked', {
+            tokenId: eligibleOracleSignal?.token_id,
+            marketId: oracleTarget?.target?.rawMarketId || oracleTarget?.target?.slug || null,
+            marketSlug: oracleTarget?.target?.slug || null,
+            outcome: this.gabagoolOutcomeForSignal(eligibleOracleSignal, oracleTarget),
+            side: 'buy',
+            price: entryBook?.bestAsk,
+            sizeUsd: this.config.gabagoolMaxPaperOrderUsd,
+            expectedEdge: entryPlanResult.expectedEdge,
+            confidence: eligibleOracleSignal?.confidence,
+            reason: entryPlanResult.blockReason,
+          });
+        }
         this.logGabagoolPresophieBlock(
           entryPlanResult.blockReason,
           this.gabagoolPresophiePayload({
@@ -5199,65 +9598,28 @@ class BotEngine {
             oracleEventKey: eligibleOracleEventKey,
           })
         );
+        maybeLogActiveExitIdle(
+          attemptGabagoolExits(),
+          idleSignalFallback
+        );
+      } else {
+        maybeLogActiveExitIdle(
+          attemptGabagoolExits(),
+          idleSignalFallback
+        );
       }
-    }
-
-    for (const tokenId of targetTokenIds) {
-      const qty = this.portfolio.position(tokenId);
-      if (qty <= 0) continue;
-      const book = books.get(String(tokenId));
-      const asset = this.buildGabagoolSyntheticAsset(oracleTarget, tokenId);
-      if (!book || !asset) continue;
-
-      const exitPlanResult = buildExitPlan({
-        model,
-        tokenId,
-        positionQty: qty,
-        avgCost: this.portfolio.avgCost(tokenId),
-        lastFillTs: this.lastStrategyFillTs(tokenId, 'GabagoolBtcOracleStrategy'),
-        oracleSignal,
-        oracleTarget,
-        book,
-        now: Date.now(),
-        minEdge: this.config.minSignalEdge,
-      });
-
-      if (!exitPlanResult.plan) continue;
-
-      const exitSignal = new Signal({
-        strategy: 'GabagoolBtcOracleStrategy',
-        tokenId: exitPlanResult.plan.tokenId,
-        marketId: exitPlanResult.plan.marketId,
-        side: exitPlanResult.plan.side,
-        price: exitPlanResult.plan.price,
-        sizeUsd: exitPlanResult.plan.sizeUsd,
-        expectedEdge: exitPlanResult.plan.expectedEdge,
-        confidence: exitPlanResult.plan.confidence,
-        reason: exitPlanResult.plan.reason,
-        exitPlan: exitPlanResult.plan.exitPlan,
-        ttlMs: exitPlanResult.plan.ttlMs,
-        maxHoldMs: exitPlanResult.plan.maxHoldMs,
-        metadata: {
-          marketSlug: exitPlanResult.plan.marketSlug,
-          marketQuestion: exitPlanResult.plan.marketQuestion,
-          outcome: exitPlanResult.plan.outcome,
-          gabagool: {
-            oracleSignalFresh: Date.parse(String(oracleSignal?.expires_at || '')) > Date.now(),
-            direction: exitPlanResult.plan.metadata.direction,
-            secondsIntoWindow: exitPlanResult.plan.metadata.secondsIntoWindow,
-            exitIntent: true,
-            exitTrigger: exitPlanResult.plan.metadata.trigger,
-            sourceWallet: exitPlanResult.plan.metadata.sourceWallet,
-          },
-        },
-      });
-      this.trySignal(exitSignal, asset, book);
+    } else {
+      maybeLogActiveExitIdle(attemptGabagoolExits());
     }
   }
 
   buildBtcOracleReport(markPrices = this.cache.markPrices(), now = Date.now()) {
+    this.syncPortfolioMarks(markPrices);
     const health = this.portfolio.executionHealth(now);
     const ledger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
+    const standardLedger = this.portfolio.strategyLedger((strategy) => !isBtcOracleStrategy(strategy), markPrices, now);
+    const spreadHunterLedger = this.portfolio.strategyLedger((strategy) => resolveStrategyName(strategy) === 'SpreadHunter', markPrices, now);
+    const strategyPnlBreakdown = this.portfolio.pnlBreakdownByStrategy(markPrices, now);
     const hourAgo = now - 60 * 60_000;
     const recentEvents = this.portfolio.executionEvents.filter((event) => (
       Number(event.ts) >= hourAgo && isBtcOracleStrategy(event.strategy)
@@ -5275,6 +9637,7 @@ class BotEngine {
         event.type === 'gabagool_presophie_block' ||
         event.type === 'gabagool_sophie_blocked' ||
         event.type === 'gabagool_risk_blocked' ||
+        event.type === 'gabagool_placement_blocked' ||
         event.type === 'gabagool_duplicate_oracle_signal'
       )
     ));
@@ -5298,6 +9661,7 @@ class BotEngine {
     const averageTimeToFillSec = averageFinite(
       fillEvents.map((event) => Number(event.timeToFillSec))
     );
+    const fillSourceCountsLastHour = health.fillCountsBySourceLastHour || fillSourceCountsObject(fillEvents);
 
     const target = this.lastGabagoolOracleTarget || null;
     const lastSignal = this.lastGabagoolOracleSignal || null;
@@ -5362,6 +9726,30 @@ class BotEngine {
       Number(this.config.maxTotalExposureUsd),
     ].filter((value) => Number.isFinite(value) && value > 0);
     const currentExposureCapUsd = capCandidates.length > 0 ? Math.min(...capCandidates) : null;
+    const portfolioExposure = this.portfolio.portfolioExposureBreakdown(markPrices);
+    const riskExposure = this.risk.exposureBreakdown();
+    const gabagoolNetPnl = this.gabagoolNetPnl(ledger);
+    const gabagoolDrawdownPct = this.gabagoolDrawdownPct(ledger);
+    const gabagoolClosedLossUsd = Math.max(0, -Number(ledger.closedPnl || 0));
+    const gabagoolEntriesPaused = this.config.gabagoolPauseEntriesOnLoss === true && (
+      gabagoolDrawdownPct > Number(this.config.gabagoolMaxPaperDrawdownPct || 0) ||
+      gabagoolClosedLossUsd > Number(this.config.gabagoolMaxPaperClosedLossUsd || 0)
+    );
+    const roundTripsLastHour = (ledger.roundTrips || []).filter((trip) => Number(trip.exitTs || 0) >= hourAgo);
+    const gabagoolAvgRoundTripPnl = roundTripsLastHour.length > 0
+      ? roundTripsLastHour.reduce((sum, trip) => sum + Number(trip.realizedPnl || 0), 0) / roundTripsLastHour.length
+      : null;
+    const dustPositions = perTokenExposure.filter((item) => (
+      Number(item.positionExposureUsd || 0) > 0 &&
+      Number(item.positionExposureUsd || 0) < Number(this.config.minOrderUsd || 0)
+    ));
+    const riskExposureUsd = Number(riskExposure.riskTotalExposureUsd || 0);
+    const portfolioExposureUsd = Number(portfolioExposure.totalExposureUsd || 0);
+    const btcOracleExposureUsd = Number(ledger.totalExposureUsd || 0);
+    const exposureMismatchUsd = riskExposureUsd - portfolioExposureUsd;
+    const exposureMismatchReason = Math.abs(exposureMismatchUsd) <= 0.01
+      ? 'none_formulas_aligned_latest_mark_or_avg_cost_plus_open_buys'
+      : 'portfolio_and_risk_formulas_diverged';
 
     const marketStartMs = Number.isFinite(Number(target?.ts)) ? Number(target.ts) * 1000 : null;
     const marketEndMs = marketStartMs == null ? null : marketStartMs + (5 * 60_000);
@@ -5378,6 +9766,16 @@ class BotEngine {
         enableGabagoolBtcImitation: this.config.enableGabagoolBtcImitation === true,
         enableBtcOraclePaperTrading: btcOraclePaperTradingFlag,
         telegramUpdatesEnabled: this.config.gabagoolTelegramUpdates === true,
+        globalMinConfidence: Number(this.config.minConfidence),
+        gabagoolMinConfidencePaper: Number(this.config.gabagoolMinConfidence),
+        gabagoolMinConfidenceLive: Number(this.config.gabagoolMinConfidenceLive),
+        gabagoolActiveConfidenceMode: this.config.enableLiveTrading === true ? 'live' : 'paper',
+        gabagoolActiveMinConfidence: this.config.enableLiveTrading === true
+          ? Math.max(Number(this.config.minConfidence), Number(this.config.gabagoolMinConfidenceLive))
+          : Number(this.config.gabagoolMinConfidence),
+        gabagoolEntriesPaused,
+        gabagoolEntryPauseReason: gabagoolEntriesPaused ? 'gabagool_loss_guard' : 'none',
+        gabagoolDrawdownPct,
         liveFlags: {
           enableLiveTrading: this.config.enableLiveTrading === true,
           liveAutoExecute: this.config.liveAutoExecute === true,
@@ -5405,27 +9803,73 @@ class BotEngine {
       },
       pipelineStats: {
         gabagoolCandidatesBuiltLastHour: health.gabagoolCandidatesBuiltLastHour,
+        gabagoolZeroSizeBlockedLastHour: health.gabagoolZeroSizeBlockedLastHour,
         gabagoolSophieEvaluatedLastHour: health.gabagoolSophieEvaluatedLastHour,
         gabagoolSophieAdmittedLastHour: health.gabagoolSophieAdmittedLastHour,
         gabagoolSophieBlockedLastHour: health.gabagoolSophieBlockedLastHour,
         gabagoolRiskEvaluatedLastHour: health.gabagoolRiskEvaluatedLastHour,
         gabagoolRiskAdmittedLastHour: health.gabagoolRiskAdmittedLastHour,
         gabagoolRiskBlockedLastHour: health.gabagoolRiskBlockedLastHour,
+        gabagoolPlacementAttemptedLastHour: health.gabagoolPlacementAttemptedLastHour,
+        gabagoolPlacementBlockedLastHour: health.gabagoolPlacementBlockedLastHour,
         gabagoolOrdersPlacedLastHour: health.gabagoolOrdersPlacedLastHour,
         gabagoolFillsLastHour: health.gabagoolFillsLastHour,
         gabagoolExitsLastHour: health.gabagoolExitsLastHour,
+        gabagoolRepeatedSameMarketSameTokenEntriesLastHour: health.gabagoolRepeatedSameMarketSameTokenEntriesLastHour,
         gabagoolTelegramSuppressedLastHour: health.gabagoolTelegramSuppressedLastHour,
+        gabagoolChurnBlocksLastHour: health.gabagoolChurnBlocksLastHour,
+        gabagoolSameMarketDirectionBlocksLastHour: health.gabagoolSameMarketDirectionBlocksLastHour,
+        gabagoolStaleDustIgnoredLastHour: health.gabagoolStaleDustIgnoredLastHour,
+        gabagoolSameMarketUnknownDirectionIgnoredLastHour: health.gabagoolSameMarketUnknownDirectionIgnoredLastHour,
+        gabagoolReentryBlocksLastHour: health.gabagoolReentryBlocksLastHour,
+        gabagoolHighPriceEntryBlocksLastHour: health.gabagoolHighPriceEntryBlocksLastHour,
+        gabagoolPlacementBlockReasonLast: health.gabagoolPlacementBlockReasonLast || this.lastGabagoolPlacementBlockReason || null,
+        gabagoolLastRiskBlockReason: health.gabagoolLastRiskBlockReason || this.lastGabagoolRiskBlockReason || null,
+        gabagoolLastSophieBlockReason: health.gabagoolLastSophieBlockReason || this.lastGabagoolSophieBlockReason || null,
+        gabagoolLastPlacementDecision: health.gabagoolLastPlacementDecision || this.lastGabagoolPlacementDecision || null,
+        gabagoolMarketLockoutReasonLast: health.gabagoolMarketLockoutReasonLast || this.lastGabagoolMarketLockoutReason || null,
+        gabagoolZeroSizeSourceLast: health.gabagoolZeroSizeSourceLast || null,
+      },
+      exitStats: {
+        gabagoolDustExitsLastHour: health.gabagoolDustExitsLastHour,
+        gabagoolDustExitsSuppressedLastHour: health.gabagoolDustExitsSuppressedLastHour,
+        gabagoolDustExitAllowedLastHour: health.gabagoolDustExitAllowedLastHour,
+        gabagoolDustPositionRemainingLastHour: health.gabagoolDustPositionRemainingLastHour,
+        gabagoolProfitExitsLastHour: health.gabagoolProfitExitsLastHour,
+        gabagoolLossExitsLastHour: health.gabagoolLossExitsLastHour,
+        gabagoolLossExitBlocksLastHour: health.gabagoolLossExitBlocksLastHour,
+        gabagoolRepeatedBlockedLossExitCountLastHour: health.gabagoolRepeatedBlockedLossExitCountLastHour,
+        gabagoolInventoryReducesLastHour: health.gabagoolInventoryReducesLastHour,
+        gabagoolInvalidZeroSizeLastHour: health.gabagoolInvalidZeroSizeLastHour,
+        gabagoolLastExitClassification: health.gabagoolLastExitClassification || null,
+        gabagoolLastExitPnl: health.gabagoolLastExitPnl == null ? null : Number(health.gabagoolLastExitPnl),
+        lastExitAvgEntry: health.lastExitAvgEntry == null ? null : Number(health.lastExitAvgEntry),
+        lastExitSellPrice: health.lastExitSellPrice == null ? null : Number(health.lastExitSellPrice),
       },
       pnl: {
         btcOraclePaperClosedPnl: Number(ledger.closedPnl || 0),
         btcOraclePaperOpenPnl: Number(ledger.openPnl || 0),
         btcOraclePaperRealizedPnl: Number(ledger.realizedPnl || 0),
         btcOraclePaperUnrealizedPnl: Number(ledger.unrealizedPnl || 0),
+        trustedClosedPnl: Number(ledger.trustedClosedPnl || 0),
+        untrustedClosedPnl: Number(ledger.untrustedClosedPnl || 0),
+        trustedOpenPnl: Number(ledger.trustedOpenPnl || 0),
+        untrustedOpenPnl: Number(ledger.untrustedOpenPnl || 0),
+        gabagoolPaperClosedPnl: Number(ledger.closedPnl || 0),
+        gabagoolPaperUnrealizedPnl: Number(ledger.unrealizedPnl || 0),
+        gabagoolPaperNetPnl: gabagoolNetPnl,
+        spreadHunterPaperClosedPnl: Number(spreadHunterLedger.closedPnl || 0),
+        spreadHunterPaperOpenPnl: Number(spreadHunterLedger.openPnl || 0),
+        spreadHunterTrustedClosedPnl: Number(spreadHunterLedger.trustedClosedPnl || 0),
+        spreadHunterTrustedOpenPnl: Number(spreadHunterLedger.trustedOpenPnl || 0),
         btcOraclePaperEquityContribution: Number(ledger.equityContribution || 0),
         btcOraclePaperGrossBuyUsd: Number(ledger.grossBuyUsd || 0),
         btcOraclePaperGrossSellUsd: Number(ledger.grossSellUsd || 0),
         btcOraclePaperFeesEstimate: Number(ledger.feesEstimate || 0),
         btcOraclePaperNetAfterFeesEstimate: Number(ledger.netAfterFeesEstimate || 0),
+        pnlByStrategy: strategyPnlBreakdown.pnlByStrategy,
+        trustedPnlByStrategy: strategyPnlBreakdown.trustedPnlByStrategy,
+        untrustedPnlByStrategy: strategyPnlBreakdown.untrustedPnlByStrategy,
       },
       exposure: {
         currentBtcOraclePositionExposureUsd: Number(ledger.currentPositionExposureUsd || 0),
@@ -5442,12 +9886,26 @@ class BotEngine {
           maxMarketExposureUsd: Number(this.config.maxMarketExposureUsd || 0),
           maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
         },
+        audit: {
+          riskExposureUsd,
+          portfolioExposureUsd,
+          btcOracleExposureUsd,
+          exposureMismatchUsd,
+          exposureMismatchReason,
+          maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
+          exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
+        },
       },
       tradeQuality: {
         averageBtcOracleEntryPrice: ledger.averageEntryPrice,
         averageBtcOracleExitPrice: ledger.averageExitPrice,
         averageHoldSeconds: ledger.averageHoldSeconds,
         averageTimeToFillSeconds: averageTimeToFillSec,
+        gabagoolRoundTripsLastHour: roundTripsLastHour.length,
+        gabagoolAvgRoundTripPnl,
+        gabagoolWinCount: Number(ledger.winCount || 0),
+        gabagoolLossCount: Number(ledger.lossCount || 0),
+        gabagoolDustExitPnl: Number(ledger.dustExitPnl || 0),
         fillRateLastHour: health.gabagoolOrdersPlacedLastHour > 0
           ? (health.gabagoolFillsLastHour / health.gabagoolOrdersPlacedLastHour) * 100
           : 0,
@@ -5457,6 +9915,33 @@ class BotEngine {
         mostCommonBlockedReason,
         priceSanityBlocksLastHour: blockedEvents.filter((event) => event.reason === 'invalid_price').length,
         zeroEdgeBlocksLastHour: blockedEvents.filter((event) => event.reason === 'expected_edge_zero').length,
+      },
+      fillRealism: {
+        paperRealisticFills: this.config.paperRealisticFills === true,
+        avgFillDelayMs: health.avgFillDelayMs,
+        avgTimeToFillSec: health.avgTimeToFillSec,
+        zeroSecondFillCountLastHour: health.zeroSecondFillCountLastHour,
+        invalidOrUntrustedFillCountLastHour: health.invalidOrUntrustedFillCountLastHour,
+        trustedFillCountLastHour: health.trustedFillCountLastHour,
+        untrustedFillCountLastHour: health.untrustedFillCountLastHour,
+        fillCountsBySourceLastHour: fillSourceCountsLastHour,
+        orderRealismBlocksLastHour: health.orderRealismBlocksLastHour,
+        lastFillAudit: health.lastFillAudit,
+      },
+      spreadHunterStatus: {
+        closedPnl: Number(spreadHunterLedger.closedPnl || 0),
+        openPnl: Number(spreadHunterLedger.openPnl || 0),
+        trustedClosedPnl: Number(spreadHunterLedger.trustedClosedPnl || 0),
+        trustedOpenPnl: Number(spreadHunterLedger.trustedOpenPnl || 0),
+        untrustedClosedPnl: Number(spreadHunterLedger.untrustedClosedPnl || 0),
+        untrustedOpenPnl: Number(spreadHunterLedger.untrustedOpenPnl || 0),
+        ordersPlacedLastHour: Number(health.strategyOrderCountsLastHour?.SpreadHunter || 0),
+        fillsLastHour: Number(health.strategyFillCountsLastHour?.SpreadHunter || 0),
+        blockedByGhostLastHour: health.spreadHunterGhostBlocksLastHour,
+        blockedBySophieLastHour: health.spreadHunterSophieBlocksLastHour,
+        blockedByConfidenceLastHour: health.spreadHunterConfidenceBlocksLastHour,
+        blockedByCooldownLastHour: health.spreadHunterCooldownBlocksLastHour,
+        blockedByExecutionRealismLastHour: health.spreadHunterExecutionRealismBlocksLastHour,
       },
       marketSnapshot: {
         marketSlug: target?.slug || null,
@@ -5472,6 +9957,10 @@ class BotEngine {
         oracleThreshold: Number.isFinite(Number(this.config.btcOracleThreshold)) ? Number(this.config.btcOracleThreshold) : null,
         persistenceMs: Number.isFinite(Number(this.config.btcOraclePersistenceMs)) ? Number(this.config.btcOraclePersistenceMs) : null,
         persistenceMinPct: Number.isFinite(Number(this.config.btcOraclePersistenceMinPct)) ? Number(this.config.btcOraclePersistenceMinPct) : null,
+      },
+      dust: {
+        gabagoolDustPositionsCount: dustPositions.length,
+        gabagoolDustValueUsd: dustPositions.reduce((sum, item) => sum + Number(item.positionExposureUsd || 0), 0),
       },
     };
   }
@@ -5490,6 +9979,18 @@ class BotEngine {
       `LIVE_KILL_SWITCH=${formatBool(report.strategyStatus.liveFlags.liveKillSwitch)} ` +
       `LIVE_DRY_RUN_ONLY=${formatBool(report.strategyStatus.liveFlags.liveDryRunOnly)} ` +
       `LIVE_SUBMIT_CONFIRM=${formatBool(report.strategyStatus.liveFlags.liveSubmitConfirm)}`
+    );
+    lines.push(
+      `Confidence Floors: global=${fmtCount(report.strategyStatus.globalMinConfidence, 3)} ` +
+      `gabagoolPaper=${fmtCount(report.strategyStatus.gabagoolMinConfidencePaper, 3)} ` +
+      `gabagoolLive=${fmtCount(report.strategyStatus.gabagoolMinConfidenceLive, 3)} ` +
+      `activeMode=${report.strategyStatus.gabagoolActiveConfidenceMode} ` +
+      `activeGabagoolMin=${fmtCount(report.strategyStatus.gabagoolActiveMinConfidence, 3)}`
+    );
+    lines.push(
+      `Entry Guard: gabagoolEntriesPaused=${formatBool(report.strategyStatus.gabagoolEntriesPaused)} ` +
+      `gabagoolEntryPauseReason=${report.strategyStatus.gabagoolEntryPauseReason || 'none'} ` +
+      `gabagoolDrawdownPct=${fmtCount(report.strategyStatus.gabagoolDrawdownPct, 2)}`
     );
     lines.push(
       `Signals 1h: read=${report.signalStats.oracleSignalsReadLastHour} ` +
@@ -5514,20 +10015,58 @@ class BotEngine {
     );
     lines.push(
       `Pipeline 1h: candidates=${report.pipelineStats.gabagoolCandidatesBuiltLastHour} ` +
+      `zeroSizeBlocked=${report.pipelineStats.gabagoolZeroSizeBlockedLastHour} ` +
       `sophieEval=${report.pipelineStats.gabagoolSophieEvaluatedLastHour} ` +
       `sophieAdmit=${report.pipelineStats.gabagoolSophieAdmittedLastHour} ` +
       `sophieBlock=${report.pipelineStats.gabagoolSophieBlockedLastHour} ` +
       `riskEval=${report.pipelineStats.gabagoolRiskEvaluatedLastHour} ` +
       `riskAdmit=${report.pipelineStats.gabagoolRiskAdmittedLastHour} ` +
       `riskBlock=${report.pipelineStats.gabagoolRiskBlockedLastHour} ` +
+      `placementAttempt=${report.pipelineStats.gabagoolPlacementAttemptedLastHour} ` +
+      `placementBlock=${report.pipelineStats.gabagoolPlacementBlockedLastHour} ` +
+      `churnBlocks=${report.pipelineStats.gabagoolChurnBlocksLastHour} ` +
+      `sameMarketDirectionBlocks=${report.pipelineStats.gabagoolSameMarketDirectionBlocksLastHour} ` +
+      `staleDustIgnored=${report.pipelineStats.gabagoolStaleDustIgnoredLastHour} ` +
+      `unknownDirectionIgnored=${report.pipelineStats.gabagoolSameMarketUnknownDirectionIgnoredLastHour} ` +
+      `reentryBlocks=${report.pipelineStats.gabagoolReentryBlocksLastHour} ` +
+      `highPriceEntryBlocks=${report.pipelineStats.gabagoolHighPriceEntryBlocksLastHour} ` +
       `orders=${report.pipelineStats.gabagoolOrdersPlacedLastHour} ` +
       `fills=${report.pipelineStats.gabagoolFillsLastHour} ` +
       `exits=${report.pipelineStats.gabagoolExitsLastHour} ` +
+      `repeatSameTokenEntries=${report.pipelineStats.gabagoolRepeatedSameMarketSameTokenEntriesLastHour} ` +
       `telegramSuppressed=${report.pipelineStats.gabagoolTelegramSuppressedLastHour}`
+    );
+    lines.push(
+      `Exit Stats: dustExits=${report.exitStats.gabagoolDustExitsLastHour} ` +
+      `dustExitsSuppressed=${report.exitStats.gabagoolDustExitsSuppressedLastHour} ` +
+      `dustExitAllowed=${report.exitStats.gabagoolDustExitAllowedLastHour} ` +
+      `dustPositionRemaining=${report.exitStats.gabagoolDustPositionRemainingLastHour} ` +
+      `profitExits=${report.exitStats.gabagoolProfitExitsLastHour} ` +
+      `lossExits=${report.exitStats.gabagoolLossExitsLastHour} ` +
+      `lossExitBlocks=${report.exitStats.gabagoolLossExitBlocksLastHour} ` +
+      `repeatedLossExitBlocks=${report.exitStats.gabagoolRepeatedBlockedLossExitCountLastHour} ` +
+      `inventoryReduces=${report.exitStats.gabagoolInventoryReducesLastHour} ` +
+      `invalidZeroSize=${report.exitStats.gabagoolInvalidZeroSizeLastHour} ` +
+      `lastExitClassification=${report.exitStats.gabagoolLastExitClassification || 'none'} ` +
+      `lastExitPnl=${fmtMoney(report.exitStats.gabagoolLastExitPnl)} ` +
+      `lastExitAvgEntry=${fmtPrice(report.exitStats.lastExitAvgEntry)} ` +
+      `lastExitSellPrice=${fmtPrice(report.exitStats.lastExitSellPrice)}`
+    );
+    lines.push(
+      `Last Decisions: sophieBlock=${report.pipelineStats.gabagoolLastSophieBlockReason || 'none'} ` +
+      `riskBlock=${report.pipelineStats.gabagoolLastRiskBlockReason || 'none'} ` +
+      `placementBlock=${report.pipelineStats.gabagoolPlacementBlockReasonLast || 'none'} ` +
+      `placementDecision=${report.pipelineStats.gabagoolLastPlacementDecision || 'none'} ` +
+      `marketLockout=${report.pipelineStats.gabagoolMarketLockoutReasonLast || 'none'} ` +
+      `zeroSizeSourceLast=${report.pipelineStats.gabagoolZeroSizeSourceLast || 'none'}`
     );
     lines.push(
       `PnL: closed=${fmtMoney(report.pnl.btcOraclePaperClosedPnl)} ` +
       `open=${fmtMoney(report.pnl.btcOraclePaperOpenPnl)} ` +
+      `trustedClosed=${fmtMoney(report.pnl.trustedClosedPnl)} ` +
+      `untrustedClosed=${fmtMoney(report.pnl.untrustedClosedPnl)} ` +
+      `trustedOpen=${fmtMoney(report.pnl.trustedOpenPnl)} ` +
+      `untrustedOpen=${fmtMoney(report.pnl.untrustedOpenPnl)} ` +
       `realized=${fmtMoney(report.pnl.btcOraclePaperRealizedPnl)} ` +
       `unrealized=${fmtMoney(report.pnl.btcOraclePaperUnrealizedPnl)} ` +
       `equityContribution=${fmtMoney(report.pnl.btcOraclePaperEquityContribution)} ` +
@@ -5535,6 +10074,19 @@ class BotEngine {
       `grossSell=${fmtMoney(report.pnl.btcOraclePaperGrossSellUsd)} ` +
       `fees=${fmtMoney(report.pnl.btcOraclePaperFeesEstimate)} ` +
       `netAfterFees=${fmtMoney(report.pnl.btcOraclePaperNetAfterFeesEstimate)}`
+    );
+    lines.push(
+      `Gabagool PnL: gabagoolPaperClosedPnl=${fmtMoney(report.pnl.gabagoolPaperClosedPnl)} ` +
+      `gabagoolPaperUnrealizedPnl=${fmtMoney(report.pnl.gabagoolPaperUnrealizedPnl)} ` +
+      `gabagoolPaperNetPnl=${fmtMoney(report.pnl.gabagoolPaperNetPnl)}`
+    );
+    lines.push(
+      `SpreadHunter PnL: closed=${fmtMoney(report.spreadHunterStatus.closedPnl)} ` +
+      `open=${fmtMoney(report.spreadHunterStatus.openPnl)} ` +
+      `trustedClosed=${fmtMoney(report.spreadHunterStatus.trustedClosedPnl)} ` +
+      `trustedOpen=${fmtMoney(report.spreadHunterStatus.trustedOpenPnl)} ` +
+      `untrustedClosed=${fmtMoney(report.spreadHunterStatus.untrustedClosedPnl)} ` +
+      `untrustedOpen=${fmtMoney(report.spreadHunterStatus.untrustedOpenPnl)}`
     );
     lines.push(
       `Exposure: position=${fmtMoney(report.exposure.currentBtcOraclePositionExposureUsd)} ` +
@@ -5545,6 +10097,25 @@ class BotEngine {
       `max1h=${fmtMoney(report.exposure.maxBtcOracleExposureUsedLastHourUsd)} ` +
       `cap=${fmtMoney(report.exposure.currentExposureCapUsd)} ` +
       `marketSlug=${report.exposure.currentBtcMarketSlug || 'n/a'}`
+    );
+    lines.push(
+      `Exposure Audit: riskExposureUsd=${fmtMoney(report.exposure.audit.riskExposureUsd)} ` +
+      `portfolioExposureUsd=${fmtMoney(report.exposure.audit.portfolioExposureUsd)} ` +
+      `btcOracleExposureUsd=${fmtMoney(report.exposure.audit.btcOracleExposureUsd)} ` +
+      `exposureMismatchUsd=${fmtMoney(report.exposure.audit.exposureMismatchUsd)} ` +
+      `exposureMismatchReason=${report.exposure.audit.exposureMismatchReason || 'unknown'} ` +
+      `maxTotalExposureUsd=${fmtMoney(report.exposure.audit.maxTotalExposureUsd)} ` +
+      `exposureAvailableUsd=${fmtMoney(report.exposure.audit.exposureAvailableUsd)}`
+    );
+    lines.push(
+      `Round Trips: gabagoolRoundTripsLastHour=${report.tradeQuality.gabagoolRoundTripsLastHour} ` +
+      `gabagoolAvgRoundTripPnl=${fmtMoney(report.tradeQuality.gabagoolAvgRoundTripPnl)} ` +
+      `winCount=${report.tradeQuality.gabagoolWinCount} lossCount=${report.tradeQuality.gabagoolLossCount} ` +
+      `dustExitPnl=${fmtMoney(report.tradeQuality.gabagoolDustExitPnl)}`
+    );
+    lines.push(
+      `Dust Inventory: gabagoolDustPositionsCount=${report.dust.gabagoolDustPositionsCount} ` +
+      `gabagoolDustValueUsd=${fmtMoney(report.dust.gabagoolDustValueUsd)}`
     );
     if (report.exposure.perTokenExposure.length > 0) {
       lines.push(
@@ -5570,6 +10141,41 @@ class BotEngine {
       `zeroEdgeBlocks=${report.tradeQuality.zeroEdgeBlocksLastHour}`
     );
     lines.push(
+      `Fill Realism: mode=${formatBool(report.fillRealism.paperRealisticFills)} ` +
+      `avgFillDelayMs=${fmtCount(report.fillRealism.avgFillDelayMs, 0)} ` +
+      `avgFillSec=${fmtCount(report.fillRealism.avgTimeToFillSec, 1)} ` +
+      `zeroSecondFills=${report.fillRealism.zeroSecondFillCountLastHour} ` +
+      `invalidUntrustedFills=${report.fillRealism.invalidOrUntrustedFillCountLastHour} ` +
+      `trustedFills=${report.fillRealism.trustedFillCountLastHour} ` +
+      `untrustedFills=${report.fillRealism.untrustedFillCountLastHour} ` +
+      `orderRealismBlocks=${report.fillRealism.orderRealismBlocksLastHour} ` +
+      `fillSourceCounts=${formatFillSourceCounts(report.fillRealism.fillCountsBySourceLastHour)}`
+    );
+    if (report.fillRealism.lastFillAudit) {
+      lines.push(
+        `Last Fill Audit: fillSource=${report.fillRealism.lastFillAudit.fillSource || 'unknown'} ` +
+        `fillDelayMs=${fmtCount(report.fillRealism.lastFillAudit.fillDelayMs, 0)} ` +
+        `bookAgeMs=${fmtCount(report.fillRealism.lastFillAudit.bookAgeMs, 0)} ` +
+        `placementBidAsk=${fmtPrice(report.fillRealism.lastFillAudit.bestBidAtPlacement)}/${fmtPrice(report.fillRealism.lastFillAudit.bestAskAtPlacement)} ` +
+        `fillBidAsk=${fmtPrice(report.fillRealism.lastFillAudit.bestBidAtFill)}/${fmtPrice(report.fillRealism.lastFillAudit.bestAskAtFill)} ` +
+        `orderPrice=${fmtPrice(report.fillRealism.lastFillAudit.orderPrice)} ` +
+        `wasExecutableAtPlacement=${formatBool(report.fillRealism.lastFillAudit.wasExecutableAtPlacement === true)} ` +
+        `wasExecutableAtFill=${formatBool(report.fillRealism.lastFillAudit.wasExecutableAtFill === true)} ` +
+        `queueHaircutApplied=${fmtCount(report.fillRealism.lastFillAudit.queueHaircutApplied, 3)} ` +
+        `slippageApplied=${fmtCount(report.fillRealism.lastFillAudit.slippageApplied, 3)} ` +
+        `adverseSelectionBufferApplied=${fmtCount(report.fillRealism.lastFillAudit.adverseSelectionBufferApplied, 3)} ` +
+        `trustedPnl=${formatBool(report.fillRealism.lastFillAudit.trustedPnl === true)}`
+      );
+    }
+    lines.push(
+      `SpreadHunter Blocks: ghost=${report.spreadHunterStatus.blockedByGhostLastHour} ` +
+      `sophie=${report.spreadHunterStatus.blockedBySophieLastHour} ` +
+      `confidence=${report.spreadHunterStatus.blockedByConfidenceLastHour} ` +
+      `cooldown=${report.spreadHunterStatus.blockedByCooldownLastHour} ` +
+      `executionRealism=${report.spreadHunterStatus.blockedByExecutionRealismLastHour} ` +
+      `orders=${report.spreadHunterStatus.ordersPlacedLastHour} fills=${report.spreadHunterStatus.fillsLastHour}`
+    );
+    lines.push(
       `Market Snapshot: marketSlug=${report.marketSnapshot.marketSlug || 'n/a'} ` +
       `timeRemainingSec=${fmtCount(report.marketSnapshot.timeRemainingSec, 0)} ` +
       `upBid=${fmtPrice(report.marketSnapshot.upBid)} upAsk=${fmtPrice(report.marketSnapshot.upAsk)} upSpread=${fmtCount(report.marketSnapshot.upSpread, 3)} ` +
@@ -5584,17 +10190,27 @@ class BotEngine {
   }
 
   formatBtcOracleReportTelegram(report) {
+    const lastBlockReason = report.pipelineStats.gabagoolPlacementBlockReasonLast ||
+      report.pipelineStats.gabagoolLastRiskBlockReason ||
+      report.pipelineStats.gabagoolLastSophieBlockReason ||
+      report.signalStats.lastOracleSignalBlockedReason ||
+      'none';
     return [
       'PAPER ONLY BTC ORACLE REPORT',
       `equityContribution=${fmtMoney(report.pnl.btcOraclePaperEquityContribution)} ` +
         `closedPnl=${fmtMoney(report.pnl.btcOraclePaperClosedPnl)} ` +
-        `openPnl=${fmtMoney(report.pnl.btcOraclePaperOpenPnl)}`,
+        `openPnl=${fmtMoney(report.pnl.btcOraclePaperOpenPnl)} ` +
+        `trustedClosed=${fmtMoney(report.pnl.trustedClosedPnl)} ` +
+        `untrustedClosed=${fmtMoney(report.pnl.untrustedClosedPnl)}`,
       `orders/fills1h=${report.pipelineStats.gabagoolOrdersPlacedLastHour}/${report.pipelineStats.gabagoolFillsLastHour} ` +
         `sophieA/B=${report.pipelineStats.gabagoolSophieAdmittedLastHour}/${report.pipelineStats.gabagoolSophieBlockedLastHour} ` +
-        `riskA/B=${report.pipelineStats.gabagoolRiskAdmittedLastHour}/${report.pipelineStats.gabagoolRiskBlockedLastHour}`,
+        `riskA/B=${report.pipelineStats.gabagoolRiskAdmittedLastHour}/${report.pipelineStats.gabagoolRiskBlockedLastHour} ` +
+        `fillSources=${formatFillSourceCounts(report.fillRealism.fillCountsBySourceLastHour)}`,
       `signals C/E/NC=${report.signalStats.oracleSignalsConfirmedLastHour}/${report.signalStats.oracleSignalsExpiredLastHour}/${report.signalStats.oracleSignalsNotConfirmedLastHour} ` +
         `exposure=${fmtMoney(report.exposure.totalBtcOracleExposureUsd)} ` +
-        `lastBlock=${report.signalStats.lastOracleSignalBlockedReason || 'none'}`,
+        `lastBlock=${lastBlockReason} ` +
+        `zeroSecondFills=${report.fillRealism.zeroSecondFillCountLastHour} ` +
+        `invalidUntrustedFills=${report.fillRealism.invalidOrUntrustedFillCountLastHour}`,
     ].join('\n');
   }
 
@@ -5660,6 +10276,7 @@ class BotEngine {
     this.sophieBootstrapAdmissionsThisScan = 0;
     this.sophieBootstrapCandidates = [];
     this.sophieMakerRecoveryCandidates = [];
+    this.standardQualifiedCandidateKeysThisScan = new Set();
     this.whaleTracker?.tick?.();
 
     if (this.cycle === 1 || this.cycle % this.config.marketRefreshEveryCycles === 0) {
@@ -5670,7 +10287,7 @@ class BotEngine {
       }
     }
 
-    const markPrices = this.cache.markPrices();
+    const markPrices = this.syncPortfolioMarks(this.cache.markPrices());
     this.portfolio.updateGhostOrders(markPrices);
 
     for (const asset of this.assets) {
@@ -5685,6 +10302,7 @@ class BotEngine {
         this.logAssetBookSkip(asset, book, 'incomplete_book');
         continue;
       }
+      this.portfolio.setMarkPrice(asset.tokenId, book.midpoint);
 
       this.volGuard.update(asset.tokenId, book.midpoint);
       this.consensus.recordMid(asset.tokenId, book.midpoint);
@@ -5708,9 +10326,10 @@ class BotEngine {
     this.flushSophieBootstrapCandidates();
     this.flushSophieMakerRecoveryCandidates();
     this.execution.processOpenOrders();
-    const postOrderMarkPrices = this.cache.markPrices();
+    const postOrderMarkPrices = this.syncPortfolioMarks(this.cache.markPrices());
     this.recordBtcOracleExposureSample(postOrderMarkPrices);
     this.maybeEmitBtcOracleReport({ markPrices: postOrderMarkPrices });
+    this.paperUpdates?.maybeSendDigest?.();
 
     if (this.cycle % this.config.reportEveryCycles === 0) {
       this.report(postOrderMarkPrices);
@@ -5732,10 +10351,428 @@ class BotEngine {
     );
   }
 
+  standardCandidateQualifiesForMixedModePacing(signal) {
+    if (!isStandardPaperStrategy(signal)) return false;
+    if (String(signal?.side || '').toLowerCase() !== 'buy') return false;
+    if (isProtectiveExitStrategy(signal?.strategy)) return false;
+    if (!Number.isFinite(Number(signal?.price)) || Number(signal.price) <= 0 || Number(signal.price) >= 1) return false;
+    if (!Number.isFinite(Number(signal?.sizeUsd)) || Number(signal.sizeUsd) < Number(this.config.minOrderUsd || 0)) return false;
+    if (!Number.isFinite(Number(signal?.expectedEdge)) || Number(signal.expectedEdge) < this.risk.minSignalEdgeForSignal(signal)) {
+      return false;
+    }
+    const confidenceThreshold = this.risk.confidenceThreshold(signal);
+    if (!Number.isFinite(Number(signal?.confidence)) || Number(signal.confidence) < Number(confidenceThreshold.minConfidence || 0)) {
+      return false;
+    }
+    return true;
+  }
+
+  trackStandardMixedModeCandidate(signal) {
+    if (!this.standardCandidateQualifiesForMixedModePacing(signal)) return false;
+    const key = [
+      signal.strategy || 'UNKNOWN',
+      signal.marketId || signal.metadata?.marketSlug || 'unknown',
+      signal.tokenId || 'unknown',
+      String(signal.side || '').toLowerCase(),
+    ].join(':');
+    this.standardQualifiedCandidateKeysThisScan.add(key);
+    this.logMixedModePace(this.mixedModePaceState());
+    return true;
+  }
+
+  mixedModePaceState(now = Date.now()) {
+    const candidateCount = this.standardQualifiedCandidateKeysThisScan.size;
+    if (candidateCount <= 0) {
+      return { considered: false, blocked: false, action: 'no_standard_candidate' };
+    }
+    const health = this.portfolio.executionHealth(now);
+    const btcOrdersLastHour = Number(health.gabagoolOrdersPlacedLastHour || 0);
+    const standardOrdersLastHour = Math.max(0, Number(health.paperOrdersPlacedLastHour || 0) - btcOrdersLastHour);
+    const totalOrdersLastHour = btcOrdersLastHour + standardOrdersLastHour;
+    const projectedBtcShare = (btcOrdersLastHour + 1) / Math.max(1, totalOrdersLastHour + 1);
+    const paceCap = clamp(Number(this.config.mixedModeBtcOrderShareCap ?? 0.75), 0, 1);
+    const standardLedger = this.portfolio.strategyLedger((strategy) => !isBtcOracleStrategy(strategy), this.cache.markPrices(), now);
+    const standardExposureUsd = Number(standardLedger.totalExposureUsd || 0);
+    const standardExposureCapUsd = Number(this.config.maxTotalExposureUsd || 0) *
+      clamp(Number(this.config.standardExposureBucketShare ?? 0.5), 0, 1);
+    const standardUnderCap = standardExposureCapUsd > 0 &&
+      standardExposureUsd + Number(this.config.minOrderUsd || 0) <= standardExposureCapUsd + 1e-9;
+    const blocked = standardUnderCap && btcOrdersLastHour >= 3 && projectedBtcShare > paceCap;
+    return {
+      considered: true,
+      blocked,
+      action: blocked ? 'defer_btc_to_standard' : 'allow_btc',
+      btcOrdersLastHour,
+      standardOrdersLastHour,
+      projectedBtcShare,
+      mixedModeBtcOrderShareCap: paceCap,
+      standardExposureUsd,
+      standardExposureCapUsd,
+      standardQualifiedCandidatesThisScan: candidateCount,
+    };
+  }
+
+  logMixedModePace(state = {}) {
+    if (!state || state.considered !== true) return;
+    const now = Date.now();
+    const key = [
+      state.action || 'unknown',
+      state.btcOrdersLastHour || 0,
+      state.standardOrdersLastHour || 0,
+      state.standardQualifiedCandidatesThisScan || 0,
+    ].join(':');
+    if (this.lastMixedModePaceLog.key === key && now - Number(this.lastMixedModePaceLog.ts || 0) < 15_000) return;
+    this.lastMixedModePaceLog = { key, ts: now };
+    info(
+      `[MIXED MODE PACE] btcOrdersLastHour=${state.btcOrdersLastHour || 0} ` +
+      `standardOrdersLastHour=${state.standardOrdersLastHour || 0} action=${state.action || 'unknown'} ` +
+      `projectedBtcShare=${cleanLogValue(state.projectedBtcShare)} ` +
+      `shareCap=${cleanLogValue(state.mixedModeBtcOrderShareCap)} ` +
+      `standardExposure=${cleanLogValue(state.standardExposureUsd)} ` +
+      `standardCap=${cleanLogValue(state.standardExposureCapUsd)} ` +
+      `standardQualifiedCandidates=${state.standardQualifiedCandidatesThisScan || 0}`
+    );
+  }
+
+  standardChurnKey(signal) {
+    return [
+      signal?.marketId || signal?.metadata?.marketSlug || 'unknown',
+      signal?.tokenId || 'unknown',
+    ].join(':');
+  }
+
+  logStandardChurnGuard(signal, action, reason, extra = {}) {
+    const key = [
+      action || 'unknown',
+      reason || 'unknown',
+      this.standardChurnKey(signal),
+    ].join(':');
+    const now = Date.now();
+    const last = this.standardChurnLastLogged.get(key) || 0;
+    if (now - last < 15_000) return;
+    this.standardChurnLastLogged.set(key, now);
+    info(
+      `[STANDARD CHURN GUARD] token=${shortId(signal?.tokenId)} action=${action} reason=${reason} ` +
+      `expectedEdge=${cleanLogValue(signal?.expectedEdge)} lastExitEdge=${cleanLogValue(extra?.lastExitEdge)} ` +
+      `minImprovement=${cleanLogValue(extra?.minImprovement)} cooldownSec=${cleanLogValue(extra?.cooldownSec)}`
+    );
+  }
+
+  standardChurnDecision(signal, now = Date.now()) {
+    if (!isStandardPaperStrategy(signal)) return { blocked: false, reason: 'not_standard_strategy' };
+    if (String(signal?.side || '').toLowerCase() !== 'buy') return { blocked: false, reason: 'not_buy_entry' };
+    if (isProtectiveExitStrategy(signal?.strategy)) return { blocked: false, reason: 'protective_exit' };
+    const key = this.standardChurnKey(signal);
+    const state = this.standardChurnCooldowns.get(key);
+    if (!state) return { blocked: false, reason: 'no_recent_round_trip' };
+    if (Number(state.cooldownUntil || 0) <= now) {
+      this.standardChurnCooldowns.delete(key);
+      this.logStandardChurnGuard(signal, 'allow', 'cooldown_expired', {
+        lastExitEdge: state.lastExitEdge,
+        minImprovement: this.config.standardChurnMinEdgeImprovement,
+        cooldownSec: 0,
+      });
+      return { blocked: false, reason: 'cooldown_expired' };
+    }
+    const expectedEdge = Number(signal?.expectedEdge || 0);
+    const lastExitEdge = Number(state.lastExitEdge || 0);
+    const minImprovement = Math.max(0, Number(this.config.standardChurnMinEdgeImprovement || 0));
+    if (expectedEdge >= lastExitEdge + minImprovement) {
+      this.logStandardChurnGuard(signal, 'allow', 'edge_improved', {
+        lastExitEdge,
+        minImprovement,
+        cooldownSec: Math.max(0, Math.round((Number(state.cooldownUntil || now) - now) / 1000)),
+      });
+      return { blocked: false, reason: 'edge_improved' };
+    }
+    const cooldownSec = Math.max(0, Math.round((Number(state.cooldownUntil || now) - now) / 1000));
+    this.logStandardChurnGuard(signal, 'block', 'recent_round_trip_cooldown', {
+      lastExitEdge,
+      minImprovement,
+      cooldownSec,
+    });
+    this.portfolio.recordExecutionEvent('standard_churn_block', {
+      tokenId: signal?.tokenId,
+      marketId: signal?.marketId,
+      marketSlug: signal?.metadata?.marketSlug,
+      side: signal?.side,
+      strategy: signal?.strategy,
+      price: signal?.price,
+      sizeUsd: signal?.sizeUsd,
+      expectedEdge,
+      confidence: signal?.confidence,
+      reason: 'recent_round_trip_cooldown',
+      cooldownSec,
+      lastExitEdge,
+    });
+    return { blocked: true, reason: 'recent_round_trip_cooldown', cooldownSec, lastExitEdge, minImprovement };
+  }
+
+  updateStandardChurnCooldownOnFill({ order, fillDetails, fillPrice, now = Date.now(), book = null } = {}) {
+    if (!isStandardPaperStrategy(order?.strategy)) return;
+    if (String(order?.side || '').toLowerCase() !== 'sell') return;
+    const remainingQty = Number(fillDetails?.positionQtyAfter || this.portfolio.position(order?.tokenId) || 0);
+    const referenceBid = Number.isFinite(Number(book?.bestBid)) ? Number(book.bestBid) : Number(fillPrice || order?.price || 0);
+    const remainingValueUsd = remainingQty > 0 && Number.isFinite(referenceBid) && referenceBid > 0
+      ? remainingQty * referenceBid
+      : 0;
+    const roundTripCompleted = remainingQty <= 1e-9 || (remainingValueUsd > 0 && remainingValueUsd < this.config.minOrderUsd);
+    if (!roundTripCompleted) return;
+    const key = this.standardChurnKey(order);
+    this.standardChurnCooldowns.set(key, {
+      cooldownUntil: now + Math.max(0, Number(this.config.standardChurnCooldownMs || 0)),
+      lastExitEdge: Number(order?.signal?.expectedEdge || 0),
+      lastExitPrice: Number(fillPrice || order?.price || 0),
+      tokenId: String(order?.tokenId || ''),
+      marketId: String(order?.marketId || ''),
+      ts: now,
+    });
+  }
+
   trySignal(rawSignal, asset, book) {
     let signal = rawSignal;
-    const gabagoolSignal = isGabagoolStrategy(rawSignal?.strategy);
+    const gabagoolSignal = isGabagoolStrategy(rawSignal);
+    const gabagoolNow = Date.now();
     let quality = null;
+    if (Number.isFinite(Number(book?.midpoint))) {
+      this.portfolio.setMarkPrice(rawSignal?.tokenId || asset?.tokenId, Number(book.midpoint));
+    }
+    this.trackStandardMixedModeCandidate(rawSignal);
+    const standardChurnDecision = this.standardChurnDecision(rawSignal, gabagoolNow);
+    if (standardChurnDecision.blocked) {
+      this.execution.setPlacementDecision(rawSignal, {
+        placed: false,
+        reason: 'standard_churn_guard',
+        detail: standardChurnDecision.reason,
+      });
+      warn(
+        `[STANDARD BLOCK] strategy=${rawSignal?.strategy || 'UNKNOWN'} side=${String(rawSignal?.side || '').toUpperCase() || 'UNKNOWN'} ` +
+        `token=${shortId(rawSignal?.tokenId)} reason=${standardChurnDecision.reason}`
+      );
+      return false;
+    }
+    if (gabagoolSignal && (!Number.isFinite(Number(rawSignal?.sizeUsd)) || Number(rawSignal.sizeUsd) <= 0)) {
+      const zeroSizeReason = 'zero_size_candidate';
+      const positionQty = this.portfolio.position(rawSignal?.tokenId);
+      const availableSellQty = this.portfolio.availablePositionQty(rawSignal?.tokenId);
+      this.lastGabagoolBlockedReason = zeroSizeReason;
+      this.lastGabagoolPlacementDecision = `PRESOPHIE_BLOCKED:${zeroSizeReason}`;
+      this.recordGabagoolMetric('gabagool_zero_size_blocked', {
+        tokenId: rawSignal?.tokenId,
+        marketId: rawSignal?.marketId,
+        marketSlug: rawSignal?.metadata?.marketSlug,
+        outcome: rawSignal?.metadata?.outcome,
+        side: rawSignal?.side,
+        price: rawSignal?.price,
+        sizeUsd: rawSignal?.sizeUsd,
+        expectedEdge: rawSignal?.expectedEdge,
+        confidence: rawSignal?.confidence,
+        reason: zeroSizeReason,
+        source: 'trySignal_invalid_or_zero_size',
+        positionQty,
+        availableSellQty,
+      });
+      this.recordGabagoolMetric('gabagool_placement_decision', {
+        tokenId: rawSignal?.tokenId,
+        marketId: rawSignal?.marketId,
+        marketSlug: rawSignal?.metadata?.marketSlug,
+        outcome: rawSignal?.metadata?.outcome,
+        side: rawSignal?.side,
+        price: rawSignal?.price,
+        sizeUsd: rawSignal?.sizeUsd,
+        expectedEdge: rawSignal?.expectedEdge,
+        confidence: rawSignal?.confidence,
+        reason: this.lastGabagoolPlacementDecision,
+      });
+      this.logGabagoolPresophieBlock(zeroSizeReason, {
+        strategy: rawSignal?.strategy || 'GabagoolBtcOracleStrategy',
+        marketSlug: rawSignal?.metadata?.marketSlug || asset?.market?.marketSlug || null,
+        marketQuestion: rawSignal?.metadata?.marketQuestion || asset?.market?.question || null,
+        tokenId: rawSignal?.tokenId || null,
+        outcome: rawSignal?.metadata?.outcome || asset?.outcome || null,
+        side: rawSignal?.side || 'sell',
+        price: rawSignal?.price,
+        sizeUsd: rawSignal?.sizeUsd,
+        expectedEdge: rawSignal?.expectedEdge,
+        confidence: rawSignal?.confidence,
+        oracleEventKey: rawSignal?.metadata?.gabagool?.oracleEventKey || null,
+      });
+      return;
+    }
+
+    if (gabagoolSignal) {
+      const lifecycleGuard = this.gabagoolLifecycleConflictGuard(rawSignal, gabagoolNow);
+      if (lifecycleGuard.blocked) {
+        this.lastGabagoolBlockedReason = lifecycleGuard.reason;
+        this.lastGabagoolPlacementDecision = `IDLE:${lifecycleGuard.reason}`;
+        this.recordGabagoolMetric('gabagool_reentry_blocked', {
+          tokenId: rawSignal?.tokenId,
+          marketId: rawSignal?.marketId,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          side: rawSignal?.side,
+          price: rawSignal?.price,
+          sizeUsd: rawSignal?.sizeUsd,
+          expectedEdge: rawSignal?.expectedEdge,
+          confidence: rawSignal?.confidence,
+          reason: lifecycleGuard.reason,
+        });
+        this.recordGabagoolMetric('gabagool_placement_decision', {
+          tokenId: rawSignal?.tokenId,
+          marketId: rawSignal?.marketId,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          side: rawSignal?.side,
+          price: rawSignal?.price,
+          sizeUsd: rawSignal?.sizeUsd,
+          expectedEdge: rawSignal?.expectedEdge,
+          confidence: rawSignal?.confidence,
+          reason: this.lastGabagoolPlacementDecision,
+        });
+        warn(
+          `[GABAGOOL LIFECYCLE BLOCK] reason=${lifecycleGuard.reason} token=${shortId(rawSignal?.tokenId)} ` +
+          `marketSlug=${rawSignal?.metadata?.marketSlug || 'unknown'} side=${String(rawSignal?.side || '').toUpperCase()} ` +
+          `opposingSide=${lifecycleGuard.opposingSide || 'unknown'}`
+        );
+        return;
+      }
+    }
+
+    if (gabagoolSignal && String(rawSignal?.side || '').toLowerCase() === 'buy') {
+      const entryGuard = this.gabagoolEntryGuard(rawSignal, this.cache.markPrices(), gabagoolNow);
+      if (entryGuard.blocked) {
+        this.lastGabagoolBlockedReason = entryGuard.reason;
+        this.lastGabagoolPlacementDecision = `IDLE:${entryGuard.reason}`;
+        let metricType = 'gabagool_placement_blocked';
+        if (entryGuard.reason === 'gabagool_loss_guard') {
+          metricType = 'gabagool_entry_paused';
+        } else if (entryGuard.reason === 'gabagool_same_market_direction_guard') {
+          metricType = 'gabagool_same_market_direction_blocked';
+        } else if (entryGuard.reason === 'gabagool_reentry_guard' || entryGuard.reason === 'gabagool_market_lockout') {
+          metricType = 'gabagool_reentry_blocked';
+        } else if (entryGuard.reason === 'gabagool_churn_guard') {
+          metricType = 'gabagool_churn_blocked';
+        } else if (entryGuard.reason === 'gabagool_high_price_entry_guard') {
+          metricType = 'gabagool_high_price_entry_blocked';
+        }
+        this.recordGabagoolMetric(metricType, {
+          tokenId: rawSignal?.tokenId,
+          marketId: rawSignal?.marketId,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          side: rawSignal?.side,
+          price: rawSignal?.price,
+          sizeUsd: rawSignal?.sizeUsd,
+          expectedEdge: rawSignal?.expectedEdge,
+          confidence: rawSignal?.confidence,
+          reason: entryGuard.reason,
+        });
+        this.recordGabagoolMetric('gabagool_placement_decision', {
+          tokenId: rawSignal?.tokenId,
+          marketId: rawSignal?.marketId,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          side: rawSignal?.side,
+          price: rawSignal?.price,
+          sizeUsd: rawSignal?.sizeUsd,
+          expectedEdge: rawSignal?.expectedEdge,
+          confidence: rawSignal?.confidence,
+          reason: this.lastGabagoolPlacementDecision,
+        });
+        warn(
+          `[GABAGOOL IDLE] reason=${entryGuard.reason} token=${shortId(rawSignal?.tokenId)} ` +
+          `${Object.entries(entryGuard)
+            .filter(([key, value]) => !['blocked', 'reason'].includes(key) && value != null)
+            .map(([key, value]) => `${key}=${cleanLogValue(value)}`)
+            .join(' ')}`
+        );
+        return;
+      }
+    }
+
+    if (gabagoolSignal && String(rawSignal?.side || '').toLowerCase() === 'sell') {
+      const exitGuard = this.gabagoolExitGuard(rawSignal, gabagoolNow);
+      if (exitGuard.blocked) {
+        this.lastGabagoolBlockedReason = exitGuard.reason;
+        this.lastGabagoolPlacementDecision = `IDLE:${exitGuard.reason}`;
+        let blockedLossExitSuppressed = false;
+        if (exitGuard.reason === 'blocked_loss_exit') {
+          const suppression = this.consumeBlockedLossExitSuppression({
+            tokenId: rawSignal?.tokenId,
+            marketSlug: rawSignal?.metadata?.marketSlug,
+            outcome: rawSignal?.metadata?.outcome,
+          }, gabagoolNow);
+          blockedLossExitSuppressed = suppression.suppressed === true;
+          this.recordGabagoolMetric('gabagool_blocked_loss_exit', {
+            tokenId: rawSignal?.tokenId,
+            marketId: rawSignal?.marketId,
+            marketSlug: rawSignal?.metadata?.marketSlug,
+            outcome: rawSignal?.metadata?.outcome,
+            side: rawSignal?.side,
+            price: rawSignal?.price,
+            sizeUsd: rawSignal?.sizeUsd,
+            expectedEdge: rawSignal?.expectedEdge,
+            confidence: rawSignal?.confidence,
+            reason: exitGuard.reason,
+            avgEntryPrice: exitGuard.avgEntryPrice,
+          });
+          if (suppression.suppressed) {
+            this.recordGabagoolMetric('gabagool_blocked_loss_exit_repeat', {
+              tokenId: rawSignal?.tokenId,
+              marketId: rawSignal?.marketId,
+              marketSlug: rawSignal?.metadata?.marketSlug,
+              outcome: rawSignal?.metadata?.outcome,
+              side: rawSignal?.side,
+              price: rawSignal?.price,
+              sizeUsd: rawSignal?.sizeUsd,
+              expectedEdge: rawSignal?.expectedEdge,
+              confidence: rawSignal?.confidence,
+              reason: exitGuard.reason,
+              avgEntryPrice: exitGuard.avgEntryPrice,
+              source: 'suppressed_repeat',
+            });
+          } else {
+            this.emitGabagoolUpdate('risk_blocked', {
+              strategy: rawSignal?.strategy,
+              marketSlug: rawSignal?.metadata?.marketSlug,
+              marketQuestion: rawSignal?.metadata?.marketQuestion,
+              tokenId: rawSignal?.tokenId,
+              outcome: rawSignal?.metadata?.outcome,
+              side: rawSignal?.side,
+              price: rawSignal?.price,
+              sizeUsd: rawSignal?.sizeUsd,
+              expectedEdge: rawSignal?.expectedEdge,
+              confidence: rawSignal?.confidence,
+              blockReason: 'blocked_loss_exit',
+              avgEntryPrice: exitGuard.avgEntryPrice,
+              sophieDecision: 'NOT_RUN',
+              riskDecision: 'BLOCK:blocked_loss_exit',
+              oracleEventKey: rawSignal?.metadata?.gabagool?.oracleEventKey || null,
+            });
+          }
+        }
+        this.recordGabagoolMetric('gabagool_placement_decision', {
+          tokenId: rawSignal?.tokenId,
+          marketId: rawSignal?.marketId,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          side: rawSignal?.side,
+          price: rawSignal?.price,
+          sizeUsd: rawSignal?.sizeUsd,
+          expectedEdge: rawSignal?.expectedEdge,
+          confidence: rawSignal?.confidence,
+          reason: this.lastGabagoolPlacementDecision,
+        });
+        if (!blockedLossExitSuppressed) {
+          warn(
+            `[GABAGOOL CAPITAL PROTECTION] reason=${exitGuard.reason} token=${shortId(rawSignal?.tokenId)} ` +
+            `marketSlug=${exitGuard.marketSlug || 'unknown'} avgEntry=${fmtPrice(exitGuard.avgEntryPrice)} ` +
+            `sellPrice=${fmtPrice(exitGuard.sellPrice)} minProfitPrice=${fmtPrice(exitGuard.minProfitPrice)}`
+          );
+        }
+        return;
+      }
+    }
 
     if (rawSignal && !isProtectiveExitStrategy(rawSignal.strategy)) {
       this.portfolio.recordExecutionEvent('candidate_evaluation', rawSignal);
@@ -5744,6 +10781,13 @@ class BotEngine {
         `token=${shortId(rawSignal.tokenId)} price=${fmtPrice(rawSignal.price)} sizeUsd=${cleanLogValue(rawSignal.sizeUsd)} ` +
         `edge=${cleanLogValue(rawSignal.expectedEdge)} confidence=${cleanLogValue(rawSignal.confidence)}`
       );
+      if (isStandardPaperStrategy(rawSignal.strategy)) {
+        info(
+          `[STANDARD CANDIDATE] stage=raw strategy=${rawSignal.strategy} side=${String(rawSignal.side || '').toUpperCase()} ` +
+          `token=${shortId(rawSignal.tokenId)} price=${fmtPrice(rawSignal.price)} sizeUsd=${cleanLogValue(rawSignal.sizeUsd)} ` +
+          `edge=${cleanLogValue(rawSignal.expectedEdge)} confidence=${cleanLogValue(rawSignal.confidence)}`
+        );
+      }
     }
 
     if (this.config.enableConsensus && !gabagoolSignal) {
@@ -5799,6 +10843,8 @@ class BotEngine {
     if (!this.applySophieExecutionGate(signal, asset, book, quality)) {
       if (gabagoolSignal) {
         this.lastGabagoolBlockedReason = quality.qualityDecision;
+        this.lastGabagoolSophieBlockReason = quality.qualityDecision;
+        this.lastGabagoolPlacementDecision = `SOPHIE_BLOCKED:${quality.qualityDecision || 'unknown'}`;
         this.recordGabagoolMetric('gabagool_sophie_blocked', {
           tokenId: signal.tokenId,
           marketId: signal.marketId,
@@ -5813,6 +10859,18 @@ class BotEngine {
           sophieExecutionQuality: quality?.sophieExecutionQuality,
           distanceFromTouch: quality?.distanceFromTouch,
           predictedFillProbability: quality?.predictedFillProbability,
+        });
+        this.recordGabagoolMetric('gabagool_placement_decision', {
+          tokenId: signal.tokenId,
+          marketId: signal.marketId,
+          marketSlug: signal.metadata?.marketSlug,
+          outcome: signal.metadata?.outcome,
+          side: signal.side,
+          price: signal.price,
+          sizeUsd: signal.sizeUsd,
+          expectedEdge: signal.expectedEdge,
+          confidence: signal.confidence,
+          reason: this.lastGabagoolPlacementDecision,
         });
         this.emitGabagoolUpdate('sophie_blocked', {
           strategy: signal.strategy,
@@ -5864,8 +10922,21 @@ class BotEngine {
     }
     signal = this.risk.evaluate(signal);
     if (!signal) {
+      if (rawSignal) {
+        this.portfolio.recordExecutionEvent('risk_block', {
+          ...rawSignal,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          reason: this.risk.lastBlockReason || 'invalid_signal',
+          ...this.risk.lastBlockDetails,
+        });
+      }
       if (gabagoolSignal) {
-        this.lastGabagoolBlockedReason = this.risk.lastBlockReason || 'invalid_signal';
+        const riskBlockReason = this.risk.lastBlockReason || 'invalid_signal';
+        const noPlacementReason = this.gabagoolNoPlacementReasonFromRisk(riskBlockReason, rawSignal);
+        this.lastGabagoolBlockedReason = riskBlockReason;
+        this.lastGabagoolRiskBlockReason = riskBlockReason;
+        this.lastGabagoolPlacementDecision = `RISK_BLOCKED:${noPlacementReason}`;
         this.recordGabagoolMetric('gabagool_risk_blocked', {
           tokenId: rawSignal.tokenId,
           marketId: rawSignal.marketId,
@@ -5876,11 +10947,44 @@ class BotEngine {
           sizeUsd: rawSignal.sizeUsd,
           expectedEdge: rawSignal.expectedEdge,
           confidence: rawSignal.confidence,
-          reason: this.risk.lastBlockReason || 'invalid_signal',
+          reason: riskBlockReason,
           sophieExecutionQuality: quality?.sophieExecutionQuality,
           distanceFromTouch: quality?.distanceFromTouch,
           predictedFillProbability: quality?.predictedFillProbability,
+          riskTotalExposureUsd: this.risk.lastBlockDetails?.riskTotalExposureUsd,
+          portfolioPositionExposureUsd: this.risk.lastBlockDetails?.portfolioPositionExposureUsd,
+          portfolioOpenOrderExposureUsd: this.risk.lastBlockDetails?.portfolioOpenOrderExposureUsd,
+          btcOraclePositionExposureUsd: this.risk.lastBlockDetails?.btcOraclePositionExposureUsd,
+          btcOracleOpenOrderExposureUsd: this.risk.lastBlockDetails?.btcOracleOpenOrderExposureUsd,
+          nonBtcPositionExposureUsd: this.risk.lastBlockDetails?.nonBtcPositionExposureUsd,
+          nonBtcOpenOrderExposureUsd: this.risk.lastBlockDetails?.nonBtcOpenOrderExposureUsd,
+          strategyBucketExposureRawUsd: this.risk.lastBlockDetails?.strategyBucketExposureRawUsd,
+          strategyBucketExposureExclusionUsd: this.risk.lastBlockDetails?.strategyBucketExposureExclusionUsd,
+          strategyBucketExposureUsd: this.risk.lastBlockDetails?.strategyBucketExposureUsd,
+          strategyBucketWouldExposureUsd: this.risk.lastBlockDetails?.strategyBucketWouldExposureUsd,
+          maxTotalExposureUsd: this.risk.lastBlockDetails?.maxTotalExposureUsd,
+          exposureAvailableUsd: this.risk.lastBlockDetails?.exposureAvailableUsd,
+          candidateSizeUsd: this.risk.lastBlockDetails?.candidateSizeUsd,
+          wouldTotalExposureUsd: this.risk.lastBlockDetails?.wouldTotalExposureUsd,
         });
+        this.recordGabagoolMetric('gabagool_placement_decision', {
+          tokenId: rawSignal.tokenId,
+          marketId: rawSignal.marketId,
+          marketSlug: rawSignal.metadata?.marketSlug,
+          outcome: rawSignal.metadata?.outcome,
+          side: rawSignal.side,
+          price: rawSignal.price,
+          sizeUsd: rawSignal.sizeUsd,
+          expectedEdge: rawSignal.expectedEdge,
+          confidence: rawSignal.confidence,
+          reason: this.lastGabagoolPlacementDecision,
+        });
+        warn(
+          `[GABAGOOL NO PLACE] stage=risk reason=${noPlacementReason} rawRisk=${riskBlockReason} ` +
+          `token=${shortId(rawSignal.tokenId)} price=${fmtPrice(rawSignal.price)} sizeUsd=${cleanLogValue(rawSignal.sizeUsd)} ` +
+          `expectedEdge=${cleanLogValue(rawSignal.expectedEdge)} confidence=${cleanLogValue(rawSignal.confidence)} ` +
+          `${formatRiskBlockDetails(this.risk.lastBlockDetails)}`
+        );
         this.emitGabagoolUpdate('risk_blocked', {
           strategy: rawSignal.strategy,
           marketSlug: rawSignal.metadata?.marketSlug,
@@ -5896,6 +11000,7 @@ class BotEngine {
           riskDecision: `BLOCK:${this.risk.lastBlockReason || 'invalid_signal'}`,
           blockReason: this.risk.lastBlockReason || 'invalid_signal',
           oracleEventKey: rawSignal.metadata?.gabagool?.oracleEventKey || null,
+          ...this.risk.lastBlockDetails,
         });
       }
       if (this.config.consensusLogRejected && rawSignal) {
@@ -5903,6 +11008,13 @@ class BotEngine {
         warn(
           `[SIGNAL BLOCK] ${rawSignal.strategy} ${String(rawSignal.side || '').toUpperCase()} ${shortId(rawSignal.tokenId)} ` +
           `block=${this.risk.lastBlockReason || 'invalid_signal'} ${details}`
+        );
+      }
+      if (rawSignal && isStandardPaperStrategy(rawSignal.strategy)) {
+        warn(
+          `[STANDARD BLOCK] stage=risk strategy=${rawSignal.strategy} side=${String(rawSignal.side || '').toUpperCase()} ` +
+          `token=${shortId(rawSignal.tokenId)} reason=${this.risk.lastBlockReason || 'invalid_signal'} ` +
+          `${formatRiskBlockDetails(this.risk.lastBlockDetails)}`
         );
       }
       return;
@@ -5924,10 +11036,87 @@ class BotEngine {
         distanceFromTouch: quality?.distanceFromTouch,
         predictedFillProbability: quality?.predictedFillProbability,
       });
+      this.recordGabagoolMetric('gabagool_placement_attempted', {
+        tokenId: signal.tokenId,
+        marketId: signal.marketId,
+        marketSlug: signal.metadata?.marketSlug,
+        outcome: signal.metadata?.outcome,
+        side: signal.side,
+        price: signal.price,
+        sizeUsd: signal.sizeUsd,
+        expectedEdge: signal.expectedEdge,
+        confidence: signal.confidence,
+        reason: 'attempt',
+      });
     }
     const placed = this.execution.place(signal, book);
+    const placementDecision = this.execution.lastPlacementDecision || null;
+    if (!placed && signal) {
+      this.portfolio.recordExecutionEvent('placement_block', {
+        ...signal,
+        marketSlug: signal?.metadata?.marketSlug,
+        outcome: signal?.metadata?.outcome,
+        reason: placementDecision?.reason || 'unknown_placement_block',
+        source: 'execution_place',
+      });
+    }
+    if (gabagoolSignal && !placed) {
+      const placementBlockReason = this.gabagoolNoPlacementReasonFromExecution(placementDecision, signal);
+      this.lastGabagoolPlacementBlockReason = placementBlockReason;
+      this.lastGabagoolPlacementDecision = `PLACEMENT_BLOCKED:${placementBlockReason}`;
+      this.recordGabagoolMetric('gabagool_placement_blocked', {
+        tokenId: signal.tokenId,
+        marketId: signal.marketId,
+        marketSlug: signal.metadata?.marketSlug,
+        outcome: signal.metadata?.outcome,
+        side: signal.side,
+        price: signal.price,
+        sizeUsd: signal.sizeUsd,
+        expectedEdge: signal.expectedEdge,
+        confidence: signal.confidence,
+        reason: placementBlockReason,
+      });
+      this.recordGabagoolMetric('gabagool_placement_decision', {
+        tokenId: signal.tokenId,
+        marketId: signal.marketId,
+        marketSlug: signal.metadata?.marketSlug,
+        outcome: signal.metadata?.outcome,
+        side: signal.side,
+        price: signal.price,
+        sizeUsd: signal.sizeUsd,
+        expectedEdge: signal.expectedEdge,
+        confidence: signal.confidence,
+        reason: this.lastGabagoolPlacementDecision,
+      });
+      warn(
+        `[GABAGOOL NO PLACE] stage=placement reason=${placementBlockReason} rawPlacement=${placementDecision?.reason || 'unknown'} ` +
+        `token=${shortId(signal.tokenId)} price=${fmtPrice(signal.price)} sizeUsd=${cleanLogValue(signal.sizeUsd)} ` +
+        `expectedEdge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)}`
+      );
+    }
+    if (!gabagoolSignal && !placed && isStandardPaperStrategy(signal.strategy)) {
+      warn(
+        `[STANDARD BLOCK] stage=placement strategy=${signal.strategy} side=${String(signal.side || '').toUpperCase()} ` +
+        `token=${shortId(signal.tokenId)} reason=${placementDecision?.reason || 'unknown'} ` +
+        `price=${fmtPrice(signal.price)} sizeUsd=${cleanLogValue(signal.sizeUsd)} ` +
+        `edge=${cleanLogValue(signal.expectedEdge)} confidence=${cleanLogValue(signal.confidence)}`
+      );
+    }
     if (placed) {
       if (gabagoolSignal) {
+        this.lastGabagoolPlacementDecision = 'ORDER_PLACED';
+        this.recordGabagoolMetric('gabagool_placement_decision', {
+          tokenId: signal.tokenId,
+          marketId: signal.marketId,
+          marketSlug: signal.metadata?.marketSlug,
+          outcome: signal.metadata?.outcome,
+          side: signal.side,
+          price: signal.price,
+          sizeUsd: signal.sizeUsd,
+          expectedEdge: signal.expectedEdge,
+          confidence: signal.confidence,
+          reason: this.lastGabagoolPlacementDecision,
+        });
         this.recordGabagoolMetric('gabagool_order_placed', {
           tokenId: signal.tokenId,
           marketId: signal.marketId,
@@ -5943,21 +11132,55 @@ class BotEngine {
           distanceFromTouch: quality?.distanceFromTouch,
           predictedFillProbability: quality?.predictedFillProbability,
         });
-        this.emitGabagoolUpdate('order_placed', {
-          strategy: signal.strategy,
-          marketSlug: signal.metadata?.marketSlug,
-          marketQuestion: signal.metadata?.marketQuestion,
-          tokenId: signal.tokenId,
-          outcome: signal.metadata?.outcome,
-          side: signal.side,
-          price: signal.price,
-          sizeUsd: signal.sizeUsd,
-          expectedEdge: signal.expectedEdge,
-          confidence: signal.confidence,
-          sophieDecision: quality?.qualityDecision || 'ADMIT',
-          riskDecision: 'ADMIT',
-          oracleEventKey: signal.metadata?.gabagool?.oracleEventKey || null,
-        });
+        if (signal.metadata?.gabagool?.exitMode === 'loss_guard_reduce_only') {
+          this.recordGabagoolMetric('gabagool_loss_guard_exit_placed', {
+            tokenId: signal.tokenId,
+            marketId: signal.marketId,
+            marketSlug: signal.metadata?.marketSlug,
+            outcome: signal.metadata?.outcome,
+            side: signal.side,
+            price: signal.price,
+            sizeUsd: signal.sizeUsd,
+            expectedEdge: signal.expectedEdge,
+            confidence: signal.confidence,
+            reason: 'loss_guard_reduce_only',
+            exitMode: 'loss_guard_reduce_only',
+          });
+        }
+        if (signal.metadata?.gabagool?.exitMode === 'exposure_cap_reduce_only') {
+          this.recordGabagoolMetric('gabagool_reduce_only_exit_placed', {
+            tokenId: signal.tokenId,
+            marketId: signal.marketId,
+            marketSlug: signal.metadata?.marketSlug,
+            outcome: signal.metadata?.outcome,
+            side: signal.side,
+            price: signal.price,
+            sizeUsd: signal.sizeUsd,
+            expectedEdge: signal.expectedEdge,
+            confidence: signal.confidence,
+            reason: signal.metadata?.gabagool?.exitTrigger || 'exposure_cap_reduce_only',
+            exitMode: 'exposure_cap_reduce_only',
+          });
+        }
+        if (String(signal.side || '').toLowerCase() === 'sell') {
+          this.onGabagoolSellPlaced(signal, gabagoolNow);
+        } else {
+          this.emitGabagoolUpdate('order_placed', {
+            strategy: signal.strategy,
+            marketSlug: signal.metadata?.marketSlug,
+            marketQuestion: signal.metadata?.marketQuestion,
+            tokenId: signal.tokenId,
+            outcome: signal.metadata?.outcome,
+            side: signal.side,
+            price: signal.price,
+            sizeUsd: signal.sizeUsd,
+            expectedEdge: signal.expectedEdge,
+            confidence: signal.confidence,
+            sophieDecision: quality?.qualityDecision || 'ADMIT',
+            riskDecision: 'ADMIT',
+            oracleEventKey: signal.metadata?.gabagool?.oracleEventKey || null,
+          });
+        }
       }
       this.maybeWriteLiveCandidate(signal, asset, book);
     }
@@ -5974,10 +11197,25 @@ class BotEngine {
           `block=${this.risk.lastBlockReason || 'invalid_signal'} ${details}`
         );
       }
+      if (rawSignal && isStandardPaperStrategy(rawSignal.strategy)) {
+        warn(
+          `[STANDARD BLOCK] stage=risk strategy=${rawSignal.strategy} side=${String(rawSignal.side || '').toUpperCase()} ` +
+          `token=${shortId(rawSignal.tokenId)} reason=${this.risk.lastBlockReason || 'invalid_signal'} ` +
+          `${formatRiskBlockDetails(this.risk.lastBlockDetails)}`
+        );
+      }
       return false;
     }
 
     const placed = this.execution.place(risked, book);
+    if (!placed && rawSignal && isStandardPaperStrategy(rawSignal.strategy)) {
+      warn(
+        `[STANDARD BLOCK] stage=placement strategy=${rawSignal.strategy} side=${String(rawSignal.side || '').toUpperCase()} ` +
+        `token=${shortId(rawSignal.tokenId)} reason=${this.execution.lastPlacementDecision?.reason || 'unknown'} ` +
+        `price=${fmtPrice(rawSignal.price)} sizeUsd=${cleanLogValue(rawSignal.sizeUsd)} ` +
+        `edge=${cleanLogValue(rawSignal.expectedEdge)} confidence=${cleanLogValue(rawSignal.confidence)}`
+      );
+    }
     if (placed) {
       this.maybeWriteLiveCandidate(risked, asset, book);
     }
@@ -6509,20 +11747,81 @@ class BotEngine {
     const key = this.sophieExecutionKey(signal);
     const repeatKey = this.repeatCandidateKey(signal);
     const now = Date.now();
+    const health = this.portfolio.executionHealth(now);
+    const paperProbation = signal?.metadata?.paperProbation || null;
+    const probationActive = (
+      this.config.enableLiveTrading !== true &&
+      resolveStrategyName(signal) === 'SpreadHunter' &&
+      String(signal?.side || '').toLowerCase() === 'buy' &&
+      paperProbation?.active === true &&
+      this.portfolio.openOrders.size === 0 &&
+      Number(health.paperOrdersPlacedLastHour || 0) === 0
+    );
+    const probationTraceReasonBase = paperProbation?.active === true
+      ? 'metadata_present'
+      : 'metadata_missing';
+    this.logPaperProbationTrace(signal, {
+      probationEligible: paperProbation?.active === true,
+      probationActive,
+      reason: probationTraceReasonBase,
+    }, 'sophie_gate_entry');
+    const recordProbationAdmit = (reason = 'paper_flow_probation') => {
+      this.portfolio.recordExecutionEvent('paper_probation_admit', {
+        ...signal,
+        quality: quality.sophieExecutionQuality,
+        distanceFromTouch: quality.distanceFromTouch,
+        predictedFillProbability: quality.predictedFillProbability,
+        reason,
+        source: 'paper_probation',
+      });
+    };
+    const recordProbationBlock = (reason = 'paper_flow_probation_blocked') => {
+      this.portfolio.recordExecutionEvent('paper_probation_block', {
+        ...signal,
+        quality: quality.sophieExecutionQuality,
+        distanceFromTouch: quality.distanceFromTouch,
+        predictedFillProbability: quality.predictedFillProbability,
+        reason,
+        source: 'paper_probation',
+      });
+    };
     const repeatCooldownUntil = this.sophieRepeatCandidateCooldownUntil.get(repeatKey) || 0;
     if (repeatCooldownUntil > now) {
-      quality.qualityDecision = 'REPEAT_COOLDOWN';
-      this.lastSophieQualityDecision = quality;
-      this.recordRepeatCandidateSuppression(signal, repeatKey);
-      this.portfolio.recordExecutionEvent('quality_block', signal);
-      return false;
+      if (!probationActive) {
+        this.logPaperProbationTrace(signal, {
+          probationEligible: paperProbation?.active === true,
+          probationActive,
+          repeatCooldownBlocked: true,
+          reason: paperProbation?.active === true ? 'repeat_cooldown_probation_inactive' : 'repeat_cooldown_no_probation_metadata',
+        }, 'sophie_repeat_cooldown');
+        quality.qualityDecision = 'REPEAT_COOLDOWN';
+        this.lastSophieQualityDecision = quality;
+        this.recordRepeatCandidateSuppression(signal, repeatKey);
+        this.portfolio.recordExecutionEvent('quality_block', {
+          ...signal,
+          reason: 'repeat_cooldown',
+          source: 'sophie_execution_gate',
+        });
+        return false;
+      }
+      quality.repeatCooldownBypassed = true;
+      this.logPaperProbationTrace(signal, {
+        probationEligible: paperProbation?.active === true,
+        probationActive,
+        repeatCooldownBypassed: true,
+        reason: 'repeat_cooldown_bypassed_for_probation',
+      }, 'sophie_repeat_cooldown');
     }
 
     const cooldownUntil = this.sophieNoFillCooldownUntil.get(key) || 0;
     if (cooldownUntil > now) {
       quality.qualityDecision = 'THROTTLE';
       this.lastSophieQualityDecision = quality;
-      this.portfolio.recordExecutionEvent('quality_throttle', signal);
+      this.portfolio.recordExecutionEvent('quality_throttle', {
+        ...signal,
+        reason: 'token_cooldown',
+        source: 'sophie_execution_gate',
+      });
       return false;
     }
 
@@ -6534,7 +11833,11 @@ class BotEngine {
       this.sophieNoFillCooldownUntil.set(key, now + this.config.sophieNoFillTokenCooldownMs);
       quality.qualityDecision = 'THROTTLE_NO_FILL_LEARN';
       this.lastSophieQualityDecision = quality;
-      this.portfolio.recordExecutionEvent('quality_throttle', signal);
+      this.portfolio.recordExecutionEvent('quality_throttle', {
+        ...signal,
+        reason: 'no_fill_learning',
+        source: 'sophie_execution_gate',
+      });
       this.logNoFillLearning(signal, windowStats, quality.rawPredictedFillProbability, quality.predictedFillProbability);
       return false;
     }
@@ -6548,7 +11851,11 @@ class BotEngine {
       this.sophieNoFillCooldownUntil.set(key, now + this.config.sophieNoFillCooldownMs);
       quality.qualityDecision = 'THROTTLE';
       this.lastSophieQualityDecision = quality;
-      this.portfolio.recordExecutionEvent('quality_throttle', signal);
+      this.portfolio.recordExecutionEvent('quality_throttle', {
+        ...signal,
+        reason: 'no_fill_window',
+        source: 'sophie_execution_gate',
+      });
       warn(
         `[SOPHIE EXECUTION THROTTLE] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} strategy=${signal.strategy} ` +
         `reason=no_fills attemptsWindow=${windowStats.attemptsLastHour} duplicateSkipsWindow=${windowStats.duplicateSkipsLastHour} ` +
@@ -6575,6 +11882,29 @@ class BotEngine {
         return true;
       }
 
+      if (probationActive) {
+        const probationFailures = [];
+        const probationMinConfidence = Number(paperProbation?.minConfidence || 0);
+        if (quality.sophieExecutionQuality < Number(this.config.sophieBootstrapMinQuality || 0)) probationFailures.push('quality');
+        if (Number(signal.expectedEdge) < this.risk.minSignalEdgeForSignal(signal)) probationFailures.push('edge');
+        if (Number(signal.confidence) < probationMinConfidence) probationFailures.push('confidence');
+        if (quality.predictedFillProbability < Number(this.config.sophieBootstrapMinFillProb || 0)) probationFailures.push('fill_probability');
+        if (quality.distanceFromTouch > Number(this.config.sophieBootstrapMaxDistanceFromTouch || 0)) probationFailures.push('distance_from_touch');
+        if (probationFailures.length === 0) {
+          quality.qualityDecision = 'PAPER_PROBATION_ADMIT';
+          this.lastSophieQualityDecision = quality;
+          recordProbationAdmit('paper_flow_probation_low_quality_recovery');
+          this.recordSophieAdmission(signal, quality);
+          info(
+            `[SOPHIE PAPER PROBATION ADMIT] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
+            `quality=${quality.sophieExecutionQuality} confidence=${cleanLogValue(signal.confidence)} ` +
+            `fillProb=${quality.predictedFillProbability} distanceFromTouch=${quality.distanceFromTouch} ` +
+            `trigger=${paperProbation?.trigger || 'unknown'} sizeUsd=${cleanLogValue(signal.sizeUsd)} paperOnly=true`
+          );
+          return true;
+        }
+      }
+
       if (this.shouldBootstrapQueue(signal, quality)) {
         this.queueSophieBootstrapCandidate(signal, asset, book, quality);
         return false;
@@ -6586,11 +11916,27 @@ class BotEngine {
       if (this.queueStarvedPaperMakerQuote(signal, asset, book, quality, 'zero_open_orders_low_quality')) {
         return false;
       }
+      if (probationActive) {
+        const probationReasons = [];
+        const probationMinConfidence = Number(paperProbation?.minConfidence || 0);
+        if (quality.sophieExecutionQuality < Number(this.config.sophieBootstrapMinQuality || 0)) probationReasons.push('quality');
+        if (Number(signal.expectedEdge) < this.risk.minSignalEdgeForSignal(signal)) probationReasons.push('edge');
+        if (Number(signal.confidence) < probationMinConfidence) probationReasons.push('confidence');
+        if (quality.predictedFillProbability < Number(this.config.sophieBootstrapMinFillProb || 0)) probationReasons.push('fill_probability');
+        if (quality.distanceFromTouch > Number(this.config.sophieBootstrapMaxDistanceFromTouch || 0)) probationReasons.push('distance_from_touch');
+        recordProbationBlock(probationReasons.join('+') || 'low_quality');
+      }
       this.recordLowQualityBlock(signal, quality);
-      this.sophieRepeatCandidateCooldownUntil.set(repeatKey, now + this.config.sophieRepeatCandidateCooldownMs);
+      if (!probationActive) {
+        this.sophieRepeatCandidateCooldownUntil.set(repeatKey, now + this.config.sophieRepeatCandidateCooldownMs);
+      }
       quality.qualityDecision = 'BLOCK_LOW_QUALITY';
       this.lastSophieQualityDecision = quality;
-      this.portfolio.recordExecutionEvent('quality_block', signal);
+      this.portfolio.recordExecutionEvent('quality_block', {
+        ...signal,
+        reason: probationActive ? 'low_quality_probation_blocked' : 'low_execution_quality',
+        source: 'sophie_execution_gate',
+      });
       return false;
     }
 
@@ -6600,6 +11946,9 @@ class BotEngine {
 
     quality.qualityDecision = 'ADMIT';
     this.lastSophieQualityDecision = quality;
+    if (probationActive) {
+      recordProbationAdmit('paper_flow_probation');
+    }
     this.recordSophieAdmission(signal, quality);
     info(
       `[SOPHIE ORDER QUALITY] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
@@ -6898,35 +12247,94 @@ class BotEngine {
 
     const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId);
     const availableSellUsd = availableSellQty * signal.price;
-    return availableSellUsd > 0 && availableSellUsd < this.risk.minOrderUsdForSignal(signal);
+    const requestedSellUsd = Number.isFinite(Number(signal.sizeUsd))
+      ? Math.max(0, Math.min(Number(signal.sizeUsd), availableSellUsd))
+      : availableSellUsd;
+    const gabagoolPolicy = gabagoolDustExitPolicy(signal, this.portfolio, this.config);
+    if (gabagoolPolicy.eligible) {
+      return requestedSellUsd > 0 && requestedSellUsd < gabagoolPolicy.minDustExitUsd;
+    }
+    const reduceOnlyPolicy = reduceOnlyPaperExitPolicy(signal, this.portfolio, this.config);
+    if (reduceOnlyPolicy.eligible) {
+      return requestedSellUsd > 0 && requestedSellUsd < reduceOnlyPolicy.minReduceOnlyExitUsd;
+    }
+    return requestedSellUsd > 0 && requestedSellUsd < this.risk.minOrderUsdForSignal(signal);
   }
 
   suppressDustExit(signal) {
     const availableSellQty = this.portfolio.availablePositionQty(signal.tokenId);
     const availableSellUsd = availableSellQty * signal.price;
+    const requestedSellUsd = Number.isFinite(Number(signal.sizeUsd))
+      ? Math.max(0, Math.min(Number(signal.sizeUsd), availableSellUsd))
+      : availableSellUsd;
     const cooldownMs = Math.max(0, this.config.dustExitLogCooldownMs || 0);
     const cooldownSec = Math.round(cooldownMs / 1000);
     const minOrderUsd = this.risk.minOrderUsdForSignal(signal);
     const key = `${signal.strategy}:${signal.side}:${signal.tokenId}`;
     const now = Date.now();
     const last = this.dustExitLastLogged.get(key) || 0;
+    const dustExitPolicy = gabagoolDustExitPolicy(signal, this.portfolio, this.config);
+    const reduceOnlyExitPolicy = reduceOnlyPaperExitPolicy(signal, this.portfolio, this.config);
+    let suppressReason = 'dust_exit_suppressed';
+    if (dustExitPolicy.eligible) {
+      suppressReason = dustExitPolicy.belowDustFloor ? 'gabagool_dust_exit_below_floor' : 'dust_exit_below_min';
+    } else if (reduceOnlyExitPolicy.eligible) {
+      suppressReason = reduceOnlyExitPolicy.belowDustFloor
+        ? 'reduce_only_exit_below_dust_floor'
+        : 'reduce_only_exit_below_min';
+    }
 
     this.lastDustExitSuppressed = {
-      reason: 'DUST_EXIT_SUPPRESSED',
+      reason: suppressReason,
       strategy: signal.strategy,
       side: signal.side,
       tokenId: signal.tokenId,
       availableSellQty,
       availableSellUsd,
+      requestedSellUsd,
       minOrderUsd,
       cooldownSec,
     };
+    if (dustExitPolicy.eligible) {
+      this.recordGabagoolMetric('gabagool_dust_exit_suppressed', {
+        tokenId: signal.tokenId,
+        marketId: signal.marketId,
+        marketSlug: signal.metadata?.marketSlug,
+        outcome: signal.metadata?.outcome,
+        side: signal.side,
+        price: signal.price,
+        sizeUsd: requestedSellUsd,
+        expectedEdge: signal.expectedEdge,
+        confidence: signal.confidence,
+        reason: suppressReason,
+      });
+    }
+    this.portfolio.recordExecutionEvent('dust_exit_blocked', {
+      strategy: signal.strategy,
+      tokenId: signal.tokenId,
+      marketId: signal.marketId,
+      marketSlug: signal.metadata?.marketSlug,
+      outcome: signal.metadata?.outcome,
+      side: signal.side,
+      price: signal.price,
+      sizeUsd: requestedSellUsd,
+      reason: suppressReason,
+      availableSellQty,
+      currentValueUsd: availableSellUsd,
+      roundedExitSizeUsd: requestedSellUsd,
+    });
 
     if (now - last >= cooldownMs) {
       this.dustExitLastLogged.set(key, now);
       warn(
-        `[DUST EXIT SUPPRESSED] ${signal.strategy} ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
-        `availableSellUsd=${availableSellUsd.toFixed(3)} minOrderUsd=${minOrderUsd} cooldownSec=${cooldownSec}`
+        `[DUST EXIT BLOCK] reason=${suppressReason} token=${shortId(signal.tokenId)} ` +
+        `qty=${fmtCount(availableSellQty, 6)} bid=${fmtPrice(signal.price)} valueUsd=${fmtMoney(availableSellUsd)} ` +
+        `requestedSellUsd=${cleanLogValue(requestedSellUsd)} minOrderUsd=${cleanLogValue(minOrderUsd)} ` +
+        `strategy=${signal.strategy || 'UNKNOWN'} cooldownSec=${cooldownSec}`
+      );
+      info(
+        `[DUST EXIT] token=${shortId(signal.tokenId)} qty=${fmtCount(availableSellQty, 6)} ` +
+        `valueUsd=${fmtMoney(availableSellUsd)} bid=${fmtPrice(signal.price)} action=skipped`
       );
     }
   }
@@ -7021,16 +12429,22 @@ class BotEngine {
   }
 
   report(markPrices = this.cache.markPrices()) {
+    this.syncPortfolioMarks(markPrices);
     const equity = this.portfolio.equity(markPrices);
     const drawdown = this.portfolio.drawdownPct(markPrices);
 
     info('--- PORTFOLIO REPORT ---');
     info(`Equity: $${equity.toFixed(2)} | Cash: $${this.portfolio.cash.toFixed(2)} | Drawdown: ${drawdown.toFixed(2)}%`);
-    info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd().toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
+    info(`Open Orders: ${this.portfolio.openOrders.size} | Exposure: $${this.portfolio.totalExposureUsd(markPrices).toFixed(2)} | Closed PnL: $${this.portfolio.closedPnl.toFixed(2)}`);
     info(`Position Exposure: $${this.portfolio.positionExposureUsd(markPrices).toFixed(2)} | Open Order Exposure: $${this.portfolio.openOrderExposureUsd().toFixed(2)} | Available Cash: $${this.portfolio.availableCash().toFixed(2)}`);
 
     const dust = this.portfolio.dustSummary(markPrices);
     info(`Dust Positions: count=${dust.count} value=$${dust.valueUsd.toFixed(2)}`);
+    const now = Date.now();
+    const btcLedger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
+    const standardLedger = this.portfolio.strategyLedger((strategy) => !isBtcOracleStrategy(strategy), markPrices, now);
+    const spreadHunterLedger = this.portfolio.strategyLedger((strategy) => resolveStrategyName(strategy) === 'SpreadHunter', markPrices, now);
+    const pnlBreakdown = this.portfolio.pnlBreakdownByStrategy(markPrices, now);
 
     const health = this.portfolio.executionHealth();
     info(
@@ -7054,15 +12468,129 @@ class BotEngine {
       `fillRateByPlacedOrdersLastHour=${health.fillRateByPlacedOrdersLastHour.toFixed(1)}%`
     );
     info(
+      `PnL Trust: trustedClosedPnl=$${Number(btcLedger.trustedClosedPnl || 0).toFixed(2)} ` +
+      `untrustedClosedPnl=$${Number(btcLedger.untrustedClosedPnl || 0).toFixed(2)} ` +
+      `trustedOpenPnl=$${Number(btcLedger.trustedOpenPnl || 0).toFixed(2)} ` +
+      `untrustedOpenPnl=$${Number(btcLedger.untrustedOpenPnl || 0).toFixed(2)}`
+    );
+    info(
+      `Strategy PnL: btcGabagoolClosed=$${Number(btcLedger.closedPnl || 0).toFixed(2)} ` +
+      `btcGabagoolTrustedClosed=$${Number(btcLedger.trustedClosedPnl || 0).toFixed(2)} ` +
+      `spreadHunterClosed=$${Number(spreadHunterLedger.closedPnl || 0).toFixed(2)} ` +
+      `spreadHunterTrustedClosed=$${Number(spreadHunterLedger.trustedClosedPnl || 0).toFixed(2)}`
+    );
+    info(
+      `Fill Realism: paperRealisticFills=${this.config.paperRealisticFills === true ? 'true' : 'false'} ` +
+      `avgFillDelayMs=${health.avgFillDelayMs == null ? 'NA' : Math.round(health.avgFillDelayMs)} ` +
+      `zeroSecondFillCountLastHour=${health.zeroSecondFillCountLastHour} ` +
+      `invalidUntrustedFillCountLastHour=${health.invalidOrUntrustedFillCountLastHour} ` +
+      `trustedFillCountLastHour=${health.trustedFillCountLastHour} ` +
+      `untrustedFillCountLastHour=${health.untrustedFillCountLastHour} ` +
+      `fillCountsBySource=${formatFillSourceCounts(health.fillCountsBySourceLastHour)}`
+    );
+    if (health.lastFillAudit) {
+      info(
+        `Last Fill Audit: fillSource=${health.lastFillAudit.fillSource || 'unknown'} ` +
+        `fillDelayMs=${health.lastFillAudit.fillDelayMs == null ? 'NA' : Math.round(health.lastFillAudit.fillDelayMs)} ` +
+        `bookAgeMs=${health.lastFillAudit.bookAgeMs == null ? 'NA' : Math.round(health.lastFillAudit.bookAgeMs)} ` +
+        `bestBidAtPlacement=${fmtPrice(health.lastFillAudit.bestBidAtPlacement)} ` +
+        `bestAskAtPlacement=${fmtPrice(health.lastFillAudit.bestAskAtPlacement)} ` +
+        `bestBidAtFill=${fmtPrice(health.lastFillAudit.bestBidAtFill)} ` +
+        `bestAskAtFill=${fmtPrice(health.lastFillAudit.bestAskAtFill)} ` +
+        `orderPrice=${fmtPrice(health.lastFillAudit.orderPrice)} ` +
+        `wasExecutableAtPlacement=${health.lastFillAudit.wasExecutableAtPlacement === true ? 'true' : 'false'} ` +
+        `wasExecutableAtFill=${health.lastFillAudit.wasExecutableAtFill === true ? 'true' : 'false'} ` +
+        `queueHaircutApplied=${cleanLogValue(health.lastFillAudit.queueHaircutApplied)} ` +
+        `slippageApplied=${cleanLogValue(health.lastFillAudit.slippageApplied)} ` +
+        `adverseSelectionBufferApplied=${cleanLogValue(health.lastFillAudit.adverseSelectionBufferApplied)} ` +
+        `trustedPnl=${health.lastFillAudit.trustedPnl === true ? 'true' : 'false'}`
+      );
+    }
+    info(
+      `Loss Exit Audit: blockedLossExitCountLastHour=${health.gabagoolLossExitBlocksLastHour} ` +
+      `repeatedBlockedLossExitCountLastHour=${health.gabagoolRepeatedBlockedLossExitCountLastHour} ` +
+      `repeatedSameMarketSameTokenEntriesLastHour=${health.gabagoolRepeatedSameMarketSameTokenEntriesLastHour}`
+    );
+    info(
+      `Exposure Split: tradableExposure=$${Number(health.tradableExposureUsd || 0).toFixed(2)} ` +
+      `staleExposure=$${Number(health.staleExposureUsd || 0).toFixed(2)} ` +
+      `dustExposure=$${Number(health.dustExposureUsd || 0).toFixed(2)} ` +
+      `tradableCount=${Number(health.tradableExposureCount || 0)} ` +
+      `staleCount=${Number(health.staleExposureCount || 0)} ` +
+      `dustCount=${Number(health.dustExposureCount || 0)}`
+    );
+    info(
+      `Gabagool Exit Blocks: exposureCap=${health.gabagoolExposureCapBlockedReasonCountsLastHour || 'none'} ` +
+      `lastPlacementDecision=${health.gabagoolLastPlacementDecision || 'none'}`
+    );
+    info(
+      `SpreadHunter Blocks: ghost=${health.spreadHunterGhostBlocksLastHour} ` +
+      `sophie=${health.spreadHunterSophieBlocksLastHour} ` +
+      `confidence=${health.spreadHunterConfidenceBlocksLastHour} ` +
+      `cooldown=${health.spreadHunterCooldownBlocksLastHour} ` +
+      `executionRealism=${health.spreadHunterExecutionRealismBlocksLastHour}`
+    );
+    info(
+      `Paper Flow: totalOrders=${health.paperOrdersPlacedLastHour} ` +
+      `whyTotalOrdersZero=${health.whyTotalOrdersZeroLastHour || 'none'} ` +
+      `topBlockReasons=${health.topBlockReasonsLastHour || 'none'} ` +
+      `probationAdmissions=${health.probationAdmissionsLastHour || 0} ` +
+      `probationBlocks=${health.probationBlocksLastHour || 0}`
+    );
+    info(
+      `Strategy Orders 1h: ${Object.entries(health.strategyOrderCountsLastHour || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([strategy, count]) => `${strategy}:${count}`)
+        .join(', ') || 'none'}`
+    );
+    info(
+      `Live Safety: ENABLE_LIVE_TRADING=${this.config.enableLiveTrading === true ? 'true' : 'false'} ` +
+      `LIVE_AUTO_EXECUTE=${this.config.liveAutoExecute === true ? 'true' : 'false'} ` +
+      `LIVE_KILL_SWITCH=${this.config.liveKillSwitch === true ? 'true' : 'false'} ` +
+      `LIVE_DRY_RUN_ONLY=${this.config.liveDryRunOnly === true ? 'true' : 'false'} ` +
+      `LIVE_SUBMIT_CONFIRM=${this.config.liveSubmitConfirm === true ? 'true' : 'false'}`
+    );
+    info(
+      `[MIXED MODE REPORT] btcOrdersLastHour=${health.gabagoolOrdersPlacedLastHour} ` +
+      `standardOrdersLastHour=${Math.max(0, health.paperOrdersPlacedLastHour - health.gabagoolOrdersPlacedLastHour)} ` +
+      `btcExposure=${fmtMoney(btcLedger.totalExposureUsd)} standardExposure=${fmtMoney(standardLedger.totalExposureUsd)} ` +
+      `dustCount=${dust.count}`
+    );
+    info(
+      `PnL By Strategy: ${Object.entries(pnlBreakdown.pnlByStrategy || {})
+        .map(([strategy, value]) => (
+          `${strategy}:closed=${fmtMoney(value.closedPnl)} open=${fmtMoney(value.openPnl)} net=${fmtMoney(value.netPnl)}`
+        ))
+        .join(' | ') || 'none'}`
+    );
+    info(
       `Gabagool Health: oracleSignalsReadLastHour=${health.oracleSignalsReadLastHour} ` +
       `oracleSignalsFreshLastHour=${health.oracleSignalsFreshLastHour} ` +
       `oracleSignalsExpiredLastHour=${health.oracleSignalsExpiredLastHour} ` +
       `oracleSignalsNotConfirmedLastHour=${health.oracleSignalsNotConfirmedLastHour} ` +
       `gabagoolCandidatesBuiltLastHour=${health.gabagoolCandidatesBuiltLastHour} ` +
+      `gabagoolZeroSizeBlockedLastHour=${health.gabagoolZeroSizeBlockedLastHour} ` +
       `gabagoolSophieEvaluatedLastHour=${health.gabagoolSophieEvaluatedLastHour} ` +
+      `gabagoolSophieAdmittedLastHour=${health.gabagoolSophieAdmittedLastHour} ` +
+      `gabagoolSophieBlockedLastHour=${health.gabagoolSophieBlockedLastHour} ` +
       `gabagoolRiskEvaluatedLastHour=${health.gabagoolRiskEvaluatedLastHour} ` +
+      `gabagoolRiskAdmittedLastHour=${health.gabagoolRiskAdmittedLastHour} ` +
+      `gabagoolRiskBlockedLastHour=${health.gabagoolRiskBlockedLastHour} ` +
+      `gabagoolPlacementAttemptedLastHour=${health.gabagoolPlacementAttemptedLastHour} ` +
+      `gabagoolPlacementBlockedLastHour=${health.gabagoolPlacementBlockedLastHour} ` +
       `gabagoolOrdersPlacedLastHour=${health.gabagoolOrdersPlacedLastHour} ` +
-      `gabagoolTelegramSuppressedLastHour=${health.gabagoolTelegramSuppressedLastHour}`
+      `gabagoolDustExitsLastHour=${health.gabagoolDustExitsLastHour} ` +
+      `gabagoolDustExitsSuppressedLastHour=${health.gabagoolDustExitsSuppressedLastHour} ` +
+      `gabagoolProfitExitsLastHour=${health.gabagoolProfitExitsLastHour} ` +
+      `gabagoolLossExitsLastHour=${health.gabagoolLossExitsLastHour} ` +
+      `gabagoolInventoryReducesLastHour=${health.gabagoolInventoryReducesLastHour} ` +
+      `gabagoolTelegramSuppressedLastHour=${health.gabagoolTelegramSuppressedLastHour} ` +
+      `gabagoolPlacementBlockReasonLast=${health.gabagoolPlacementBlockReasonLast || 'none'} ` +
+      `gabagoolLastRiskBlockReason=${health.gabagoolLastRiskBlockReason || 'none'} ` +
+      `gabagoolLastSophieBlockReason=${health.gabagoolLastSophieBlockReason || 'none'} ` +
+      `gabagoolLastPlacementDecision=${health.gabagoolLastPlacementDecision || 'none'} ` +
+      `gabagoolLastExitClassification=${health.gabagoolLastExitClassification || 'none'} ` +
+      `gabagoolLastExitPnl=${fmtMoney(health.gabagoolLastExitPnl)}`
     );
 
     if (
@@ -7112,6 +12640,11 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function round(value, digits = 6) {
+  if (!Number.isFinite(value)) return null;
+  return Number(value.toFixed(digits));
+}
+
 function roundToTick(value, tick) {
   if (!Number.isFinite(value)) return value;
   if (!Number.isFinite(tick) || tick <= 0) return value;
@@ -7131,8 +12664,27 @@ function firstFinite(...values) {
   return 0;
 }
 
+function numericOrNull(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function isProtectiveExitStrategy(strategy) {
   return ['InventoryExit', 'StopLossExit', 'TakeProfitExit'].includes(strategy);
+}
+
+function isReduceOnlyPaperExitSignal(signal) {
+  if (String(signal?.side || '').toLowerCase() !== 'sell') return false;
+  if (signal?.metadata?.reduceOnly === true) return true;
+  if (isProtectiveExitStrategy(resolveStrategyName(signal))) return true;
+  return (
+    signal?.metadata?.exitMode === 'loss_guard_reduce_only' ||
+    signal?.metadata?.exitMode === 'exposure_cap_reduce_only' ||
+    signal?.metadata?.gabagool?.exitMode === 'loss_guard_reduce_only' ||
+    signal?.metadata?.gabagool?.exitMode === 'exposure_cap_reduce_only' ||
+    signal?.metadata?.gabagool?.exitTrigger === 'loss_guard_reduce_only' ||
+    signal?.metadata?.gabagool?.exitTrigger === 'exposure_cap_reduce_only'
+  );
 }
 
 function shortId(value) {
@@ -7156,6 +12708,17 @@ function fmtCount(value, digits = 2) {
   if (value === null || value === undefined || value === '') return 'n/a';
   if (!Number.isFinite(Number(value))) return 'n/a';
   return Number(value).toFixed(digits);
+}
+
+function formatLargestExposurePositions(positions = []) {
+  if (!Array.isArray(positions) || positions.length === 0) return 'none';
+  return positions.map((item) => (
+    `${shortId(item.tokenId)}:${item.outcome || 'n/a'} ` +
+    `total=${fmtMoney(item.totalExposureUsd)} pos=${fmtMoney(item.positionExposureUsd)} ` +
+    `open=${fmtMoney(item.openOrderExposureUsd)} avg=${fmtPrice(item.avgEntryPrice)} ` +
+    `mark=${fmtPrice(item.mark)} qty=${fmtCount(item.qty, 4)} ` +
+    `market=${item.marketSlug || 'n/a'}`
+  )).join(' | ');
 }
 
 function fmtPercent(value, digits = 2) {
@@ -7252,15 +12815,159 @@ function formatGabagoolConfirmCheck(confirmCheck = null) {
   return fields.join('|');
 }
 
+function resolveStrategyName(candidate) {
+  if (typeof candidate === 'string') return candidate.trim();
+  if (!candidate || typeof candidate !== 'object') return '';
+  const candidates = [
+    candidate.strategy,
+    candidate.strategyName,
+    candidate.metadata?.strategy,
+    candidate.metadata?.strategyName,
+  ];
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
 function isBtcOracleStrategy(strategy) {
-  const normalized = String(strategy || '');
+  const normalized = resolveStrategyName(strategy);
   if (!normalized) return false;
   if (normalized === 'GabagoolBtcOracleStrategy' || normalized === 'BtcOracleScalpStrategy') return true;
   return /btc.*oracle|oracle.*btc/i.test(normalized);
 }
 
+function isStandardPaperStrategy(strategy) {
+  const normalized = resolveStrategyName(strategy);
+  return Boolean(normalized) && !isBtcOracleStrategy(normalized);
+}
+
 function isGabagoolStrategy(strategy) {
-  return String(strategy || '') === 'GabagoolBtcOracleStrategy';
+  return resolveStrategyName(strategy) === 'GabagoolBtcOracleStrategy';
+}
+
+function minSignalEdgeForCandidate(signal, config = {}) {
+  const globalMinEdge = Math.max(0, Number(config?.minSignalEdge || 0));
+  const standardMinEdge = Math.max(0, Number(config?.standardMinSignalEdge ?? globalMinEdge));
+  const strategy = resolveStrategyName(signal);
+  if (!strategy) return globalMinEdge;
+  if (strategy === 'GabagoolBtcOracleStrategy') {
+    return Math.max(0, Number(config?.gabagoolMinExpectedEdge ?? globalMinEdge));
+  }
+  if (strategy === 'SpreadHunter') {
+    return standardMinEdge;
+  }
+  if (strategy === 'ComplementArb') {
+    const complementFloor = Math.max(0, Number(config?.complementArbMinEdge || 0) / 2);
+    return Math.max(standardMinEdge, complementFloor);
+  }
+  return globalMinEdge;
+}
+
+function gabagoolDustExitPolicy(signal, portfolio, config) {
+  const configuredMinDustExitUsd = Number(
+    config?.gabagoolMinDustExitUsd || (config?.enableLiveTrading === true ? 0.05 : 0.01)
+  );
+  const minDustExitUsd = Math.max(0.01, configuredMinDustExitUsd);
+  const minOrderUsd = Math.max(0.01, Number(config?.minOrderUsd || 0));
+  if (!config?.enableGabagoolBtcImitation || config?.gabagoolAllowDustExits !== true) {
+    return { eligible: false, minDustExitUsd, minOrderUsd };
+  }
+  if (!isGabagoolStrategy(signal)) return { eligible: false, minDustExitUsd, minOrderUsd };
+  if (String(signal?.side || '').toLowerCase() !== 'sell') return { eligible: false, minDustExitUsd, minOrderUsd };
+  const price = Number(signal?.price);
+  if (!Number.isFinite(price) || price <= 0) return { eligible: false, minDustExitUsd, minOrderUsd };
+  const availableQtyOverride = Number(signal?.metadata?.availableSellQtyOverride ?? signal?.availableSellQtyOverride);
+  const availableQty = Number.isFinite(availableQtyOverride) && availableQtyOverride > 0
+    ? availableQtyOverride
+    : Number(portfolio?.availablePositionQty?.(signal?.tokenId) ?? portfolio?.position?.(signal?.tokenId) ?? 0);
+  if (!(availableQty > 0)) return { eligible: false, minDustExitUsd, minOrderUsd };
+  const availableSellUsd = availableQty * price;
+  const rawRequestedSellUsd = Number(signal?.sizeUsd);
+  const requestedSellUsd = Number.isFinite(rawRequestedSellUsd)
+    ? Math.max(0, Math.min(rawRequestedSellUsd, availableSellUsd))
+    : availableSellUsd;
+  return {
+    eligible: true,
+    minDustExitUsd,
+    minOrderUsd,
+    availableQty,
+    availableSellUsd,
+    requestedSellUsd,
+    isDustExit: requestedSellUsd > 0 && requestedSellUsd < minOrderUsd,
+    belowDustFloor: requestedSellUsd > 0 && requestedSellUsd < minDustExitUsd,
+  };
+}
+
+function reduceOnlyPaperExitPolicy(signal, portfolio, config) {
+  const configuredMinExitUsd = Number(config?.reduceOnlyMinExitUsd || 0.01);
+  const minReduceOnlyExitUsd = Math.max(0.01, configuredMinExitUsd);
+  if (String(signal?.side || '').toLowerCase() !== 'sell') {
+    return { eligible: false, minReduceOnlyExitUsd };
+  }
+  const price = Number(signal?.price);
+  if (!Number.isFinite(price) || price <= 0) {
+    return { eligible: false, minReduceOnlyExitUsd };
+  }
+  const availableQtyOverride = Number(signal?.metadata?.availableSellQtyOverride ?? signal?.availableSellQtyOverride);
+  const availableQty = Number.isFinite(availableQtyOverride) && availableQtyOverride > 0
+    ? availableQtyOverride
+    : Number(portfolio?.availablePositionQty?.(signal?.tokenId) ?? portfolio?.position?.(signal?.tokenId) ?? 0);
+  if (!(availableQty > 0)) {
+    return { eligible: false, minReduceOnlyExitUsd };
+  }
+  const availableSellUsd = availableQty * price;
+  const rawRequestedSellUsd = Number(signal?.sizeUsd);
+  const requestedSellUsd = Number.isFinite(rawRequestedSellUsd)
+    ? Math.max(0, Math.min(rawRequestedSellUsd, availableSellUsd))
+    : availableSellUsd;
+  const explicitReduceOnly = isReduceOnlyPaperExitSignal(signal);
+  return {
+    eligible: requestedSellUsd > 0,
+    explicitReduceOnly,
+    minReduceOnlyExitUsd,
+    availableQty,
+    availableSellUsd,
+    requestedSellUsd,
+    belowDustFloor: requestedSellUsd > 0 && requestedSellUsd < minReduceOnlyExitUsd,
+  };
+}
+
+function classifyGabagoolExit({
+  signal = null,
+  filledUsd = null,
+  avgEntryPrice = null,
+  sellPrice = null,
+  realizedPnl = null,
+  positionQtyBefore = null,
+  positionQtyAfter = null,
+  minOrderUsd = null,
+} = {}) {
+  const usd = Number(filledUsd);
+  const pnl = Number(realizedPnl);
+  const beforeQty = Number(positionQtyBefore);
+  const afterQty = Number(positionQtyAfter);
+  const avgEntry = Number(avgEntryPrice);
+  const sell = Number(sellPrice);
+  const explicitLossExitAllowed =
+    signal?.metadata?.reduceOnly === true ||
+    signal?.metadata?.exitMode === 'loss_guard_reduce_only' ||
+    signal?.metadata?.gabagool?.exitMode === 'loss_guard_reduce_only' ||
+    signal?.metadata?.gabagool?.exitTrigger === 'loss_guard_reduce_only';
+  if (!Number.isFinite(usd) || usd <= 0) return 'invalid_zero_size';
+  if (Number.isFinite(avgEntry) && avgEntry > 0 && Number.isFinite(sell) && sell < avgEntry - 1e-9) {
+    return explicitLossExitAllowed ? 'loss_exit' : 'blocked_loss_exit';
+  }
+  if (Number.isFinite(minOrderUsd) && usd < minOrderUsd) return 'dust_exit';
+  if (Number.isFinite(pnl) && pnl > 1e-9) return 'profit_exit';
+  if (Number.isFinite(pnl) && pnl < -1e-9) return 'loss_exit';
+  if (
+    signal?.metadata?.gabagool?.exitIntent === true ||
+    (Number.isFinite(beforeQty) && Number.isFinite(afterQty) && afterQty < beforeQty)
+  ) {
+    return 'inventory_reduce';
+  }
+  return 'unknown_exit';
 }
 
 function formatRiskBlockDetails(details = {}) {
@@ -7271,16 +12978,35 @@ function formatRiskBlockDetails(details = {}) {
     'minConfidence',
     'confidenceProfile',
     'thresholdSource',
+    'gabagoolConfidenceMode',
     'paperConfidenceOverrideEligible',
     'paperConfidenceOverrideReason',
+    'configuredGabagoolMinConfidence',
+    'configuredGabagoolMinConfidenceLive',
     'sizeUsd',
     'minOrderUsd',
     'availableCash',
     'currentPositionQty',
     'availableSellQty',
     'currentPositionUsd',
+    'riskTotalExposureUsd',
+    'portfolioPositionExposureUsd',
+    'portfolioOpenOrderExposureUsd',
+    'btcOraclePositionExposureUsd',
+    'btcOracleOpenOrderExposureUsd',
+    'nonBtcPositionExposureUsd',
+    'nonBtcOpenOrderExposureUsd',
+    'strategyBucket',
+    'strategyBucketCapUsd',
+    'strategyBucketExposureRawUsd',
+    'strategyBucketExposureExclusionUsd',
+    'strategyBucketExposureUsd',
+    'strategyBucketWouldExposureUsd',
     'totalExposureUsd',
     'maxTotalExposureUsd',
+    'exposureAvailableUsd',
+    'candidateSizeUsd',
+    'wouldTotalExposureUsd',
     'marketExposureUsd',
     'maxMarketExposureUsd',
     'maxPositionUsdPerAsset',
@@ -7366,6 +13092,7 @@ module.exports = {
   PaperPortfolio,
   PaperOrder,
   Signal,
+  SpreadHunterStrategy,
   VolatilityGuard,
   isBookComplete,
   topDepthUsd,

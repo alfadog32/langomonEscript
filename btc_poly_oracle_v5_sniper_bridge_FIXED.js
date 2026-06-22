@@ -554,11 +554,19 @@ function emitSignal({ impulse, latest, persistedAbsMove, finalBook }) {
   stats.lastSignalAt = lastSignalAt;
   stats.lastSignalDirection = signal.direction;
 
-  console.log(
-    `[ORACLE] ${signal.interrupt_level} ${signal.direction} ` +
-    `BTC=${fmtPct(persistedAbsMove)} poly=${polyMidMovePct === null ? 'n/a' : fmtPct(polyMidMovePct)} ` +
-    `lag=${fmtPct(lagScore)} OBI=${finalBook.obi.toFixed(4)} token=${shortId(impulse.tokenId)}`
-  );
+  try {
+    const polyMidMovePctForLog = Number.isFinite(signal?.poly_mid_move_pct) ? signal.poly_mid_move_pct : null;
+    const polyMoveText = polyMidMovePctForLog === null ? 'n/a' : fmtPct(polyMidMovePctForLog);
+    const lagScoreForLog = Number.isFinite(signal?.lag_score) ? signal.lag_score : null;
+    const lagText = lagScoreForLog === null ? 'n/a' : fmtPct(lagScoreForLog);
+    console.log(
+      `[ORACLE] ${signal.interrupt_level} ${signal.direction} ` +
+      `BTC=${fmtPct(persistedAbsMove)} poly=${polyMoveText} ` +
+      `lag=${lagText} OBI=${finalBook.obi.toFixed(4)} token=${shortId(impulse.tokenId)}`
+    );
+  } catch (error) {
+    console.warn(`${nowIso()} [ORACLE SIGNAL FORMAT ERROR] ${error.message}`);
+  }
 }
 
 function startPersistenceCheck(candidate) {

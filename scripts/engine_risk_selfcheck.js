@@ -92,11 +92,53 @@ function run() {
     assert.strictEqual(risk.lastBlockReason, null);
   }
 
+  {
+    const { portfolio, risk } = makeRisk();
+    seedPosition(portfolio, { qty: 10, avg: 0.4 });
+    portfolio.setMarkPrice('risk-token', 0.4);
+    const details = risk.riskDetails(makeSignal({ sizeUsd: 1 }));
+    assert.strictEqual(details.riskTotalExposureUsd, portfolio.totalExposureUsd(), 'risk exposure should match portfolio exposure for simple positions');
+    assert.strictEqual(details.portfolioPositionExposureUsd, portfolio.positionExposureUsd(), 'position exposure breakdown should match portfolio positions');
+    assert.strictEqual(details.portfolioOpenOrderExposureUsd, 0, 'simple positions should not have open-order exposure');
+  }
+
+  {
+    const { portfolio, risk } = makeRisk();
+    seedPosition(portfolio, { qty: 10, avg: 0.4 });
+    portfolio.recordFill({
+      tokenId: 'risk-token',
+      marketId: 'risk-market',
+      side: 'sell',
+      price: 0.5,
+      size: 10,
+      strategy: 'Seed',
+    });
+    const details = risk.riskDetails(makeSignal({ sizeUsd: 1 }));
+    assert.strictEqual(portfolio.position('risk-token'), 0, 'historical sell should fully close the seeded position');
+    assert.strictEqual(details.riskTotalExposureUsd, 0, 'closed positions and historical fills must not be double-counted');
+  }
+
   expectBlock('edge_below_min', { expectedEdge: 0.001 });
   expectBlock('confidence_below_min', { confidence: 0.10 });
   expectBlock('max_position_per_asset', { sizeUsd: 10 }, { config: { maxPositionUsdPerAsset: 5 } });
   expectBlock('max_total_exposure', { sizeUsd: 10 }, { config: { maxTotalExposureUsd: 5, maxMarketExposureUsd: 1_000, maxPositionUsdPerAsset: 1_000 } });
   expectBlock('cash_cap', { sizeUsd: 10 }, { config: { initialCash: 5, maxTotalExposureUsd: 1_000, maxMarketExposureUsd: 1_000, maxPositionUsdPerAsset: 1_000 } });
+
+  {
+    const { risk } = makeRisk({ config: { maxTotalExposureUsd: 5, maxMarketExposureUsd: 1_000, maxPositionUsdPerAsset: 1_000 } });
+    const result = risk.evaluate(makeSignal({ sizeUsd: 10 }));
+    assert.strictEqual(result, null, 'buy above the total exposure cap should block');
+    assert.strictEqual(risk.lastBlockReason, 'max_total_exposure');
+    assert.strictEqual(risk.lastBlockDetails.riskTotalExposureUsd, 0, 'fresh portfolio should start at zero exposure');
+    assert.strictEqual(risk.lastBlockDetails.candidateSizeUsd, 10, 'risk block details should include candidate size');
+    assert.strictEqual(risk.lastBlockDetails.wouldTotalExposureUsd, 10, 'risk block details should include post-trade exposure');
+    assert.strictEqual(typeof risk.lastBlockDetails.portfolioPositionExposureUsd, 'number');
+    assert.strictEqual(typeof risk.lastBlockDetails.portfolioOpenOrderExposureUsd, 'number');
+    assert.strictEqual(typeof risk.lastBlockDetails.btcOraclePositionExposureUsd, 'number');
+    assert.strictEqual(typeof risk.lastBlockDetails.btcOracleOpenOrderExposureUsd, 'number');
+    assert.strictEqual(typeof risk.lastBlockDetails.nonBtcPositionExposureUsd, 'number');
+    assert.strictEqual(typeof risk.lastBlockDetails.nonBtcOpenOrderExposureUsd, 'number');
+  }
 
   {
     const { risk } = makeRisk();
@@ -127,6 +169,26 @@ function run() {
       confidence: 0,
     }));
     assert(result, 'protective exit with valid position should pass risk');
+    assert.strictEqual(risk.lastBlockReason, null);
+  }
+
+  {
+    const { portfolio, risk } = makeRisk({
+      config: {
+        maxTotalExposureUsd: 5,
+        maxMarketExposureUsd: 1_000,
+        maxPositionUsdPerAsset: 1_000,
+      },
+    });
+    seedPosition(portfolio, { qty: 20, avg: 0.4 });
+    portfolio.setMarkPrice('risk-token', 0.4);
+    const result = risk.evaluate(makeSignal({
+      side: 'sell',
+      sizeUsd: 4,
+      price: 0.40,
+    }));
+    assert(result, 'sell reducing an existing position should pass even above the total exposure cap');
+    assert.strictEqual(result.metadata.risk_exposure_reduce_allowed, true, 'sell reducing exposure should be tagged as explicitly allowed');
     assert.strictEqual(risk.lastBlockReason, null);
   }
 

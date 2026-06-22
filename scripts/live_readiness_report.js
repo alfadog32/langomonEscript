@@ -9,7 +9,12 @@ const { readConfig: readLiveConfig } = require('../live_adapter_polymarket');
 const { readConfig: readTelegramConfig } = require('../telegram/telegram_approval_bot');
 
 const ROOT = process.cwd();
-const REQUIRED_PM2 = ['langomonEscript', 'liveIntentRouter', 'telegramApprovalBot', 'moneyMakerDashboard'];
+const REQUIRED_PM2 = {
+  langomonEscript: ['langomonEscript'],
+  liveIntentRouter: ['liveIntentRouter'],
+  telegramApprovalBot: ['telegramApprovalBot'],
+  moneyMakerDashboard: ['moneyMakerDashboard', 'langomon-dashboard'],
+};
 
 function loadEnvFile(filePath) {
   const resolved = path.resolve(filePath);
@@ -194,8 +199,8 @@ function main() {
     reasons.push(`pm2 status unavailable: ${pm2.error}`);
   }
 
-  for (const name of REQUIRED_PM2) {
-    const proc = byName.get(name);
+  for (const [name, aliases] of Object.entries(REQUIRED_PM2)) {
+    const proc = aliases.map((alias) => byName.get(alias)).find(Boolean);
     const online = proc?.pm2_env?.status === 'online';
     pm2Checks[name] = online ? 'online' : 'missing_or_not_online';
     if (!online) reasons.push(`${name} is not online`);

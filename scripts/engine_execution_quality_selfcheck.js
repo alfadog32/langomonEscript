@@ -222,6 +222,27 @@ function makeBootstrapBook(overrides = {}) {
   });
 }
 
+function makeProbationSignal(overrides = {}) {
+  return makeSignal({
+    tokenId: 'probation-token',
+    sizeUsd: 1,
+    expectedEdge: 0.011,
+    confidence: 0.344,
+    metadata: {
+      consensus: { score: 0.72, authorized: true },
+      paperProbation: {
+        active: true,
+        paperOnly: true,
+        trigger: 'ghost_throttle_zero_order_drought',
+        minConfidence: 0.34,
+        strictMinConfidence: 0.70,
+        tinySizeUsd: 1,
+      },
+    },
+    ...overrides,
+  });
+}
+
 function queueAndFlush(bot, signal, asset, book) {
   bot.trySignal(signal, asset, book);
   bot.flushSophieBootstrapCandidates();
@@ -239,7 +260,7 @@ function captureLogs(fn) {
   return lines;
 }
 
-function run() {
+async function run() {
   {
     const bot = makeBot();
     const asset = makeAsset('low-fill-token');
@@ -621,6 +642,76 @@ function run() {
   }
 
   {
+    const bot = makeBot({
+      maxOpenOrders: 10,
+      minConfidence: 0.70,
+      standardPaperMinConfidence: 0.70,
+      spreadHunterMinConfidencePaper: 0.70,
+      sophieMinExecutionQuality: 0.80,
+      sophieCalibratedAdmissionEnabled: false,
+      sophieBootstrapAdmissionEnabled: false,
+      paperMakerOptimizerEnabled: false,
+      paperMakerNudgeEnabled: false,
+    });
+    const asset = makeAsset('probation-admit-token');
+    const signal = makeProbationSignal({ tokenId: asset.tokenId });
+    bot.trySignal(signal, asset, makeBook());
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'paper probation candidate should place a tiny paper order');
+    assert.strictEqual(bot.lastSophieQualityDecision.qualityDecision, 'PAPER_PROBATION_ADMIT');
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.probationAdmissionsLastHour, 1, 'probation admissions should be counted');
+  }
+
+  {
+    const bot = makeBot({
+      maxOpenOrders: 10,
+      minConfidence: 0.70,
+      standardPaperMinConfidence: 0.70,
+      spreadHunterMinConfidencePaper: 0.70,
+      sophieMinExecutionQuality: 0.80,
+      sophieCalibratedAdmissionEnabled: false,
+      sophieBootstrapAdmissionEnabled: false,
+      paperMakerOptimizerEnabled: false,
+      paperMakerNudgeEnabled: false,
+    });
+    const asset = makeAsset('probation-repeat-bypass-token');
+    const signal = makeProbationSignal({ tokenId: asset.tokenId });
+    bot.sophieRepeatCandidateCooldownUntil.set(bot.repeatCandidateKey(signal), Date.now() + 60_000);
+    bot.trySignal(signal, asset, makeBook());
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'repeat cooldown must not starve the only probation candidate');
+    assert.notStrictEqual(bot.lastSophieQualityDecision.qualityDecision, 'REPEAT_COOLDOWN');
+  }
+
+  {
+    const bot = makeBot({
+      maxOpenOrders: 10,
+      baseOrderUsd: 2,
+      minOrderUsd: 1,
+      minConfidence: 0.70,
+      standardPaperMinConfidence: 0.70,
+      spreadHunterMinConfidencePaper: 0.70,
+      spreadHunterGhostGateEnabled: true,
+      spreadHunterGhostMinSamples: 10,
+      spreadHunterMinGhostFavorablePct: 15,
+      spreadHunterGhostSizeMultiplier: 0.49,
+      paperMakerOptimizerEnabled: false,
+      paperMakerNudgeEnabled: false,
+    });
+    bot.portfolio.ghostStats.total = 100;
+    bot.portfolio.ghostStats.favorable = 8;
+    const strategy = bot.strategies.find((entry) => entry.name === 'SpreadHunter');
+    const asset = makeAsset('probation-generate-token');
+    asset.market.volume24h = 10_000;
+    const signals = await strategy.generate(
+      asset,
+      makeBook({ bestBid: 0.45, bestAsk: 0.55, midpoint: 0.50, spread: 0.10 })
+    );
+    assert.strictEqual(signals.length, 1, 'ghost throttle drought should still emit one probation candidate');
+    assert.strictEqual(Number(signals[0].sizeUsd), 1, 'probation size should be the tiny paper minimum');
+    assert.strictEqual(signals[0].metadata.paperProbation.active, true, 'generated candidate should carry paper probation metadata');
+  }
+
+  {
     const bot = makeBot();
     addOpenOrder(bot, makeSignal({ tokenId: 'strong-old-1', price: 0.49, expectedEdge: 0.04, confidence: 0.90 }), 90_000);
     addOpenOrder(bot, makeSignal({ tokenId: 'strong-old-2', price: 0.49, expectedEdge: 0.04, confidence: 0.90 }), 90_000);
@@ -686,7 +777,8 @@ function run() {
       confidence: 1,
       metadata: {},
     }), asset, makeBook());
-    assert.strictEqual(bot.lastDustExitSuppressed.reason, 'DUST_EXIT_SUPPRESSED', 'dust must remain suppression-only');
+    assert.strictEqual(bot.lastDustExitSuppressed, null, 'protective paper exits now bypass the legacy dust-suppression path');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'small protective exits should still rest as open orders before any fill logic runs');
     assert(bot.portfolio.position(asset.tokenId) > 0, 'dust must not be force-sold');
   }
 
@@ -702,4 +794,7 @@ function run() {
   console.log('engine execution quality self-check passed');
 }
 
-run();
+run().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
