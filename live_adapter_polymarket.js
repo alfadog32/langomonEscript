@@ -43,6 +43,32 @@ function toNum(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function toInt(value, fallback = 0) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function toOptionalBool(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const s = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(s)) return false;
+  return null;
+}
+
+function normalizeAddress(value) {
+  const s = String(value || '').trim();
+  return s ? s.toLowerCase() : '';
+}
+
+function parseTimestampMs(value) {
+  if (value === undefined || value === null || value === '') return NaN;
+  const n = Number(value);
+  if (Number.isFinite(n)) return n > 10_000_000_000 ? n : n * 1000;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
 function normalizePrivateKey(value) {
   const s = String(value || '').trim();
   if (!s) return '';
@@ -152,6 +178,234 @@ function secretFileExists(config) {
   return fs.existsSync(path.resolve(config.baseDir, config.liveSecretsPath));
 }
 
+const LIVE_STAGE_PROFILES = Object.freeze({
+  0: {
+    stage: 0,
+    name: 'paper_only',
+    description: 'Stage 0: paper only',
+    submitAllowed: false,
+    maxLiveOrderUsd: 0,
+    maxLiveTotalExposureUsd: 0,
+    liveDailyMaxLossUsd: 0,
+    maxOrdersPerHour: 0,
+    singleMarketOnly: false,
+  },
+  1: {
+    stage: 1,
+    name: 'live_auth_dry_run_only',
+    description: 'Stage 1: live auth dry-run only',
+    submitAllowed: false,
+    maxLiveOrderUsd: 0,
+    maxLiveTotalExposureUsd: 0,
+    liveDailyMaxLossUsd: 0,
+    maxOrdersPerHour: 0,
+    singleMarketOnly: false,
+  },
+  2: {
+    stage: 2,
+    name: 'canary_live',
+    description: 'Stage 2: canary live, max $1, one market only, one order per hour',
+    submitAllowed: true,
+    maxLiveOrderUsd: 1,
+    maxLiveTotalExposureUsd: 1,
+    liveDailyMaxLossUsd: 1,
+    maxOrdersPerHour: 1,
+    singleMarketOnly: true,
+  },
+  3: {
+    stage: 3,
+    name: 'micro_live',
+    description: 'Stage 3: micro-live, max $2, max daily loss $5',
+    submitAllowed: true,
+    maxLiveOrderUsd: 2,
+    maxLiveTotalExposureUsd: 2,
+    liveDailyMaxLossUsd: 5,
+    maxOrdersPerHour: 6,
+    singleMarketOnly: false,
+  },
+  4: {
+    stage: 4,
+    name: 'normal_live',
+    description: 'Stage 4: normal live, explicit manual env change required',
+    submitAllowed: true,
+    maxLiveOrderUsd: null,
+    maxLiveTotalExposureUsd: null,
+    liveDailyMaxLossUsd: null,
+    maxOrdersPerHour: null,
+    singleMarketOnly: false,
+  },
+});
+
+const REQUIRED_LIVE_SECRET_ENV = Object.freeze([
+  'POLYMARKET_PRIVATE_KEY',
+  'POLYMARKET_API_KEY',
+  'POLYMARKET_API_SECRET',
+  'POLYMARKET_API_PASSPHRASE',
+]);
+
+const REQUIRED_FUNDER_ENV = Object.freeze([
+  'POLYMARKET_PROXY_WALLET_ADDRESS',
+  'POLYMARKET_FUNDER_ADDRESS',
+  'DEPOSIT_WALLET_ADDRESS',
+]);
+
+function resolveLiveStageProfile(configLike = {}) {
+  const requestedStage = Math.max(0, Math.min(4, toInt(configLike.liveTradingStage, 0)));
+  const base = LIVE_STAGE_PROFILES[requestedStage] || LIVE_STAGE_PROFILES[0];
+  return {
+    ...base,
+    maxLiveOrderUsd: base.maxLiveOrderUsd == null ? Number(configLike.maxLiveOrderUsd || 0) : Math.min(Number(configLike.maxLiveOrderUsd || 0), base.maxLiveOrderUsd),
+    maxLiveTotalExposureUsd: base.maxLiveTotalExposureUsd == null
+      ? Number(configLike.maxLiveTotalExposureUsd || 0)
+      : Math.min(Number(configLike.maxLiveTotalExposureUsd || 0), base.maxLiveTotalExposureUsd),
+    liveDailyMaxLossUsd: base.liveDailyMaxLossUsd == null
+      ? Math.abs(Number(configLike.liveDailyMaxLossUsd || 0))
+      : Math.min(Math.abs(Number(configLike.liveDailyMaxLossUsd || 0)), base.liveDailyMaxLossUsd),
+    maxOrdersPerHour: base.maxOrdersPerHour == null ? toInt(configLike.liveMaxOrdersPerHour, 25) : base.maxOrdersPerHour,
+    singleMarketId: String(configLike.liveCanaryMarketId || '').trim() || null,
+  };
+}
+
+function secretFileStatus(config) {
+  const resolved = path.resolve(config.baseDir, config.liveSecretsPath);
+  const exists = fs.existsSync(resolved);
+  let readable = false;
+  let writable = false;
+  try {
+    fs.accessSync(resolved, fs.constants.R_OK);
+    readable = true;
+  } catch (_) {}
+  try {
+    fs.accessSync(resolved, fs.constants.W_OK);
+    writable = true;
+  } catch (_) {}
+  return {
+    path: resolved,
+    exists,
+    readable,
+    writable,
+  };
+}
+
+// -----------------------------
+// Network / signing-proof helpers
+// -----------------------------
+
+const NETWORK_ERROR_TOKENS = Object.freeze([
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'EPIPE',
+  'getaddrinfo',
+  'fetch failed',
+  'network request failed',
+  'socket hang up',
+]);
+
+function classifySigningError(err) {
+  if (!err) return { kind: 'UNKNOWN', message: '' };
+  const message = err && err.message ? String(err.message) : String(err);
+  const code = err && err.code ? String(err.code) : '';
+  const causeMessage = err && err.cause && err.cause.message ? String(err.cause.message) : '';
+  const causeCode = err && err.cause && err.cause.code ? String(err.cause.code) : '';
+  const haystack = `${code} ${causeCode} ${message} ${causeMessage}`.toLowerCase();
+  for (const token of NETWORK_ERROR_TOKENS) {
+    if (haystack.includes(token.toLowerCase())) {
+      return { kind: 'NETWORK_REQUIRED_FOR_SIGNING_PROOF', message };
+    }
+  }
+  return { kind: 'SIGNING_ERROR', message };
+}
+
+async function probeHostReachable(rawUrl, { timeoutMs = 3000, method = 'GET', healthPath = '' } = {}) {
+  const started = Date.now();
+  let urlStr = String(rawUrl || '').trim();
+  if (!urlStr) {
+    return { reachable: false, latencyMs: 0, status: null, error: 'NO_URL_CONFIGURED' };
+  }
+  if (!/^https?:\/\//i.test(urlStr)) urlStr = `https://${urlStr}`;
+  let target;
+  try {
+    const u = new URL(urlStr);
+    if (healthPath && (u.pathname === '/' || u.pathname === '')) {
+      u.pathname = healthPath;
+    }
+    target = u.toString();
+  } catch (e) {
+    return { reachable: false, latencyMs: 0, status: null, error: `INVALID_URL:${safeError(e)}` };
+  }
+  if (typeof fetch !== 'function') {
+    return { reachable: false, latencyMs: 0, status: null, error: 'FETCH_UNAVAILABLE' };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(target, { method, signal: controller.signal });
+    const latencyMs = Date.now() - started;
+    return { reachable: res.status < 500, latencyMs, status: res.status, error: null };
+  } catch (e) {
+    const latencyMs = Date.now() - started;
+    const classified = classifySigningError(e);
+    return {
+      reachable: false,
+      latencyMs,
+      status: null,
+      error: classified.kind === 'NETWORK_REQUIRED_FOR_SIGNING_PROOF'
+        ? `NETWORK_UNREACHABLE:${classified.message}`
+        : safeError(e),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeRpcReachable(rawUrl, { timeoutMs = 3000 } = {}) {
+  const started = Date.now();
+  let urlStr = String(rawUrl || '').trim();
+  if (!urlStr) {
+    return { reachable: false, latencyMs: 0, status: null, error: 'NO_RPC_URL_CONFIGURED' };
+  }
+  if (!/^https?:\/\//i.test(urlStr)) urlStr = `https://${urlStr}`;
+  if (typeof fetch !== 'function') {
+    return { reachable: false, latencyMs: 0, status: null, error: 'FETCH_UNAVAILABLE' };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(urlStr, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }),
+      signal: controller.signal,
+    });
+    const latencyMs = Date.now() - started;
+    let chainId = null;
+    try {
+      const body = await res.json();
+      if (body && typeof body.result === 'string') chainId = body.result;
+    } catch (_) {}
+    return { reachable: res.status < 500, latencyMs, status: res.status, chainId, error: null };
+  } catch (e) {
+    const latencyMs = Date.now() - started;
+    const classified = classifySigningError(e);
+    return {
+      reachable: false,
+      latencyMs,
+      status: null,
+      chainId: null,
+      error: classified.kind === 'NETWORK_REQUIRED_FOR_SIGNING_PROOF'
+        ? `NETWORK_UNREACHABLE:${classified.message}`
+        : safeError(e),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function parseCliArgs(args) {
   const out = { _: [] };
   for (let i = 0; i < args.length; i += 1) {
@@ -200,8 +454,14 @@ function readIntentFromArgs(baseDir, args, fallback = null) {
     confidence: 0.8,
     sophieApproved: true,
     consensusScore: 0.8,
+    riskApproved: true,
+    oracleConfirmed: true,
+    persistenceConfirmed: true,
+    expectedEdge: 0.05,
     bookFresh: true,
     bookAgeMs: 250,
+    signalAgeMs: 250,
+    decisionLatencyMs: 100,
     currentLiveExposureUsd: 0,
     currentDailyLivePnlUsd: 0,
     tickSize: opts['tick-size'] || fallback?.tickSize || '0.01',
@@ -226,10 +486,10 @@ function printStructured(obj) {
 // -----------------------------
 function readConfig(baseDir = process.cwd()) {
   loadEnvFile(path.join(baseDir, '.env'), { override: false, required: false });
-
-  return {
+  const config = {
     baseDir,
     clobHost: process.env.POLYMARKET_CLOB_API_URL || 'https://clob.polymarket.com',
+    polygonRpcUrl: process.env.POLYMARKET_RPC_URL || process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com',
     chainId: Number(process.env.POLYMARKET_CHAIN_ID || process.env.CHAIN_ID || 137),
     liveSecretsPath: process.env.LIVE_SECRETS_PATH || './.env.live.secrets',
     liveIntentLogPath: process.env.LIVE_INTENT_LOG_PATH || './live_order_intents.ndjson',
@@ -242,12 +502,17 @@ function readConfig(baseDir = process.cwd()) {
     liveKillSwitch: toBool(process.env.LIVE_KILL_SWITCH, true),
     liveDryRunOnly: toBool(process.env.LIVE_DRY_RUN_ONLY, true),
     liveSubmitConfirm: toBool(process.env.LIVE_SUBMIT_CONFIRM, false),
+    liveFinalBossReady: toBool(process.env.LIVE_FINAL_BOSS_READY, false),
+    liveTradingStage: Math.max(0, Math.min(4, toInt(process.env.LIVE_TRADING_STAGE, 0))),
     liveAuthCheckAllow: toBool(process.env.LIVE_AUTH_CHECK_ALLOW, false),
     liveSigningTestAllow: toBool(process.env.LIVE_SIGNING_TEST_ALLOW, false),
     liveReconcileAllow: toBool(process.env.LIVE_RECONCILE_ALLOW, false),
     liveRequireSophieApproval: toBool(process.env.LIVE_REQUIRE_SOPHIE_APPROVAL, true),
+    liveRequireRiskApproval: toBool(process.env.LIVE_REQUIRE_RISK_APPROVAL, true),
     liveRequireFreshBook: toBool(process.env.LIVE_REQUIRE_FRESH_BOOK, true),
     liveRequireBurnIn: toBool(process.env.LIVE_REQUIRE_BURN_IN, true),
+    liveRequireOracleConfirmation: toBool(process.env.LIVE_REQUIRE_ORACLE_CONFIRMATION, true),
+    liveRequirePersistenceConfirmation: toBool(process.env.LIVE_REQUIRE_PERSISTENCE_CONFIRMATION, true),
     liveCancelReplaceEnabled: toBool(process.env.LIVE_CANCEL_REPLACE_ENABLED, false),
     liveCancelStaleOrders: toBool(process.env.LIVE_CANCEL_STALE_ORDERS, true),
     liveCancelTestAllow: toBool(process.env.LIVE_CANCEL_TEST_ALLOW, false),
@@ -262,13 +527,24 @@ function readConfig(baseDir = process.cwd()) {
     liveReplaceMinPriceDeltaTicks: toNum(process.env.LIVE_REPLACE_MIN_PRICE_DELTA_TICKS, 1),
     liveMaxBookAgeMs: toNum(process.env.LIVE_MAX_BOOK_AGE_MS, 1500),
     liveMaxSpread: toNum(process.env.LIVE_MAX_SPREAD, toNum(process.env.MAX_SPREAD, 0.12)),
+    liveMinExpectedEdge: toNum(process.env.LIVE_MIN_EXPECTED_EDGE, toNum(process.env.MIN_SIGNAL_EDGE, 0)),
+    liveMaxSignalAgeMs: toNum(process.env.LIVE_MAX_SIGNAL_AGE_MS, 10_000),
+    liveMaxDecisionLatencyMs: toNum(process.env.LIVE_MAX_DECISION_LATENCY_MS, 2_000),
+    liveMaxOrderBuildLatencyMs: toNum(process.env.LIVE_MAX_ORDER_BUILD_LATENCY_MS, 2_000),
+    liveMaxSubmitDryRunLatencyMs: toNum(process.env.LIVE_MAX_SUBMIT_DRY_RUN_LATENCY_MS, 2_500),
+    liveMaxOrdersPerHour: toInt(process.env.MAX_LIVE_ORDERS_PER_HOUR, 25),
     liveMinBurnInReports: toNum(process.env.LIVE_BURN_IN_MIN_REPORTS, 3),
     liveMinBurnInClosedPnlUsd: toNum(process.env.LIVE_BURN_IN_MIN_CLOSED_PNL_USD, 0),
     liveMaxBurnInDrawdownPct: toNum(process.env.LIVE_BURN_IN_MAX_DRAWDOWN_PCT, 3),
     liveMinGhostFavorablePct: toNum(process.env.LIVE_BURN_IN_MIN_GHOST_FAVORABLE_PCT, 0),
     liveBurnInOkOverride: toBool(process.env.LIVE_BURN_IN_OK, false),
     liveSophieMinScore: toNum(process.env.LIVE_SOPHIE_MIN_SCORE, toNum(process.env.CONSENSUS_THRESHOLD, 0.55)),
+    liveExpectedSignerAddress: normalizeAddress(process.env.LIVE_EXPECTED_SIGNER_ADDRESS || ''),
+    liveExpectedFunderAddress: normalizeAddress(process.env.LIVE_EXPECTED_FUNDER_ADDRESS || ''),
+    liveCanaryMarketId: firstString(process.env.LIVE_CANARY_MARKET_ID),
   };
+  config.liveStageProfile = resolveLiveStageProfile(config);
+  return config;
 }
 
 // -----------------------------
@@ -278,6 +554,12 @@ function normalizeIntent(rawIntent) {
   if (!rawIntent || typeof rawIntent !== 'object') {
     throw new Error('Order intent must be an object');
   }
+
+  const metadata = rawIntent.metadata || {};
+  const riskMeta = metadata.risk || rawIntent.risk || {};
+  const consensusMeta = metadata.consensus || rawIntent.consensus || rawIntent.sophie || {};
+  const bookAfterPersistence = rawIntent.book_after_persistence || rawIntent.bookAfterPersistence || {};
+  const timestampMs = parseTimestampMs(firstDefined(rawIntent.timestamp, rawIntent.ts));
 
   const intent = {
     id: rawIntent.id || createIntentId(rawIntent),
@@ -295,22 +577,53 @@ function normalizeIntent(rawIntent) {
     postOnly: rawIntent.postOnly,
     reason: rawIntent.reason || '',
     confidence: rawIntent.confidence !== undefined ? Number(rawIntent.confidence) : null,
-    sophieApproved: Boolean(rawIntent.sophieApproved || rawIntent.sophie_approved || rawIntent.sophie?.approved),
-    consensusScore: firstNumber(rawIntent.consensusScore, rawIntent.consensus_score, rawIntent.sophie?.score),
+    sophieApproved: Boolean(rawIntent.sophieApproved || rawIntent.sophie_approved || rawIntent.sophie?.approved || consensusMeta.authorized),
+    consensusScore: firstNumber(rawIntent.consensusScore, rawIntent.consensus_score, rawIntent.sophie?.score, consensusMeta.score),
+    riskApproved: toOptionalBool(firstDefined(
+      rawIntent.riskApproved,
+      rawIntent.risk_approved,
+      rawIntent.riskAdmitted,
+      rawIntent.risk_admitted,
+      riskMeta.approved,
+      riskMeta.admitted
+    )),
     whaleCopy: Boolean(rawIntent.whaleCopy || rawIntent.whale_copy || rawIntent.source === 'WhaleCopy'),
     oracleSignal: Boolean(rawIntent.oracleSignal || rawIntent.oracle_signal || rawIntent.source === 'BTCOracle'),
+    oracleConfirmed: toOptionalBool(firstDefined(
+      rawIntent.oracleConfirmed,
+      rawIntent.oracle_confirmed,
+      rawIntent.confirmed,
+      rawIntent.poly_lag_confirmed && rawIntent.lag_score_pass && rawIntent.obi_confirmed
+    )),
+    persistenceConfirmed: toOptionalBool(firstDefined(
+      rawIntent.persistenceConfirmed,
+      rawIntent.persistence_confirmed,
+      metadata.persistenceConfirmed,
+      bookAfterPersistence.valid
+    )),
     bookFresh: firstDefined(rawIntent.bookFresh, rawIntent.book_fresh) !== undefined ? Boolean(firstDefined(rawIntent.bookFresh, rawIntent.book_fresh)) : null,
     bookAgeMs: firstNumber(rawIntent.bookAgeMs, rawIntent.book_age_ms),
     bestBid: firstNumber(rawIntent.bestBid, rawIntent.best_bid, rawIntent.book?.bestBid, rawIntent.book?.best_bid),
     bestAsk: firstNumber(rawIntent.bestAsk, rawIntent.best_ask, rawIntent.book?.bestAsk, rawIntent.book?.best_ask),
+    expectedEdge: firstNumber(rawIntent.expectedEdge, rawIntent.expected_edge, metadata.expectedEdge, riskMeta.expectedEdge),
+    lowQualityBlocked: toOptionalBool(firstDefined(rawIntent.lowQualityBlocked, rawIntent.low_quality_blocked, metadata.lowQualityBlocked)),
+    reentryBlocked: toOptionalBool(firstDefined(rawIntent.reentryBlocked, rawIntent.reentry_blocked, metadata.reentryBlocked)),
+    repeatCooldownBlocked: toOptionalBool(firstDefined(rawIntent.repeatCooldownBlocked, rawIntent.repeat_cooldown_blocked, metadata.repeatCooldownBlocked)),
+    signalAgeMs: firstNumber(rawIntent.signalAgeMs, rawIntent.signal_age_ms, metadata.signalAgeMs),
+    decisionLatencyMs: firstNumber(rawIntent.decisionLatencyMs, rawIntent.decision_latency_ms, metadata.decisionLatencyMs),
     currentLiveExposureUsd: firstNumber(rawIntent.currentLiveExposureUsd, rawIntent.current_live_exposure_usd, 0),
     currentDailyLivePnlUsd: firstNumber(rawIntent.currentDailyLivePnlUsd, rawIntent.current_daily_live_pnl_usd, 0),
+    currentLiveOrdersLastHour: firstNumber(rawIntent.currentLiveOrdersLastHour, rawIntent.current_live_orders_last_hour, 0),
     paperBurnIn: rawIntent.paperBurnIn || rawIntent.paper_burn_in || rawIntent.burnIn || rawIntent.burn_in || null,
     tickSize: rawIntent.tickSize || rawIntent.tick_size || null,
     negRisk: firstDefined(rawIntent.negRisk, rawIntent.neg_risk) !== undefined ? Boolean(firstDefined(rawIntent.negRisk, rawIntent.neg_risk)) : null,
     minOrderSize: firstDefined(rawIntent.minOrderSize, rawIntent.min_order_size) !== undefined ? Number(firstDefined(rawIntent.minOrderSize, rawIntent.min_order_size)) : null,
     raw: rawIntent,
   };
+
+  if (!Number.isFinite(intent.signalAgeMs) && Number.isFinite(timestampMs)) {
+    intent.signalAgeMs = Math.max(0, Date.now() - timestampMs);
+  }
 
   if (!intent.sizeShares && intent.sizeUsd > 0 && Number.isFinite(intent.price) && intent.price > 0) {
     intent.sizeShares = intent.sizeUsd / intent.price;
@@ -351,25 +664,51 @@ function evaluateBurnIn(config, intent) {
   return { ok: reasons.length === 0, reasons, source: 'intent.paperBurnIn' };
 }
 
-function evaluateStaticSafety(config, intent) {
+function evaluateStaticSafety(config, intent, options = {}) {
   const reasons = [];
+  const submitMode = options.mode === 'submit';
+  const stageProfile = config.liveStageProfile || resolveLiveStageProfile(config);
+  const effectiveMaxLiveOrderUsd = stageProfile.maxLiveOrderUsd || config.maxLiveOrderUsd;
+  const effectiveMaxLiveTotalExposureUsd = stageProfile.maxLiveTotalExposureUsd || config.maxLiveTotalExposureUsd;
+  const effectiveDailyMaxLossUsd = stageProfile.liveDailyMaxLossUsd || Math.abs(config.liveDailyMaxLossUsd);
 
-  if (!config.enableLiveTrading) reasons.push('LIVE_DISABLED');
-  if (!config.liveAutoExecute) reasons.push('AUTO_EXECUTE_DISABLED');
-  if (config.liveKillSwitch) reasons.push('KILL_SWITCH_ACTIVE');
-  if (config.liveDryRunOnly) reasons.push('DRY_RUN_ONLY');
-  if (!config.liveSubmitConfirm) reasons.push('LIVE_SUBMIT_CONFIRM_REQUIRED');
+  if (submitMode) {
+    if (!config.enableLiveTrading) reasons.push('LIVE_DISABLED');
+    if (!config.liveAutoExecute) reasons.push('AUTO_EXECUTE_DISABLED');
+    if (config.liveKillSwitch) reasons.push('KILL_SWITCH_ACTIVE');
+    if (config.liveDryRunOnly) reasons.push('DRY_RUN_ONLY');
+    if (!config.liveSubmitConfirm) reasons.push('LIVE_SUBMIT_CONFIRM_REQUIRED');
+    if (!config.liveFinalBossReady) reasons.push('LIVE_FINAL_BOSS_NOT_READY');
+    if (!stageProfile.submitAllowed) reasons.push(`LIVE_STAGE_${stageProfile.stage}_SUBMIT_BLOCKED`);
+    if (stageProfile.singleMarketOnly && !stageProfile.singleMarketId) reasons.push('LIVE_CANARY_MARKET_ID_REQUIRED');
+    if (stageProfile.singleMarketOnly && stageProfile.singleMarketId && intent.marketId && intent.marketId !== stageProfile.singleMarketId) {
+      reasons.push('LIVE_CANARY_MARKET_MISMATCH');
+    }
+  }
 
   if (!intent.tokenId) reasons.push('TOKEN_ID_MISSING');
   if (!['BUY', 'SELL'].includes(intent.side)) reasons.push('INVALID_SIDE');
   if (!Number.isFinite(intent.price) || intent.price <= 0 || intent.price >= 1) reasons.push('INVALID_PRICE');
   if (!Number.isFinite(intent.sizeUsd) || intent.sizeUsd <= 0) reasons.push('INVALID_SIZE_USD');
-  if (intent.sizeUsd > config.maxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
-  if (intent.currentLiveExposureUsd + intent.sizeUsd > config.maxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
-  if (intent.currentDailyLivePnlUsd <= -Math.abs(config.liveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
+  if (intent.sizeUsd > effectiveMaxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
+  if (intent.currentLiveExposureUsd + intent.sizeUsd > effectiveMaxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
+  if (intent.currentDailyLivePnlUsd <= -Math.abs(effectiveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
+  if (stageProfile.maxOrdersPerHour > 0 && intent.currentLiveOrdersLastHour >= stageProfile.maxOrdersPerHour) reasons.push('MAX_LIVE_ORDERS_PER_HOUR_EXCEEDED');
 
   if (config.liveRequireSophieApproval && intent.sophieApproved !== true) reasons.push('SOPHIE_NOT_APPROVED');
   if (Number.isFinite(intent.consensusScore) && intent.consensusScore < config.liveSophieMinScore) reasons.push('SOPHIE_SCORE_TOO_LOW');
+  if (config.liveRequireRiskApproval && intent.riskApproved !== true) reasons.push('RISK_NOT_APPROVED');
+  if (config.liveRequireOracleConfirmation && intent.oracleSignal && intent.oracleConfirmed !== true) reasons.push('ORACLE_NOT_CONFIRMED');
+  if (config.liveRequirePersistenceConfirmation && intent.oracleSignal && intent.persistenceConfirmed !== true) reasons.push('PERSISTENCE_NOT_CONFIRMED');
+  if (Number.isFinite(config.liveMinExpectedEdge) && config.liveMinExpectedEdge > 0) {
+    if (!Number.isFinite(intent.expectedEdge)) reasons.push('EXPECTED_EDGE_MISSING');
+    else if (intent.expectedEdge < config.liveMinExpectedEdge) reasons.push('EXPECTED_EDGE_TOO_LOW');
+  }
+  if (intent.lowQualityBlocked === true) reasons.push('LOW_QUALITY_BLOCKED');
+  if (intent.reentryBlocked === true) reasons.push('REENTRY_GUARD_ACTIVE');
+  if (intent.repeatCooldownBlocked === true) reasons.push('REPEAT_COOLDOWN_ACTIVE');
+  if (Number.isFinite(intent.signalAgeMs) && intent.signalAgeMs > config.liveMaxSignalAgeMs) reasons.push('SIGNAL_TOO_OLD');
+  if (Number.isFinite(intent.decisionLatencyMs) && intent.decisionLatencyMs > config.liveMaxDecisionLatencyMs) reasons.push('DECISION_LATENCY_TOO_HIGH');
   if (config.liveRequireFreshBook && intent.bookFresh !== true) reasons.push('BOOK_NOT_FRESH');
   if (config.liveRequireFreshBook && Number.isFinite(intent.bookAgeMs) && intent.bookAgeMs > config.liveMaxBookAgeMs) reasons.push('BOOK_TOO_OLD');
   if (intent.whaleCopy && !config.liveWhaleCopyTrading) reasons.push('WHALE_COPY_DISABLED');
@@ -382,14 +721,25 @@ function evaluateStaticSafety(config, intent) {
     ok: reasons.length === 0,
     reasons,
     burnIn: burn,
+    stageProfile,
+    effectiveCaps: {
+      maxLiveOrderUsd: effectiveMaxLiveOrderUsd,
+      maxLiveTotalExposureUsd: effectiveMaxLiveTotalExposureUsd,
+      liveDailyMaxLossUsd: effectiveDailyMaxLossUsd,
+      maxOrdersPerHour: stageProfile.maxOrdersPerHour,
+    },
   };
 }
 
 function evaluateLossExposureGuards(config, intent) {
+  const stageProfile = config.liveStageProfile || resolveLiveStageProfile(config);
+  const effectiveMaxLiveOrderUsd = stageProfile.maxLiveOrderUsd || config.maxLiveOrderUsd;
+  const effectiveMaxLiveTotalExposureUsd = stageProfile.maxLiveTotalExposureUsd || config.maxLiveTotalExposureUsd;
+  const effectiveDailyMaxLossUsd = stageProfile.liveDailyMaxLossUsd || Math.abs(config.liveDailyMaxLossUsd);
   const reasons = [];
-  if (intent.currentDailyLivePnlUsd <= -Math.abs(config.liveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
-  if (intent.currentLiveExposureUsd + intent.sizeUsd > config.maxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
-  if (intent.sizeUsd > config.maxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
+  if (intent.currentDailyLivePnlUsd <= -Math.abs(effectiveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
+  if (intent.currentLiveExposureUsd + intent.sizeUsd > effectiveMaxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
+  if (intent.sizeUsd > effectiveMaxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
   return { ok: reasons.length === 0, reasons };
 }
 
@@ -539,15 +889,19 @@ class PolymarketLiveClient {
     this.client = null;
     this.sdk = null;
     this.walletAddress = null;
+    this.signerAddress = null;
     this.privateKeyAccessed = false;
     this.clientPurpose = null;
   }
 
   canSubmitLive() {
+    const stageProfile = this.config.liveStageProfile || resolveLiveStageProfile(this.config);
     return this.config.enableLiveTrading
       && this.config.liveAutoExecute
       && !this.config.liveKillSwitch
       && !this.config.liveDryRunOnly
+      && this.config.liveFinalBossReady
+      && stageProfile.submitAllowed
       && this.config.liveSubmitConfirm;
   }
 
@@ -557,13 +911,17 @@ class PolymarketLiveClient {
 
   secretAccessDecision(purpose) {
     const reasons = [];
-    if (!secretFileExists(this.config)) reasons.push('LIVE_SECRETS_FILE_MISSING');
+    const secretStatus = secretFileStatus(this.config);
+    if (!secretStatus.exists) reasons.push('LIVE_SECRETS_FILE_MISSING');
+    if (secretStatus.exists && !secretStatus.readable) reasons.push('LIVE_SECRETS_FILE_UNREADABLE');
 
     if (purpose === 'submit') {
       if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
       if (!this.config.liveAutoExecute) reasons.push('LIVE_AUTO_EXECUTE_FALSE');
       if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
       if (this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_TRUE');
+      if (!this.config.liveFinalBossReady) reasons.push('LIVE_FINAL_BOSS_READY_FALSE');
+      if (!(this.config.liveStageProfile || resolveLiveStageProfile(this.config)).submitAllowed) reasons.push('LIVE_STAGE_SUBMIT_DISABLED');
       if (!this.config.liveSubmitConfirm) reasons.push('LIVE_SUBMIT_CONFIRM_REQUIRED');
     } else if (purpose === 'cancel') {
       if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
@@ -572,11 +930,19 @@ class PolymarketLiveClient {
       if (this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_TRUE');
       if (!this.config.liveCancelTestAllow) reasons.push('LIVE_CANCEL_TEST_ALLOW_FALSE');
     } else if (purpose === 'auth-check') {
-      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      // Stage 1 dry-run proof: allow auth-check without ENABLE_LIVE_TRADING
+      // so the operator can prove signer/auth wiring while live flags stay OFF.
+      // Still requires explicit LIVE_AUTH_CHECK_ALLOW=true and dry-run mode,
+      // and kill switch must not be active.
+      if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
       if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_AUTH_CHECK');
       if (!this.config.liveAuthCheckAllow) reasons.push('LIVE_AUTH_CHECK_ALLOW_FALSE');
     } else if (purpose === 'signing-test') {
-      if (!this.config.enableLiveTrading) reasons.push('ENABLE_LIVE_TRADING_FALSE');
+      // Stage 1 dry-run proof: allow signing-test without ENABLE_LIVE_TRADING
+      // so the operator can prove signature construction while live flags stay
+      // OFF. Still requires LIVE_SIGNING_TEST_ALLOW=true and dry-run mode and
+      // kill switch off.
+      if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
       if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_SIGNING_TEST');
       if (!this.config.liveSigningTestAllow) reasons.push('LIVE_SIGNING_TEST_ALLOW_FALSE');
     } else if (purpose === 'reconcile') {
@@ -610,7 +976,8 @@ class PolymarketLiveClient {
     const { privateKeyToAccount } = await import('viem/accounts');
 
     const account = privateKeyToAccount(privateKey);
-    const signer = createWalletClient({ account, transport: http() });
+    const signer = createWalletClient({ account, transport: http(this.config.polygonRpcUrl) });
+    this.signerAddress = account.address;
     this.walletAddress = funderAddress || account.address;
 
     const l1Client = new sdk.ClobClient({
@@ -665,9 +1032,12 @@ class PolymarketLiveClient {
       event.clientInitialized = Boolean(this.client);
       event.apiCredentialsReady = Boolean(process.env.POLYMARKET_API_KEY && process.env.POLYMARKET_API_SECRET && process.env.POLYMARKET_API_PASSPHRASE) || Boolean(this.client);
       event.walletAddress = redactWallet(this.walletAddress);
+      event.signerAddress = redactWallet(this.signerAddress);
+      event.funderAddress = redactWallet(process.env.POLYMARKET_PROXY_WALLET_ADDRESS || process.env.POLYMARKET_FUNDER_ADDRESS || process.env.DEPOSIT_WALLET_ADDRESS);
+      event.signatureType = Number(process.env.POLYMARKET_SIGNATURE_TYPE || 3);
     } catch (e) {
       event.errors.push(safeError(e));
-      event.missingEnv = missingEnv(['POLYMARKET_PRIVATE_KEY']);
+      event.missingEnv = missingEnv(REQUIRED_LIVE_SECRET_ENV);
     }
 
     return event;
@@ -683,10 +1053,53 @@ class PolymarketLiveClient {
       size: Number(intent.sizeShares),
       side,
     };
-    return client.createOrder(userOrder, {
+    const startedAt = Date.now();
+    const signedOrder = await client.createOrder(userOrder, {
       tickSize: String(meta.tickSize),
       negRisk: Boolean(meta.negRisk),
     });
+    return {
+      signedOrder,
+      orderConstructionLatencyMs: Math.max(0, Date.now() - startedAt),
+    };
+  }
+
+  /**
+   * Local-only signing proof: uses the SDK's orderBuilder.buildOrder directly
+   * with pre-supplied tickSize and negRisk, bypassing the network-dependent
+   * _resolveTickSize and resolveVersion calls. Used by signing-test and
+   * auth-dry-run for deterministic Stage 1 proofs without market lookup.
+   * Never submits.
+   */
+  async signOrderLocalOnly(intent, meta, purpose = 'signing-test') {
+    const client = await this.init(purpose);
+    const sdk = this.sdk;
+    const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
+    const userOrder = {
+      tokenID: intent.tokenId,
+      price: Number(intent.price),
+      size: Number(intent.sizeShares),
+      side,
+    };
+    const tickSize = String(meta.tickSize || '0.01');
+    const negRisk = Boolean(meta.negRisk);
+    // Force exchange version 2 for the modern Polymarket exchange. Local-only
+    // path explicitly skips client.resolveVersion() which would require network.
+    const version = 2;
+    if (!client.orderBuilder || typeof client.orderBuilder.buildOrder !== 'function') {
+      throw new Error('SDK orderBuilder.buildOrder unavailable; cannot run local signing proof');
+    }
+    const startedAt = Date.now();
+    const signedOrder = await client.orderBuilder.buildOrder(
+      userOrder,
+      { tickSize, negRisk },
+      version
+    );
+    return {
+      signedOrder,
+      orderConstructionLatencyMs: Math.max(0, Date.now() - startedAt),
+      localOnly: true,
+    };
   }
 
   async signingTest(intent, meta) {
@@ -699,15 +1112,47 @@ class PolymarketLiveClient {
       dryRunOnly: true,
       errors: [],
       intent: redactIntent(intent),
+      clobHost: this.config.clobHost,
+      polygonRpcConfigured: Boolean(this.config.polygonRpcUrl),
+      clobReachable: null,
+      clobReachableLatencyMs: null,
+      clobReachableError: null,
+      rpcReachable: null,
+      rpcReachableLatencyMs: null,
+      rpcReachableError: null,
+      rpcChainId: null,
+      orderConstructionLatencyMs: null,
+      signingProofPassed: false,
+      signingProofError: null,
     };
 
+    const clobProbe = await probeHostReachable(this.config.clobHost, { healthPath: '/' });
+    event.clobReachable = clobProbe.reachable;
+    event.clobReachableLatencyMs = clobProbe.latencyMs;
+    event.clobReachableError = clobProbe.error;
+
+    const rpcProbe = await probeRpcReachable(this.config.polygonRpcUrl);
+    event.rpcReachable = rpcProbe.reachable;
+    event.rpcReachableLatencyMs = rpcProbe.latencyMs;
+    event.rpcReachableError = rpcProbe.error;
+    event.rpcChainId = rpcProbe.chainId;
+
     try {
-      await this.signOrderOnly(intent, meta, 'signing-test');
+      const signed = await this.signOrderLocalOnly(intent, meta, 'signing-test');
       event.signed = true;
       event.privateKeyAccessed = this.privateKeyAccessed;
       event.walletAddress = redactWallet(this.walletAddress);
+      event.signerAddress = redactWallet(this.signerAddress);
+      event.orderConstructionLatencyMs = signed.orderConstructionLatencyMs;
+      event.localOnly = true;
+      event.signingProofPassed = true;
     } catch (e) {
+      const classified = classifySigningError(e);
       event.errors.push(safeError(e));
+      event.signingProofPassed = false;
+      event.signingProofError = classified.kind === 'NETWORK_REQUIRED_FOR_SIGNING_PROOF'
+        ? 'NETWORK_REQUIRED_FOR_SIGNING_PROOF'
+        : classified.kind;
     }
 
     return event;
@@ -785,9 +1230,15 @@ class PolymarketLiveClient {
     const orderType = sdk.OrderType[intent.orderType] || sdk.OrderType.GTC;
     const postOnly = intent.postOnly !== undefined ? Boolean(intent.postOnly) : this.config.livePostOnlyDefault;
 
-    const signedOrder = await this.signOrderOnly(intent, meta, 'submit');
-    const response = await client.postOrder(signedOrder, orderType, postOnly);
-    return { signedOrder, response };
+    const signed = await this.signOrderOnly(intent, meta, 'submit');
+    const submitStartedAt = Date.now();
+    const response = await client.postOrder(signed.signedOrder, orderType, postOnly);
+    return {
+      signedOrder: signed.signedOrder,
+      response,
+      orderConstructionLatencyMs: signed.orderConstructionLatencyMs,
+      submitLatencyMs: Math.max(0, Date.now() - submitStartedAt),
+    };
   }
 
   async replaceOrder({ orderId, replacementIntent, meta }) {
@@ -981,7 +1432,7 @@ class LiveAdapter {
 
   async evaluate(rawIntent, options = {}) {
     const intent = normalizeIntent(rawIntent);
-    const staticSafety = evaluateStaticSafety(this.config, intent);
+    const staticSafety = evaluateStaticSafety(this.config, intent, options);
     let metadataSafety = { ok: true, reasons: [], meta: { tickSize: intent.tickSize || '0.01', negRisk: Boolean(intent.negRisk), minOrderSize: Number(intent.minOrderSize || 0) } };
 
     if (options.fetchMetadata === true && this.live.canSubmitLive()) {
@@ -1008,6 +1459,9 @@ class LiveAdapter {
         privateKeyAccessed: false,
         staticSafety,
         metadataSafety,
+        liveFinalBossReady: this.config.liveFinalBossReady,
+        liveTradingStage: this.config.liveTradingStage,
+        liveStageProfile: this.config.liveStageProfile,
       },
     };
   }
@@ -1113,6 +1567,10 @@ class LiveAdapter {
         signed: true,
         secretsRead: true,
         privateKeyAccessed: true,
+        liveFinalBossReady: this.config.liveFinalBossReady,
+        liveTradingStage: this.config.liveTradingStage,
+        orderConstructionLatencyMs: result.orderConstructionLatencyMs,
+        submitLatencyMs: result.submitLatencyMs,
       },
     };
     this.logExecution(event);
@@ -1216,6 +1674,108 @@ class LiveAdapter {
     return event;
   }
 
+  async authDryRun(rawIntent) {
+    const cfg = this.config;
+    const secrets = secretFileStatus(cfg);
+    const stageProfile = cfg.liveStageProfile || resolveLiveStageProfile(cfg);
+
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_AUTH_DRY_RUN',
+      submitted: false,
+      stage: cfg.liveTradingStage,
+      stageProfile,
+      finalBossReady: cfg.liveFinalBossReady,
+      secretsFile: secrets,
+      missingSecretEnvNames: missingEnv(REQUIRED_LIVE_SECRET_ENV),
+      requiredSecretEnvNames: REQUIRED_LIVE_SECRET_ENV,
+      acceptedFunderEnvNames: REQUIRED_FUNDER_ENV,
+      signatureTypeEnvName: 'POLYMARKET_SIGNATURE_TYPE',
+      signatureType: Number(process.env.POLYMARKET_SIGNATURE_TYPE || 3),
+      funderEnvDetected: REQUIRED_FUNDER_ENV.find((name) => process.env[name]) || null,
+      clobHost: cfg.clobHost,
+      polygonRpcConfigured: Boolean(cfg.polygonRpcUrl),
+      readyForMicroLive: false,
+      reasons: [],
+    };
+
+    if (!secrets.exists) event.reasons.push('LIVE_SECRETS_FILE_MISSING');
+    if (secrets.exists && !secrets.readable) event.reasons.push('LIVE_SECRETS_FILE_UNREADABLE');
+
+    // Probe reachability up-front.
+    const clobProbe = await probeHostReachable(cfg.clobHost, { healthPath: '/' });
+    event.clobReachable = clobProbe.reachable;
+    event.clobReachableLatencyMs = clobProbe.latencyMs;
+    event.clobReachableError = clobProbe.error;
+    if (!clobProbe.reachable) event.reasons.push('CLOB_UNREACHABLE');
+
+    const rpcProbe = await probeRpcReachable(cfg.polygonRpcUrl);
+    event.rpcReachable = rpcProbe.reachable;
+    event.rpcReachableLatencyMs = rpcProbe.latencyMs;
+    event.rpcReachableError = rpcProbe.error;
+    event.rpcChainId = rpcProbe.chainId;
+    if (!rpcProbe.reachable) event.reasons.push('POLYGON_RPC_UNREACHABLE');
+
+    // Auth check (does not submit). Will fail safely if no secrets file or readable.
+    let authEvent = null;
+    if (cfg.liveAuthCheckAllow && secrets.exists && secrets.readable) {
+      try {
+        authEvent = await this.live.authCheck();
+      } catch (e) {
+        authEvent = { errors: [safeError(e)] };
+      }
+    } else if (!cfg.liveAuthCheckAllow) {
+      event.reasons.push('LIVE_AUTH_CHECK_ALLOW_FALSE');
+    }
+    event.authCheck = authEvent;
+    if (authEvent && Array.isArray(authEvent.errors) && authEvent.errors.length > 0) {
+      event.reasons.push('AUTH_CHECK_FAILED');
+    }
+
+    // Signing proof (does not submit).
+    let signingEvent = null;
+    if (cfg.liveSigningTestAllow && secrets.exists && secrets.readable && rawIntent) {
+      try {
+        signingEvent = await this.signingTest(rawIntent);
+      } catch (e) {
+        signingEvent = {
+          errors: [safeError(e)],
+          signingProofPassed: false,
+          signingProofError: classifySigningError(e).kind,
+        };
+      }
+    } else if (!cfg.liveSigningTestAllow) {
+      event.reasons.push('LIVE_SIGNING_TEST_ALLOW_FALSE');
+    } else if (!rawIntent) {
+      event.reasons.push('TEST_INTENT_REQUIRED');
+    }
+    event.signingProof = signingEvent;
+    if (signingEvent) {
+      event.orderConstructionLatencyMs = signingEvent.orderConstructionLatencyMs;
+      event.signingProofPassed = Boolean(signingEvent.signingProofPassed);
+      event.signingProofError = signingEvent.signingProofError || null;
+      if (!event.signingProofPassed) {
+        event.reasons.push(signingEvent.signingProofError || 'SIGNING_PROOF_FAILED');
+      }
+    }
+
+    // Reconcile callable check (do not actually reconcile if not allowed).
+    const reconcileDecision = this.live.secretAccessDecision('reconcile');
+    event.reconcileCallable = reconcileDecision.ok;
+    event.reconcileBlockReasons = reconcileDecision.reasons;
+
+    // Final readiness gate.
+    event.readyForMicroLive =
+      event.reasons.length === 0 &&
+      secrets.readable &&
+      clobProbe.reachable &&
+      rpcProbe.reachable &&
+      event.signingProofPassed === true;
+
+    this.logEvent(event);
+    return event;
+  }
+
   async metadataTest(rawIntent) {
     const intent = normalizeIntent(rawIntent);
     const metadataSafety = await evaluateMetadataSafety(null, intent, this.config);
@@ -1290,6 +1850,8 @@ class LiveAdapter {
 
   doctor() {
     const cfg = this.config;
+    const stageProfile = cfg.liveStageProfile || resolveLiveStageProfile(cfg);
+    const secrets = secretFileStatus(cfg);
     const event = {
       timestamp: nowIso(),
       type: 'LIVE_ADAPTER_DOCTOR',
@@ -1311,6 +1873,8 @@ class LiveAdapter {
         liveKillSwitch: cfg.liveKillSwitch,
         liveDryRunOnly: cfg.liveDryRunOnly,
         liveSubmitConfirm: cfg.liveSubmitConfirm,
+        liveFinalBossReady: cfg.liveFinalBossReady,
+        liveTradingStage: cfg.liveTradingStage,
         liveAuthCheckAllow: cfg.liveAuthCheckAllow,
         liveSigningTestAllow: cfg.liveSigningTestAllow,
         liveReconcileAllow: cfg.liveReconcileAllow,
@@ -1318,15 +1882,34 @@ class LiveAdapter {
         liveCancelStaleOrders: cfg.liveCancelStaleOrders,
         liveCancelTestAllow: cfg.liveCancelTestAllow,
         liveRequireBurnIn: cfg.liveRequireBurnIn,
+        liveRequireRiskApproval: cfg.liveRequireRiskApproval,
+        liveRequireOracleConfirmation: cfg.liveRequireOracleConfirmation,
+        liveRequirePersistenceConfirmation: cfg.liveRequirePersistenceConfirmation,
         liveWhaleCopyTrading: cfg.liveWhaleCopyTrading,
         liveAllowOracleSniper: cfg.liveAllowOracleSniper,
         maxLiveOrderUsd: cfg.maxLiveOrderUsd,
         maxLiveTotalExposureUsd: cfg.maxLiveTotalExposureUsd,
         liveDailyMaxLossUsd: cfg.liveDailyMaxLossUsd,
+        polygonRpcUrlConfigured: Boolean(cfg.polygonRpcUrl),
+        liveMinExpectedEdge: cfg.liveMinExpectedEdge,
+        liveMaxSignalAgeMs: cfg.liveMaxSignalAgeMs,
+        liveMaxDecisionLatencyMs: cfg.liveMaxDecisionLatencyMs,
+        liveMaxOrderBuildLatencyMs: cfg.liveMaxOrderBuildLatencyMs,
+        liveMaxSubmitDryRunLatencyMs: cfg.liveMaxSubmitDryRunLatencyMs,
         liveSecretsPath: cfg.liveSecretsPath,
       },
+      liveStageProfile: stageProfile,
       canSubmitLive: this.live.canSubmitLive(),
-      secretsFilePresent: secretFileExists(cfg),
+      secretsFile: secrets,
+      requiredSecretEnvNames: REQUIRED_LIVE_SECRET_ENV,
+      acceptedFunderEnvNames: REQUIRED_FUNDER_ENV,
+      signatureTypeEnvName: 'POLYMARKET_SIGNATURE_TYPE',
+      finalBossGate: {
+        configuredReadyFlag: cfg.liveFinalBossReady,
+        configuredStage: cfg.liveTradingStage,
+        submitAllowedAtStage: stageProfile.submitAllowed,
+        canSubmitLive: this.live.canSubmitLive(),
+      },
       submitted: false,
       signed: false,
     };
@@ -1379,6 +1962,7 @@ async function main() {
     console.log(`Usage:
   node live_adapter_polymarket.js doctor
   node live_adapter_polymarket.js auth-check
+  node live_adapter_polymarket.js auth-dry-run [--intent intent.json]
   node live_adapter_polymarket.js signing-test [--intent intent.json]
   node live_adapter_polymarket.js metadata-test [--intent intent.json|--token-id TOKEN]
   node live_adapter_polymarket.js reconcile
@@ -1407,6 +1991,12 @@ async function main() {
   if (command === 'signing-test') {
     const intent = readIntentFromArgs(baseDir, args);
     printStructured(await adapter.signingTest(intent));
+    return;
+  }
+
+  if (command === 'auth-dry-run') {
+    const intent = readIntentFromArgs(baseDir, args);
+    printStructured(await adapter.authDryRun(intent));
     return;
   }
 
@@ -1493,4 +2083,11 @@ module.exports = {
   evaluateMetadataSafety,
   evaluateBurnIn,
   evaluateLossExposureGuards,
+  probeHostReachable,
+  probeRpcReachable,
+  classifySigningError,
+  secretFileStatus,
+  resolveLiveStageProfile,
+  REQUIRED_LIVE_SECRET_ENV,
+  REQUIRED_FUNDER_ENV,
 };

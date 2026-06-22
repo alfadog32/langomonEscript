@@ -5,7 +5,14 @@ const fs = require('fs');
 const path = require('path');
 const childProcess = require('child_process');
 const { CONFIG } = require('../moneymaker_v3');
-const { readConfig: readLiveConfig } = require('../live_adapter_polymarket');
+const {
+  readConfig: readLiveConfig,
+  probeHostReachable,
+  probeRpcReachable,
+  secretFileStatus,
+  REQUIRED_LIVE_SECRET_ENV,
+  REQUIRED_FUNDER_ENV,
+} = require('../live_adapter_polymarket');
 const { readConfig: readTelegramConfig } = require('../telegram/telegram_approval_bot');
 
 const ROOT = process.cwd();
@@ -95,6 +102,44 @@ function tailLines(filePath, maxLines = 500) {
   }
 }
 
+function tailPm2Logs(processName, maxLines = 500) {
+  const result = runCommand('pm2', ['logs', processName, '--lines', String(maxLines), '--nostream'], { timeout: 8000 });
+  if (!result.ok) return [];
+  const keepPatterns = [
+    /--- PORTFOLIO REPORT ---/,
+    /--- BTC ORACLE \/ GABAGOOL REPORT ---/,
+    /Execution Health:/,
+    /Paper Flow:/,
+    /Pipeline 1h:/,
+    /Fill Realism:/,
+    /Exposure Audit:/,
+    /Exposure Buckets:/,
+    /Last Decisions:/,
+    /Gabagool Health:/,
+    /Gabagool Exit Blocks:/,
+    /\[ORDER\]/,
+    /\[FILL\]/,
+    /\[RESEARCH REFRESH/,
+  ];
+  return String(result.stdout || '')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .filter((line) => /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/.test(line) || keepPatterns.some((pattern) => pattern.test(line)));
+}
+
+function mergeTailLines(...sets) {
+  const seen = new Set();
+  const out = [];
+  for (const set of sets) {
+    for (const line of set || []) {
+      if (!line || seen.has(line)) continue;
+      seen.add(line);
+      out.push(line);
+    }
+  }
+  return out;
+}
+
 function lineTimestampMs(line) {
   const match = String(line || '').match(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/);
   if (!match) return NaN;
@@ -150,6 +195,35 @@ function parseLastExecutionHealth(lines) {
   return {};
 }
 
+function parseKeyValueLine(line) {
+  const out = {};
+  const regex = /([A-Za-z][A-Za-z0-9]*)=([^\s]+)/g;
+  let match;
+  while ((match = regex.exec(String(line || '')))) {
+    const key = match[1];
+    const raw = match[2];
+    const cleaned = raw.replace(/^\$/, '').replace(/%$/, '');
+    if (cleaned === 'true') out[key] = true;
+    else if (cleaned === 'false') out[key] = false;
+    else if (/^-?\d+(?:\.\d+)?$/.test(cleaned)) out[key] = Number(cleaned);
+    else out[key] = raw;
+  }
+  return out;
+}
+
+function parseLastKeyValueLine(lines, prefix) {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes(prefix)) continue;
+    return {
+      line,
+      ts: lineTimestampMs(line),
+      values: parseKeyValueLine(line),
+    };
+  }
+  return null;
+}
+
 function countRecent(lines, pattern, now = Date.now(), windowMs = 60 * 60_000) {
   let count = 0;
   for (const line of lines) {
@@ -187,7 +261,7 @@ function latestTs(...events) {
   return times.length ? Math.max(...times) : 0;
 }
 
-function main() {
+async function main() {
   loadEnvFile(path.join(ROOT, '.env'));
 
   const reasons = [];
@@ -209,14 +283,18 @@ function main() {
   const engineProc = byName.get('langomonEscript');
   const engineLogPath = engineProc?.pm2_env?.pm_out_log_path || path.join(process.env.HOME || '', '.pm2/logs/langomonEscript-out.log');
   const engineErrorLogPath = engineProc?.pm2_env?.pm_err_log_path || path.join(process.env.HOME || '', '.pm2/logs/langomonEscript-error.log');
-  const engineLines = tailLines(engineLogPath, 1000);
+  const engineFileLines = tailLines(engineLogPath, 1000);
+  const enginePm2Lines = tailPm2Logs('langomonEscript', 1000);
+  const pm2HasFreshReport = enginePm2Lines.some((line) => /--- PORTFOLIO REPORT ---|--- BTC ORACLE \/ GABAGOOL REPORT ---/.test(line));
+  const engineLines = (pm2HasFreshReport ? enginePm2Lines : mergeTailLines(engineFileLines, enginePm2Lines)).slice(-1500);
   const engineErrorLines = tailLines(engineErrorLogPath, 300);
   const pmUptime = Number(engineProc?.pm2_env?.pm_uptime || 0);
   const uptimeSec = pmUptime > 0 ? Math.max(0, Math.round((Date.now() - pmUptime) / 1000)) : null;
-  const currentEngineLines = linesSince(engineLines, pmUptime);
+  const linesSinceUptime = linesSince(engineLines, pmUptime);
+  const currentEngineLines = pm2HasFreshReport ? engineLines : (linesSinceUptime.length > 0 ? linesSinceUptime : engineLines.slice(-600));
   const currentEngineErrorLines = linesSince(engineErrorLines, pmUptime);
   const portfolioReportFreshMs = Number.parseInt(process.env.LIVE_READINESS_PORTFOLIO_FRESH_MS || '900000', 10);
-  const lastPortfolioReport = lastTimedLine(currentEngineLines, /--- PORTFOLIO REPORT ---/);
+  const lastPortfolioReport = lastTimedLine(currentEngineLines, /--- PORTFOLIO REPORT ---|--- BTC ORACLE \/ GABAGOOL REPORT ---/);
   const recentPortfolioReportFound = Boolean(
     lastPortfolioReport && Date.now() - lastPortfolioReport.ts <= (Number.isFinite(portfolioReportFreshMs) ? portfolioReportFreshMs : 900_000)
   );
@@ -225,12 +303,32 @@ function main() {
   const openOrderExposureUsd = parseLastNumber(currentEngineLines, /Open Order Exposure:\s+\$([0-9.]+)/);
   const totalExposureUsd = parseLastNumber(currentEngineLines, /Open Orders:\s+\d+\s+\|\s+Exposure:\s+\$([0-9.]+)/);
   const executionHealth = parseLastExecutionHealth(currentEngineLines);
-  const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour) ? executionHealth.fillsLastHour : countRecent(currentEngineLines, /\[FILL\]/);
+  const pipelineReport = parseLastKeyValueLine(currentEngineLines, 'Pipeline 1h:');
+  const paperFlowReport = parseLastKeyValueLine(currentEngineLines, 'Paper Flow:');
+  const fillRealismReport = parseLastKeyValueLine(currentEngineLines, 'Fill Realism:');
+  const exposureAuditReport = parseLastKeyValueLine(currentEngineLines, 'Exposure Audit:');
+  const exposureBucketsReport = parseLastKeyValueLine(currentEngineLines, 'Exposure Buckets:');
+  const lastDecisionsReport = parseLastKeyValueLine(currentEngineLines, 'Last Decisions:');
+  const gabagoolHealthReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Health:');
+  const gabagoolExitBlocksReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Exit Blocks:');
+  const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour)
+    ? executionHealth.fillsLastHour
+    : Number.isFinite(pipelineReport?.values?.fills)
+      ? pipelineReport.values.fills
+      : Number.isFinite(fillRealismReport?.values?.trustedFills) || Number.isFinite(fillRealismReport?.values?.untrustedFills)
+        ? (Number(fillRealismReport?.values?.trustedFills || 0) + Number(fillRealismReport?.values?.untrustedFills || 0))
+        : countRecent(currentEngineLines, /\[FILL\]/);
   const candidateEvaluationsLastHour = Number.isFinite(executionHealth.candidateEvaluationsLastHour)
     ? executionHealth.candidateEvaluationsLastHour
-    : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\]|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
+    : Number.isFinite(pipelineReport?.values?.candidates)
+      ? pipelineReport.values.candidates
+      : Number.isFinite(gabagoolHealthReport?.values?.gabagoolCandidatesBuiltLastHour)
+        ? gabagoolHealthReport.values.gabagoolCandidatesBuiltLastHour
+        : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\]|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
   const paperOrdersAdmittedLastHour = Number.isFinite(executionHealth.paperOrdersAdmittedLastHour)
     ? executionHealth.paperOrdersAdmittedLastHour
+    : Number.isFinite(pipelineReport?.values?.sophieAdmit)
+      ? pipelineReport.values.sophieAdmit
     : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\].*decision=ADMIT|\[SOPHIE CALIBRATED ADMIT\]|\[SOPHIE BOOTSTRAP ADMIT\]/);
   const paperOrdersFilledLastHour = Number.isFinite(executionHealth.paperOrdersFilledLastHour)
     ? executionHealth.paperOrdersFilledLastHour
@@ -240,10 +338,16 @@ function main() {
     : countRecent(currentEngineLines, /\[ORDER REPLACE\]/);
   const paperOrdersRejectedBySophieLastHour = Number.isFinite(executionHealth.paperOrdersRejectedBySophieLastHour)
     ? executionHealth.paperOrdersRejectedBySophieLastHour
+    : Number.isFinite(pipelineReport?.values?.sophieBlock)
+      ? pipelineReport.values.sophieBlock
     : countRecent(currentEngineLines, /\[SOPHIE ORDER QUALITY\].*BLOCK_LOW_QUALITY|\[SOPHIE EXECUTION THROTTLE\]/);
   const paperOrdersPlacedLastHour = Number.isFinite(executionHealth.paperOrdersPlacedLastHour)
     ? executionHealth.paperOrdersPlacedLastHour
-    : (Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(currentEngineLines, /\[ORDER\]/));
+    : Number.isFinite(paperFlowReport?.values?.totalOrders)
+      ? paperFlowReport.values.totalOrders
+      : Number.isFinite(pipelineReport?.values?.orders)
+        ? pipelineReport.values.orders
+        : (Number.isFinite(executionHealth.ordersPlacedLastHour) ? executionHealth.ordersPlacedLastHour : countRecent(currentEngineLines, /\[ORDER\]/));
   const ordersPlacedLastHour = paperOrdersPlacedLastHour;
   const duplicateSkipsLastHour = Number.isFinite(executionHealth.duplicateSkipsLastHour) ? executionHealth.duplicateSkipsLastHour : countRecent(currentEngineLines, /\[ORDER SKIP DUPLICATE\]/);
   const maxOpenOrderBlocksLastHour = Number.isFinite(executionHealth.maxOpenOrderBlocksLastHour)
@@ -261,6 +365,36 @@ function main() {
   const oldestOpenOrderAgeSec = Number.isFinite(executionHealth.oldestOpenOrderAgeSec) ? executionHealth.oldestOpenOrderAgeSec : 0;
   const avgOpenOrderAgeSec = Number.isFinite(executionHealth.avgOpenOrderAgeSec) ? executionHealth.avgOpenOrderAgeSec : 0;
   const avgActiveOrderAgeSec = Number.isFinite(executionHealth.avgActiveOrderAgeSec) ? executionHealth.avgActiveOrderAgeSec : avgOpenOrderAgeSec;
+  const trustedFillsLastHour = Number.isFinite(fillRealismReport?.values?.trustedFills)
+    ? fillRealismReport.values.trustedFills
+    : Number.isFinite(fillRealismReport?.values?.trustedFillCountLastHour)
+      ? fillRealismReport.values.trustedFillCountLastHour
+      : null;
+  const untrustedFillsLastHour = Number.isFinite(fillRealismReport?.values?.untrustedFills)
+    ? fillRealismReport.values.untrustedFills
+    : Number.isFinite(fillRealismReport?.values?.untrustedFillCountLastHour)
+      ? fillRealismReport.values.untrustedFillCountLastHour
+      : null;
+  const currentPlacementDecision = String(
+    lastDecisionsReport?.values?.placementDecision
+    || gabagoolExitBlocksReport?.values?.lastPlacementDecision
+    || gabagoolHealthReport?.values?.gabagoolLastPlacementDecision
+    || 'none'
+  );
+  const currentPlacementReason = String(
+    lastDecisionsReport?.values?.placementBlock
+    || gabagoolHealthReport?.values?.gabagoolPlacementBlockReasonLast
+    || 'none'
+  );
+  const reportedPortfolioExposureUsd = Number.isFinite(exposureAuditReport?.values?.portfolioExposureUsd)
+    ? exposureAuditReport.values.portfolioExposureUsd
+    : totalExposureUsd;
+  const reportedCapBlockingExposureUsd = Number.isFinite(exposureAuditReport?.values?.capBlockingExposureUsd)
+    ? exposureAuditReport.values.capBlockingExposureUsd
+    : totalExposureUsd;
+  const excludedDeadExposureUsd = Number.isFinite(exposureAuditReport?.values?.excludedDeadExposureUsd)
+    ? exposureAuditReport.values.excludedDeadExposureUsd
+    : null;
   const fillProbabilityOverestimated = countRecent(currentEngineLines, /\[SOPHIE FILL PROB CALIBRATED\].*far_from_touch|\[SOPHIE NO-FILL LEARN\]/) > 0;
   const recentStarvationWarning = countRecent(currentEngineLines, /\[ENGINE STARVATION WARNING\]/) > 0;
   const makerOptimizerAdmitsLastHour = countRecent(currentEngineLines, /\[SOPHIE MAKER OPTIMIZER ADMIT\]/);
@@ -311,7 +445,9 @@ function main() {
   if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push(`no active paper orders; candidateEvaluationsLastHour=${candidateEvaluationsLastHour} paperOrdersAdmittedLastHour=${paperOrdersAdmittedLastHour} paperOrdersPlacedLastHour=${paperOrdersPlacedLastHour} makerOptimizerAdmitsLastHour=${makerOptimizerAdmitsLastHour} makerOptimizerBlocksLastHour=${makerOptimizerBlocksLastHour}`);
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);
-  if (Number.isFinite(totalExposureUsd) && totalExposureUsd > CONFIG.maxTotalExposureUsd) reasons.push(`exposure $${totalExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);
+  if (Number.isFinite(reportedCapBlockingExposureUsd) && reportedCapBlockingExposureUsd > CONFIG.maxTotalExposureUsd) {
+    reasons.push(`capBlockingExposureUsd $${reportedCapBlockingExposureUsd} exceeds cap $${CONFIG.maxTotalExposureUsd}`);
+  }
   if (Number.isFinite(openOrderExposureUsd) && openOrderExposureUsd > CONFIG.maxTotalOpenOrderUsd) reasons.push(`open order exposure $${openOrderExposureUsd} exceeds cap $${CONFIG.maxTotalOpenOrderUsd}`);
   if (fillsLastHour < 3) reasons.push(`fillsLastHour ${fillsLastHour} below required 3`);
   if (fillRateLastHour < 1.0) reasons.push(`fillRateLastHour ${fillRateLastHour}% below required 1.0%`);
@@ -348,6 +484,46 @@ function main() {
   const dashboardSyntax = runCommand(process.execPath, ['--check', 'dashboard_server.js']);
   if (!dashboardSyntax.ok) reasons.push('dashboard_server.js syntax check failed');
 
+  // -----------------------------
+  // Live final-boss network + auth + signing diagnostics
+  // -----------------------------
+  const secrets = secretFileStatus(liveConfig);
+  const missingSecretEnvNames = REQUIRED_LIVE_SECRET_ENV.filter((name) => !process.env[name]);
+  const funderEnvDetected = REQUIRED_FUNDER_ENV.find((name) => process.env[name]) || null;
+  const signatureTypeRaw = process.env.POLYMARKET_SIGNATURE_TYPE;
+  const signatureType = signatureTypeRaw ? Number(signatureTypeRaw) : null;
+  const polygonRpcUrl = process.env.POLYMARKET_RPC_URL || process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+
+  const clobProbe = await probeHostReachable(liveConfig.clobHost, { healthPath: '/', timeoutMs: 3000 });
+  const rpcProbe = await probeRpcReachable(polygonRpcUrl, { timeoutMs: 3000 });
+
+  const routerOracleSignalsAllowed = String(process.env.LIVE_ROUTER_ALLOW_ORACLE_SIGNALS || '').toLowerCase() === 'true';
+
+  if (!secrets.exists) reasons.push('live secrets file missing');
+  if (secrets.exists && !secrets.readable) {
+    reasons.push(`live secrets file unreadable by current user (${secrets.path}); fix with chown/chmod`);
+  }
+  if (missingSecretEnvNames.length > 0) {
+    reasons.push(`missing live env names: ${missingSecretEnvNames.join(',')}`);
+  }
+  if (!funderEnvDetected) {
+    reasons.push(`no funder env detected from ${REQUIRED_FUNDER_ENV.join(',')}`);
+  }
+  if (signatureType !== 3) {
+    reasons.push(`POLYMARKET_SIGNATURE_TYPE expected 3, got ${signatureTypeRaw || 'unset'}`);
+  }
+  if (!clobProbe.reachable) reasons.push(`CLOB host unreachable (${clobProbe.error})`);
+  if (!rpcProbe.reachable) reasons.push(`Polygon RPC unreachable (${rpcProbe.error})`);
+  if (!liveConfig.liveFinalBossReady) reasons.push('LIVE_FINAL_BOSS_READY=false');
+  if (!Number.isFinite(liveConfig.liveTradingStage) || liveConfig.liveTradingStage < 1) {
+    reasons.push(`LIVE_TRADING_STAGE=${liveConfig.liveTradingStage} (Stage 1+ required for micro-live readiness gate)`);
+  }
+  // Stage 1 signing-proof status is NOT executed here automatically because it
+  // would require LIVE_SIGNING_TEST_ALLOW=true and readable secrets. Operator
+  // must run `npm run live:final-boss-selfcheck` after fixing permissions.
+  const signingProofKnown = false;
+  reasons.push('signing proof not executed in readiness report; run `npm run live:final-boss-selfcheck` to verify');
+
   const ready = reasons.length === 0;
   const report = {
     READY_FOR_MICRO_LIVE: ready,
@@ -360,6 +536,7 @@ function main() {
       lastPortfolioReportAt: lastPortfolioReport ? new Date(lastPortfolioReport.ts).toISOString() : null,
       portfolioReportFreshMs: Number.isFinite(portfolioReportFreshMs) ? portfolioReportFreshMs : 900_000,
       currentProcessLogLines: currentEngineLines.length,
+      usedPm2UptimeWindow: linesSinceUptime.length > 0,
       researchRefresh,
       openOrders: Number.isFinite(openOrders) ? openOrders : null,
       activePaperOrders,
@@ -381,6 +558,15 @@ function main() {
       avgActiveOrderAgeSec,
       avgTimeToFillSec,
       fillProbabilityOverestimated,
+      trustedFillsLastHour,
+      untrustedFillsLastHour,
+      currentPlacementDecision,
+      currentPlacementReason,
+      exposureAudit: exposureAuditReport?.values || null,
+      exposureBuckets: exposureBucketsReport?.values || null,
+      pipeline1h: pipelineReport?.values || null,
+      paperFlow: paperFlowReport?.values || null,
+      fillRealism: fillRealismReport?.values || null,
       fillsDetected: fillsLastHour > 0,
       makerOptimizerAdmitsLastHour,
       makerOptimizerBlocksLastHour,
@@ -389,10 +575,50 @@ function main() {
       crashLoopEvidence,
       drawdownPct: Number.isFinite(drawdownPct) ? drawdownPct : null,
       maxDrawdownPct: CONFIG.maxDrawdownPct,
-      totalExposureUsd: Number.isFinite(totalExposureUsd) ? totalExposureUsd : null,
+      totalExposureUsd: Number.isFinite(reportedPortfolioExposureUsd) ? reportedPortfolioExposureUsd : null,
+      capBlockingExposureUsd: Number.isFinite(reportedCapBlockingExposureUsd) ? reportedCapBlockingExposureUsd : null,
+      excludedDeadExposureUsd,
       maxTotalExposureUsd: CONFIG.maxTotalExposureUsd,
       openOrderExposureUsd: Number.isFinite(openOrderExposureUsd) ? openOrderExposureUsd : null,
       maxTotalOpenOrderUsd: CONFIG.maxTotalOpenOrderUsd,
+    },
+    liveFinalBossGate: {
+      configuredReadyFlag: liveConfig.liveFinalBossReady,
+      configuredStage: liveConfig.liveTradingStage,
+      configuredStageProfile: liveConfig.liveStageProfile || null,
+      submitAllowedAtStage: Boolean(liveConfig.liveStageProfile?.submitAllowed),
+      canSubmitLive: liveConfig.enableLiveTrading
+        && liveConfig.liveAutoExecute
+        && !liveConfig.liveKillSwitch
+        && !liveConfig.liveDryRunOnly
+        && liveConfig.liveFinalBossReady
+        && Boolean(liveConfig.liveStageProfile?.submitAllowed)
+        && liveConfig.liveSubmitConfirm,
+      secretsFilePresent: secrets.exists,
+      secretsFileReadable: secrets.readable,
+      secretsPath: secrets.path,
+      requiredSecretEnvNames: REQUIRED_LIVE_SECRET_ENV,
+      missingSecretEnvNames,
+      acceptedFunderEnvNames: REQUIRED_FUNDER_ENV,
+      funderEnvDetected,
+      signatureTypeEnvName: 'POLYMARKET_SIGNATURE_TYPE',
+      signatureTypePresent: signatureTypeRaw !== undefined,
+      signatureTypeIsThree: signatureType === 3,
+      polygonRpcConfigured: Boolean(polygonRpcUrl),
+      clobHost: liveConfig.clobHost,
+      clobReachable: clobProbe.reachable,
+      clobReachableLatencyMs: clobProbe.latencyMs,
+      clobReachableError: clobProbe.error,
+      clobStatus: clobProbe.status,
+      rpcReachable: rpcProbe.reachable,
+      rpcReachableLatencyMs: rpcProbe.latencyMs,
+      rpcReachableError: rpcProbe.error,
+      rpcChainId: rpcProbe.chainId,
+      authDryRunExecuted: false,
+      authDryRunHint: 'run `node live_adapter_polymarket.js auth-dry-run` to execute full auth+signing proof (requires LIVE_AUTH_CHECK_ALLOW=true LIVE_SIGNING_TEST_ALLOW=true and readable secrets)',
+      signingProofExecuted: signingProofKnown,
+      signingProofHint: 'run `npm run live:final-boss-selfcheck` for strict end-to-end signing proof; must show signingProofPassed=true and signed=true',
+      routerOracleSignalsAllowed,
     },
     safetyFlags,
     telegram: {
@@ -415,11 +641,13 @@ function main() {
     reasons,
   };
 
+  console.log(JSON.stringify(report, null, 2));
   if (ready) {
-    console.log('Ready for micro-live DRY-RUN review, not automatic live execution.');
-  } else {
-    console.log(JSON.stringify(report, null, 2));
+    console.log('READY_FOR_MICRO_LIVE=true (dry-run review only; live execution still gated by manual env change).');
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(`[LIVE-READINESS ERROR] ${err.stack || err.message}`);
+  process.exit(1);
+});
