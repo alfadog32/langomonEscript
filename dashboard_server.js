@@ -36,6 +36,9 @@ const SENSITIVE_KEY_RE = /(TOKEN|KEY|SECRET|PASSWORD|PRIVATE|MNEMONIC)/i;
 const SETTING_KEYS = [
   'STATE_FILE',
   'INITIAL_CASH',
+  'PAPER_DEAD_EXPOSURE_CASH_RELEASE_ENABLED',
+  'PAPER_DEAD_EXPOSURE_CASH_RELEASE_BATCH_USD',
+  'PAPER_DEAD_EXPOSURE_CASH_RELEASE_TRIGGER_USD',
   'BASE_ORDER_USD',
   'MIN_ORDER_USD',
   'MIN_CONFIDENCE',
@@ -227,6 +230,17 @@ function buildPortfolioSummary(state, report) {
     spreadHunterExecutionRealismBlocksLastHour: numberOrNull(report.spreadHunterExecutionRealismBlocksLastHour),
     staleExposureUsd: numberOrNull(report.staleExposureUsd),
     tradableExposureUsd: numberOrNull(report.tradableExposureUsd),
+    capBlockingExposureUsd: numberOrNull(report.capBlockingExposureUsd),
+    activeTradableExposureUsd: numberOrNull(report.activeTradableExposureUsd),
+    staleNoBidExposureUsd: numberOrNull(report.staleNoBidExposureUsd),
+    confirmedNoOrderbook404ExposureUsd: numberOrNull(report.confirmedNoOrderbook404ExposureUsd),
+    expiredBtc5mExposureUsd: numberOrNull(report.expiredBtc5mExposureUsd),
+    resolutionPendingExposureUsd: numberOrNull(report.resolutionPendingExposureUsd),
+    excludedDeadExposureUsd: numberOrNull(report.excludedDeadExposureUsd),
+    excludedDeadExposureReasons: report.excludedDeadExposureReasons || '',
+    deadExposureCashReserveOutstandingUsd: numberOrNull(report.deadExposureCashReserveOutstandingUsd),
+    deadExposureCashReserveCreditsUsd: numberOrNull(report.deadExposureCashReserveCreditsUsd),
+    deadExposureCashReserveRepaymentsUsd: numberOrNull(report.deadExposureCashReserveRepaymentsUsd),
     dustExposureUsd: numberOrNull(report.dustExposureUsd),
     staleExposureCount: numberOrNull(report.staleExposureCount),
     tradableExposureCount: numberOrNull(report.tradableExposureCount),
@@ -387,6 +401,29 @@ function parseLatestPortfolioReport(lines) {
       continue;
     }
 
+    match = line.match(
+      /Exposure Split:\s*portfolioExposure=\$([\d.-]+)\s*capBlockingExposure=\$([\d.-]+)\s*activeTradableExposure=\$([\d.-]+)\s*staleNoBidExposure=\$([\d.-]+)\s*confirmedNoOrderbook404Exposure=\$([\d.-]+)\s*expiredBtc5mExposure=\$([\d.-]+)\s*resolutionPendingExposure=\$([\d.-]+)\s*dustExposure=\$([\d.-]+)\s*excludedDeadExposure=\$([\d.-]+)\s*excludedDeadExposureReasons=(.*)$/
+    );
+    if (match) {
+      report.totalExposureUsd = report.totalExposureUsd == null ? Number(match[1]) : report.totalExposureUsd;
+      report.capBlockingExposureUsd = Number(match[2]);
+      report.activeTradableExposureUsd = Number(match[3]);
+      report.staleNoBidExposureUsd = Number(match[4]);
+      report.confirmedNoOrderbook404ExposureUsd = Number(match[5]);
+      report.expiredBtc5mExposureUsd = Number(match[6]);
+      report.resolutionPendingExposureUsd = Number(match[7]);
+      report.dustExposureUsd = Number(match[8]);
+      report.excludedDeadExposureUsd = Number(match[9]);
+      report.excludedDeadExposureReasons = match[10];
+      report.tradableExposureUsd = Number(match[3]);
+      report.staleExposureUsd =
+        Number(match[4]) +
+        Number(match[5]) +
+        Number(match[6]) +
+        Number(match[7]);
+      continue;
+    }
+
     match = line.match(/Gabagool Exit Blocks:\s*exposureCap=(.*?)\s+lastPlacementDecision=(.*)$/);
     if (match) {
       report.gabagoolExitBlocks = match[1];
@@ -435,6 +472,16 @@ function parseLatestPortfolioReport(lines) {
       continue;
     }
 
+    match = line.match(/Paper Cash Reserve:\s*outstanding=\$([\d.-]+)\s*credits=\$([\d.-]+)\s*repayments=\$([\d.-]+)\s*releaseBatch=\$([\d.-]+)\s*triggerCash=\$([\d.-]+)/);
+    if (match) {
+      report.deadExposureCashReserveOutstandingUsd = Number(match[1]);
+      report.deadExposureCashReserveCreditsUsd = Number(match[2]);
+      report.deadExposureCashReserveRepaymentsUsd = Number(match[3]);
+      report.deadExposureCashReserveReleaseBatchUsd = Number(match[4]);
+      report.deadExposureCashReserveTriggerCashUsd = Number(match[5]);
+      continue;
+    }
+
     match = line.match(/Last Fill Audit:\s*(.*)$/);
     if (match) {
       report.latestFillAudit = match[1];
@@ -480,6 +527,17 @@ function emptyReport() {
     spreadHunterExecutionRealismBlocksLastHour: null,
     staleExposureUsd: null,
     tradableExposureUsd: null,
+    capBlockingExposureUsd: null,
+    activeTradableExposureUsd: null,
+    staleNoBidExposureUsd: null,
+    confirmedNoOrderbook404ExposureUsd: null,
+    expiredBtc5mExposureUsd: null,
+    resolutionPendingExposureUsd: null,
+    excludedDeadExposureUsd: null,
+    excludedDeadExposureReasons: '',
+    deadExposureCashReserveOutstandingUsd: null,
+    deadExposureCashReserveCreditsUsd: null,
+    deadExposureCashReserveRepaymentsUsd: null,
     dustExposureUsd: null,
     staleExposureCount: null,
     tradableExposureCount: null,
@@ -894,6 +952,10 @@ function renderHtml(status) {
       ${metric('Open Order Exposure', money(p.openOrderExposureUsd))}
       ${metric('Tradable Exposure', money(p.tradableExposureUsd))}
       ${metric('Stale Exposure', money(p.staleExposureUsd))}
+      ${metric('Cap-Blocking Exposure', money(p.capBlockingExposureUsd))}
+      ${metric('Expired BTC 5m Exposure', money(p.expiredBtc5mExposureUsd))}
+      ${metric('Excluded Dead Exposure', money(p.excludedDeadExposureUsd))}
+      ${metric('Paper Cash Reserve', money(p.deadExposureCashReserveOutstandingUsd))}
       ${metric('Dust Exposure', money(p.dustExposureUsd))}
       ${metric('Open Orders', intVal(p.openOrders))}
       ${metric('Ghost Favorable', pct(p.ghostFavorablePct))}

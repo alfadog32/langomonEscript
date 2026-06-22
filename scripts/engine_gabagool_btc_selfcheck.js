@@ -1926,6 +1926,39 @@ async function run() {
 
   {
     const config = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      initialCash: 50,
+      minOrderUsd: 1,
+      paperDeadExposureCashReleaseEnabled: true,
+      paperDeadExposureCashReleaseBatchUsd: 50,
+      paperDeadExposureCashReleaseTriggerUsd: 5,
+    });
+    const bot = new BotEngine(config);
+    const expiredStartSec = Math.floor(Date.now() / 1000) - 900;
+    const marketSlug = `btc-updown-5m-${expiredStartSec}`;
+    const tokenId = 'expired-btc-cash-release-token';
+    bot.portfolio.recordFill({
+      tokenId,
+      marketId: marketSlug,
+      side: 'buy',
+      price: 0.50,
+      size: 100,
+      strategy: 'GabagoolBtcOracleStrategy',
+      marketSlug,
+      outcome: 'Up',
+    });
+    bot.portfolio.setMarkPrice(tokenId, 0.50);
+    bot.portfolio.cash = 1;
+    const equityBefore = bot.portfolio.equity(bot.cache.markPrices());
+    const reserveResult = bot.rebalancePaperDeadExposureCashReserve(bot.cache.markPrices(), Date.now());
+    const equityAfter = bot.portfolio.equity(bot.cache.markPrices());
+    assert.strictEqual(reserveResult.action, 'release', 'expired BTC inventory should release a paper cash batch');
+    assert(Math.abs(bot.portfolio.availableCash() - 51) < 1e-9, 'paper cash reserve should add a fresh $50 batch when cash is exhausted');
+    assert.strictEqual(bot.portfolio.deadExposureCashReserveOutstanding(), 50, 'paper cash reserve outstanding should track the released batch');
+    assert(Math.abs(equityBefore - equityAfter) < 1e-9, 'paper cash reserve must not inflate equity');
+  }
+
+  {
+    const config = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
       spreadHunterGhostGateEnabled: true,
       spreadHunterMinGhostFavorablePct: 15,
       spreadHunterGhostMinSamples: 10,

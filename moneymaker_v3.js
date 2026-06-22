@@ -86,6 +86,9 @@ const CONFIG = {
   stateFile: envStr('STATE_FILE', path.join(process.cwd(), 'moneymaker_v3_state.json')),
 
   initialCash: envNum('INITIAL_CASH', 250),
+  paperDeadExposureCashReleaseEnabled: envBool('PAPER_DEAD_EXPOSURE_CASH_RELEASE_ENABLED', true),
+  paperDeadExposureCashReleaseBatchUsd: envNum('PAPER_DEAD_EXPOSURE_CASH_RELEASE_BATCH_USD', 50),
+  paperDeadExposureCashReleaseTriggerUsd: envNum('PAPER_DEAD_EXPOSURE_CASH_RELEASE_TRIGGER_USD', 5),
 
   eventLimit: envInt('EVENT_LIMIT', 100),
   eventPages: envInt('EVENT_PAGES', 2),
@@ -2961,6 +2964,9 @@ class PaperPortfolio {
     this.closedPnl = 0;
     this.strategyPnl = new Map();
     this.fills = [];
+    this.deadExposureCashReserveOutstandingUsd = 0;
+    this.deadExposureCashReserveCreditsUsd = 0;
+    this.deadExposureCashReserveRepaymentsUsd = 0;
     this.ghostOrders = [];
     this.ghostStats = { total: 0, favorable: 0, unfavorable: 0 };
     this.executionEvents = [];
@@ -3221,6 +3227,7 @@ class PaperPortfolio {
       const mark = markPrices.get(tokenId) ?? this.avgCost(tokenId) ?? 0;
       value += qty * mark;
     }
+    value -= this.deadExposureCashReserveOutstanding();
 
     this.peakEquity = Math.max(this.peakEquity, value);
     return value;
@@ -3261,6 +3268,49 @@ class PaperPortfolio {
 
   availableCash() {
     return Math.max(0, this.cash - this.openBuyOrderUsd());
+  }
+
+  deadExposureCashReserveOutstanding() {
+    return Math.max(0, Number(this.deadExposureCashReserveOutstandingUsd || 0));
+  }
+
+  deadExposureCashReserveState() {
+    return {
+      outstandingUsd: this.deadExposureCashReserveOutstanding(),
+      creditsUsd: Math.max(0, Number(this.deadExposureCashReserveCreditsUsd || 0)),
+      repaymentsUsd: Math.max(0, Number(this.deadExposureCashReserveRepaymentsUsd || 0)),
+    };
+  }
+
+  applyDeadExposureCashReserve({ amountUsd = 0, ts = Date.now() } = {}) {
+    const roundedAmountUsd = roundMoney(Number(amountUsd) || 0);
+    if (!(roundedAmountUsd > 0)) return null;
+    this.cash = roundMoney(this.cash + roundedAmountUsd);
+    this.deadExposureCashReserveOutstandingUsd = roundMoney(this.deadExposureCashReserveOutstanding() + roundedAmountUsd);
+    this.deadExposureCashReserveCreditsUsd = roundMoney(Number(this.deadExposureCashReserveCreditsUsd || 0) + roundedAmountUsd);
+    return {
+      ts,
+      amountUsd: roundedAmountUsd,
+      outstandingUsd: this.deadExposureCashReserveOutstanding(),
+      cashUsd: roundMoney(this.cash),
+    };
+  }
+
+  repayDeadExposureCashReserve({ amountUsd = 0, ts = Date.now() } = {}) {
+    const roundedAmountUsd = roundMoney(Number(amountUsd) || 0);
+    const outstandingUsd = this.deadExposureCashReserveOutstanding();
+    if (!(roundedAmountUsd > 0) || !(outstandingUsd > 0)) return null;
+    const repaymentUsd = roundMoney(Math.min(roundedAmountUsd, outstandingUsd, Math.max(0, this.cash)));
+    if (!(repaymentUsd > 0)) return null;
+    this.cash = roundMoney(this.cash - repaymentUsd);
+    this.deadExposureCashReserveOutstandingUsd = roundMoney(outstandingUsd - repaymentUsd);
+    this.deadExposureCashReserveRepaymentsUsd = roundMoney(Number(this.deadExposureCashReserveRepaymentsUsd || 0) + repaymentUsd);
+    return {
+      ts,
+      amountUsd: repaymentUsd,
+      outstandingUsd: this.deadExposureCashReserveOutstanding(),
+      cashUsd: roundMoney(this.cash),
+    };
   }
 
   availablePositionQty(tokenId) {
@@ -3924,6 +3974,7 @@ class PaperPortfolio {
       ].filter(Boolean).join(' ') || 'no_orders_recorded'
       : null;
     const lastFillEvent = fillEvents.slice().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))[0] || null;
+    const deadExposureCashReserve = this.deadExposureCashReserveState();
 
     return {
       ...this.executionTotals,
@@ -3974,6 +4025,9 @@ class PaperPortfolio {
       capBlockingExposureUsd: Number(exposureBreakdown.capBlockingExposureUsd || 0),
       excludedDeadExposureUsd: Number(exposureBreakdown.excludedDeadExposureUsd || 0),
       excludedDeadExposureReasonSummary: exposureBreakdown.excludedDeadExposureReasonSummary || 'none',
+      deadExposureCashReserveOutstandingUsd: deadExposureCashReserve.outstandingUsd,
+      deadExposureCashReserveCreditsUsd: deadExposureCashReserve.creditsUsd,
+      deadExposureCashReserveRepaymentsUsd: deadExposureCashReserve.repaymentsUsd,
       gabagoolExposureCapBlockedReasonCountsLastHour: [...gabagoolExposureCapBlockedReasonCounts.entries()]
         .sort((a, b) => {
           if (b[1] !== a[1]) return b[1] - a[1];
@@ -4470,6 +4524,9 @@ class PaperPortfolio {
         cash: this.cash,
         startingCash: this.startingCash,
         peakEquity: this.peakEquity,
+        deadExposureCashReserveOutstandingUsd: this.deadExposureCashReserveOutstanding(),
+        deadExposureCashReserveCreditsUsd: Number(this.deadExposureCashReserveCreditsUsd || 0),
+        deadExposureCashReserveRepaymentsUsd: Number(this.deadExposureCashReserveRepaymentsUsd || 0),
         positions: Object.fromEntries(this.positions),
         positionMarkets: Object.fromEntries(this.positionMarkets),
         costBasis: Object.fromEntries(this.costBasis),
@@ -4500,6 +4557,15 @@ class PaperPortfolio {
       this.startingCash = Number.isFinite(Number(data.startingCash)) ? Number(data.startingCash) : this.startingCash;
       this.peakEquity = Number.isFinite(Number(data.peakEquity)) ? Number(data.peakEquity) : this.peakEquity;
       this.closedPnl = Number.isFinite(Number(data.closedPnl)) ? Number(data.closedPnl) : this.closedPnl;
+      this.deadExposureCashReserveOutstandingUsd = Number.isFinite(Number(data.deadExposureCashReserveOutstandingUsd))
+        ? Number(data.deadExposureCashReserveOutstandingUsd)
+        : this.deadExposureCashReserveOutstandingUsd;
+      this.deadExposureCashReserveCreditsUsd = Number.isFinite(Number(data.deadExposureCashReserveCreditsUsd))
+        ? Number(data.deadExposureCashReserveCreditsUsd)
+        : this.deadExposureCashReserveCreditsUsd;
+      this.deadExposureCashReserveRepaymentsUsd = Number.isFinite(Number(data.deadExposureCashReserveRepaymentsUsd))
+        ? Number(data.deadExposureCashReserveRepaymentsUsd)
+        : this.deadExposureCashReserveRepaymentsUsd;
 
       this.positions = new Map(Object.entries(data.positions || {}).map(([k, v]) => [k, Number(v)]));
       this.positionMarkets = new Map(Object.entries(data.positionMarkets || {}).map(([k, v]) => [k, String(v)]));
@@ -6633,6 +6699,95 @@ class BotEngine {
   syncPortfolioMarks(markPrices = this.cache.markPrices()) {
     this.portfolio.setMarkPrices(markPrices);
     return markPrices;
+  }
+
+  rebalancePaperDeadExposureCashReserve(markPrices = this.cache.markPrices(), now = Date.now()) {
+    if (this.config.enableLiveTrading === true) {
+      return { changed: false, action: 'disabled_live_mode' };
+    }
+    if (this.config.paperDeadExposureCashReleaseEnabled !== true) {
+      return { changed: false, action: 'disabled_config' };
+    }
+    const releaseBatchUsd = Math.max(0, Number(this.config.paperDeadExposureCashReleaseBatchUsd || 0));
+    const triggerCashUsd = Math.max(0, Number(this.config.paperDeadExposureCashReleaseTriggerUsd || 0));
+    if (!(releaseBatchUsd > 0)) {
+      return { changed: false, action: 'disabled_batch' };
+    }
+
+    this.syncPortfolioMarks(markPrices);
+    const exposure = this.risk.exposureBreakdown();
+    const excludedDeadExposureUsd = Math.max(0, Number(exposure.excludedDeadExposureUsd || 0));
+    const excludedDeadExposureReasonSummary = exposure.excludedDeadExposureReasonSummary || 'none';
+    const availableCashBefore = this.portfolio.availableCash();
+    const reserveOutstandingBefore = this.portfolio.deadExposureCashReserveOutstanding();
+    const reserveHeadroomUsd = Math.max(0, excludedDeadExposureUsd - reserveOutstandingBefore);
+
+    if (availableCashBefore <= triggerCashUsd + 1e-9 && reserveHeadroomUsd > 1e-9) {
+      const releaseUsd = roundMoney(Math.min(releaseBatchUsd, reserveHeadroomUsd));
+      const reserve = this.portfolio.applyDeadExposureCashReserve({ amountUsd: releaseUsd, ts: now });
+      if (reserve) {
+        this.portfolio.recordExecutionEvent('paper_dead_exposure_cash_release', {
+          strategy: 'SYSTEM',
+          reason: 'excluded_dead_exposure_cash_release',
+          source: excludedDeadExposureReasonSummary,
+          sizeUsd: reserve.amountUsd,
+        }, now);
+        info(
+          `[PAPER CASH RELEASE] amount=$${reserve.amountUsd.toFixed(2)} ` +
+          `cashBefore=$${availableCashBefore.toFixed(2)} cashAfter=$${this.portfolio.availableCash().toFixed(2)} ` +
+          `outstanding=$${reserve.outstandingUsd.toFixed(2)} backingExcludedDead=$${excludedDeadExposureUsd.toFixed(2)} ` +
+          `reasons=${excludedDeadExposureReasonSummary}`
+        );
+        return {
+          changed: true,
+          action: 'release',
+          amountUsd: reserve.amountUsd,
+          availableCashBefore,
+          availableCashAfter: this.portfolio.availableCash(),
+          reserveOutstandingUsd: reserve.outstandingUsd,
+          excludedDeadExposureUsd,
+          excludedDeadExposureReasonSummary,
+        };
+      }
+    }
+
+    if (reserveOutstandingBefore > 1e-9 && availableCashBefore > releaseBatchUsd + 1e-9) {
+      const repayUsd = roundMoney(Math.min(availableCashBefore - releaseBatchUsd, reserveOutstandingBefore));
+      const repayment = this.portfolio.repayDeadExposureCashReserve({ amountUsd: repayUsd, ts: now });
+      if (repayment) {
+        this.portfolio.recordExecutionEvent('paper_dead_exposure_cash_repay', {
+          strategy: 'SYSTEM',
+          reason: 'excluded_dead_exposure_cash_repay',
+          source: excludedDeadExposureReasonSummary,
+          sizeUsd: repayment.amountUsd,
+        }, now);
+        info(
+          `[PAPER CASH REPAY] amount=$${repayment.amountUsd.toFixed(2)} ` +
+          `cashBefore=$${availableCashBefore.toFixed(2)} cashAfter=$${this.portfolio.availableCash().toFixed(2)} ` +
+          `outstanding=$${repayment.outstandingUsd.toFixed(2)} backingExcludedDead=$${excludedDeadExposureUsd.toFixed(2)} ` +
+          `reasons=${excludedDeadExposureReasonSummary}`
+        );
+        return {
+          changed: true,
+          action: 'repay',
+          amountUsd: repayment.amountUsd,
+          availableCashBefore,
+          availableCashAfter: this.portfolio.availableCash(),
+          reserveOutstandingUsd: repayment.outstandingUsd,
+          excludedDeadExposureUsd,
+          excludedDeadExposureReasonSummary,
+        };
+      }
+    }
+
+    return {
+      changed: false,
+      action: 'none',
+      availableCashBefore,
+      reserveOutstandingUsd: reserveOutstandingBefore,
+      excludedDeadExposureUsd,
+      excludedDeadExposureReasonSummary,
+    };
   }
 
   async start() {
@@ -10514,6 +10669,7 @@ class BotEngine {
 
     const markPrices = this.syncPortfolioMarks(this.cache.markPrices());
     this.portfolio.updateGhostOrders(markPrices);
+    this.rebalancePaperDeadExposureCashReserve(markPrices);
 
     for (const asset of this.assets) {
       let book;
@@ -10552,6 +10708,7 @@ class BotEngine {
     this.flushSophieMakerRecoveryCandidates();
     this.execution.processOpenOrders();
     const postOrderMarkPrices = this.syncPortfolioMarks(this.cache.markPrices());
+    this.rebalancePaperDeadExposureCashReserve(postOrderMarkPrices);
     this.recordBtcOracleExposureSample(postOrderMarkPrices);
     this.maybeEmitBtcOracleReport({ markPrices: postOrderMarkPrices });
     this.paperUpdates?.maybeSendDigest?.();
@@ -12761,6 +12918,13 @@ class BotEngine {
       `dustExposure=$${Number(health.dustExposureUsd || 0).toFixed(2)} ` +
       `excludedDeadExposure=$${Number(health.excludedDeadExposureUsd || 0).toFixed(2)} ` +
       `excludedDeadExposureReasons=${health.excludedDeadExposureReasonSummary || 'none'}`
+    );
+    info(
+      `Paper Cash Reserve: outstanding=$${Number(health.deadExposureCashReserveOutstandingUsd || 0).toFixed(2)} ` +
+      `credits=$${Number(health.deadExposureCashReserveCreditsUsd || 0).toFixed(2)} ` +
+      `repayments=$${Number(health.deadExposureCashReserveRepaymentsUsd || 0).toFixed(2)} ` +
+      `releaseBatch=$${Number(this.config.paperDeadExposureCashReleaseBatchUsd || 0).toFixed(2)} ` +
+      `triggerCash=$${Number(this.config.paperDeadExposureCashReleaseTriggerUsd || 0).toFixed(2)}`
     );
     info(
       `Gabagool Exit Blocks: exposureCap=${health.gabagoolExposureCapBlockedReasonCountsLastHour || 'none'} ` +
