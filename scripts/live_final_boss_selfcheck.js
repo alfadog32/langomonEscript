@@ -172,10 +172,16 @@ async function main() {
     assert(evaluation.reasons.includes('RISK_NOT_APPROVED'), 'risk disagreement must block submit');
   });
 
+  // Stage 1 signing proof: kill switch stays ON, dry-run stays ON, only the
+  // explicit LIVE_SIGNING_TEST_ALLOW env opt-in unlocks the non-submitting
+  // signing proof path.  This proves the kill switch does NOT block auth/signing
+  // proofs while it still blocks every real submit/cancel/reconcile path.
   await withEnv({
     ...baseEnv,
+    LIVE_KILL_SWITCH: 'true',
     LIVE_DRY_RUN_ONLY: 'true',
     LIVE_SIGNING_TEST_ALLOW: 'true',
+    LIVE_AUTH_CHECK_ALLOW: 'true',
     LIVE_TRADING_STAGE: '1',
     LIVE_FINAL_BOSS_READY: 'false',
   }, async () => {

@@ -932,17 +932,19 @@ class PolymarketLiveClient {
     } else if (purpose === 'auth-check') {
       // Stage 1 dry-run proof: allow auth-check without ENABLE_LIVE_TRADING
       // so the operator can prove signer/auth wiring while live flags stay OFF.
-      // Still requires explicit LIVE_AUTH_CHECK_ALLOW=true and dry-run mode,
-      // and kill switch must not be active.
-      if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
+      // Still requires explicit LIVE_AUTH_CHECK_ALLOW=true and dry-run mode.
+      // Kill switch is intentionally NOT checked here because auth-check never
+      // submits orders — it only initializes the SDK client and verifies API
+      // credentials. The kill switch continues to block submit/cancel/reconcile.
       if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_AUTH_CHECK');
       if (!this.config.liveAuthCheckAllow) reasons.push('LIVE_AUTH_CHECK_ALLOW_FALSE');
     } else if (purpose === 'signing-test') {
       // Stage 1 dry-run proof: allow signing-test without ENABLE_LIVE_TRADING
       // so the operator can prove signature construction while live flags stay
-      // OFF. Still requires LIVE_SIGNING_TEST_ALLOW=true and dry-run mode and
-      // kill switch off.
-      if (this.config.liveKillSwitch) reasons.push('LIVE_KILL_SWITCH_TRUE');
+      // OFF. Still requires LIVE_SIGNING_TEST_ALLOW=true and dry-run mode.
+      // Kill switch is intentionally NOT checked here because signing-test only
+      // constructs a signed order locally and never posts it to the CLOB. The
+      // kill switch continues to block submit/cancel/reconcile.
       if (!this.config.liveDryRunOnly) reasons.push('LIVE_DRY_RUN_ONLY_MUST_BE_TRUE_FOR_SIGNING_TEST');
       if (!this.config.liveSigningTestAllow) reasons.push('LIVE_SIGNING_TEST_ALLOW_FALSE');
     } else if (purpose === 'reconcile') {
