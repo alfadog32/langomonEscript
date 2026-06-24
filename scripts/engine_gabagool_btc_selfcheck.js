@@ -1428,6 +1428,99 @@ async function run() {
 
   {
     const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    const asset = makeGabagoolAsset(baseStartSec);
+    const book = makeBook({ bestBid: 0.48, bestAsk: 0.49, midpoint: 0.485, spread: 0.01 });
+    wireBooks(bot, book);
+    bot.trySignal(makeGabagoolSignal(baseStartSec, {
+      side: 'buy',
+      price: 0.49,
+      sizeUsd: 1,
+      confidence: 0.60,
+    }), asset, book);
+    const duplicateSignal = makeGabagoolSignal(baseStartSec, {
+      side: 'buy',
+      price: 0.49,
+      sizeUsd: 1,
+      confidence: 0.60,
+    });
+    const guard = bot.gabagoolEntryGuard(duplicateSignal, bot.cache.markPrices(), Date.now());
+    bot.trySignal(duplicateSignal, asset, book);
+    const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
+    assert.strictEqual(guard.reason, 'gabagool_reentry_guard', 'same-token open BUYs must be guarded');
+    assert.strictEqual(guard.guardType, 'same_token_open_order', 'same-token open BUYs should expose an explicit guard type');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'same-token BUY reentry must not stack a second open order');
+    assert.strictEqual(bot.lastGabagoolPlacementDecision, 'IDLE:gabagool_reentry_guard', 'same-token open-order guard should surface in the last decision');
+    assert.strictEqual(report.pipelineStats.gabagoolReentryBlocksLastHour, 1, 'same-token open-order blocks should count as reentry blocks');
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    const staleStartSec = baseStartSec - 600;
+    const asset = makeGabagoolAsset(staleStartSec);
+    const book = makeBook({ bestBid: 0.48, bestAsk: 0.49, midpoint: 0.485, spread: 0.01 });
+    wireBooks(bot, book);
+    bot.portfolio.recordFill({
+      tokenId: 'up-token',
+      marketId: 'btc-market-selfcheck',
+      marketSlug: `btc-updown-5m-${staleStartSec}`,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 2,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    bot.portfolio.setMarkPrice('up-token', 0.50);
+    bot.portfolio.paperTokenTradeability.set('up-token', { status: 'stale_token_cooldown' });
+    const staleSignal = makeGabagoolSignal(staleStartSec, {
+      side: 'buy',
+      price: 0.49,
+      sizeUsd: 1,
+      confidence: 0.60,
+    });
+    const guard = bot.gabagoolEntryGuard(staleSignal, bot.cache.markPrices(), Date.now());
+    bot.trySignal(staleSignal, asset, book);
+    const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
+    assert.strictEqual(guard.reason, 'gabagool_reentry_guard', 'expired same-token BTC exposure must block reentry');
+    assert.strictEqual(guard.guardType, 'expired_btc_5m_exposure', 'expired same-token BTC exposure should expose the expired guard type');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0, 'expired same-token BTC exposure must prevent a new BUY order');
+    assert.strictEqual(report.pipelineStats.gabagoolReentryBlocksLastHour, 1, 'expired same-token BTC exposure should count as a reentry block');
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    const asset = makeGabagoolAsset(baseStartSec);
+    const book = makeBook({ bestBid: 0.48, bestAsk: 0.49, midpoint: 0.485, spread: 0.01 });
+    wireBooks(bot, book);
+    const now = Date.now();
+    bot.recordGabagoolBlockedLossExit({
+      tokenId: 'up-token',
+      marketId: 'btc-market-selfcheck',
+      marketSlug: `btc-updown-5m-${baseStartSec}`,
+      outcome: 'Up',
+      side: 'sell',
+      price: 0.40,
+      sizeUsd: 1,
+      avgEntryPrice: 0.50,
+      minProfitPrice: 0.51,
+      source: 'selfcheck_recent_blocked_loss_exit',
+    }, now);
+    const retrySignal = makeGabagoolSignal(baseStartSec, {
+      side: 'buy',
+      price: 0.49,
+      sizeUsd: 1,
+      confidence: 0.60,
+    });
+    const guard = bot.gabagoolEntryGuard(retrySignal, bot.cache.markPrices(), now + 1_000);
+    bot.trySignal(retrySignal, asset, book);
+    const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
+    assert.strictEqual(guard.reason, 'gabagool_reentry_guard', 'recent blocked loss exits must block same-token reentry');
+    assert.strictEqual(guard.guardType, 'recent_blocked_loss_exit', 'blocked loss exit cooldown should surface in the guard type');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0, 'recent blocked loss exits must prevent a new BUY order');
+    assert.strictEqual(report.pipelineStats.gabagoolReentryBlocksLastHour, 1, 'recent blocked loss exits should count as reentry blocks');
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
     const upAsset = makeGabagoolAsset(baseStartSec);
     const downAsset = makeGabagoolAsset(baseStartSec, { tokenId: 'down-token', outcome: 'Down' });
     const upBook = makeBook({ bestBid: 0.48, bestAsk: 0.49, midpoint: 0.485, spread: 0.01 });
@@ -1566,6 +1659,27 @@ async function run() {
     assert(bot.formatBtcOracleReport(report).includes('Gabagool PnL:'), 'formatted btc oracle report should include the Gabagool pnl line');
     assert(bot.formatBtcOracleReport(report).includes('Round Trips:'), 'formatted btc oracle report should include round-trip stats');
     assert.strictEqual(report.tradeQuality.winLossProxy, '1/0', 'btc oracle report should include a win/loss proxy after fake fills');
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    wireBooks(bot);
+    bot.portfolio.recordFill({
+      tokenId: 'expired-up-token',
+      marketId: 'btc-expired-market',
+      marketSlug: `btc-updown-5m-${baseStartSec - 600}`,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    bot.portfolio.setMarkPrice('expired-up-token', 0.50);
+    bot.portfolio.paperTokenTradeability.set('expired-up-token', { status: 'tradable' });
+    const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
+    assert.strictEqual(report.exposure.buckets.expiredBtc5mExposureUsd, 2, 'expired BTC 5m exposure should stay visible in the exposure buckets');
+    assert.strictEqual(report.exposure.audit.exposureMismatchUsd, 0, 'intentional expired BTC 5m exclusions should reconcile the exposure audit');
+    assert.strictEqual(report.exposure.audit.exposureMismatchReason, 'intentional_expired_btc_5m_exclusion', 'intentional expired BTC 5m exclusions should not look like a formula divergence');
   }
 
   {

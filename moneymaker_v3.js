@@ -7880,6 +7880,18 @@ class BotEngine {
       oracleEventKey: details.oracleEventKey || null,
       source: details.source || null,
     };
+    const reentryCooldownMs = Math.max(1_000, Number(this.config.gabagoolReenterCooldownMs || 0));
+    if (payload.marketSlug && payload.tokenId) {
+      this.rememberGabagoolTokenEntryGuard({
+        marketSlug: payload.marketSlug,
+        tokenId: payload.tokenId,
+        outcome: payload.outcome,
+        reason: 'blocked_loss_exit_cooldown',
+        expiresAt: now + reentryCooldownMs,
+        permanent: false,
+        ts: now,
+      });
+    }
     const suppression = this.consumeBlockedLossExitSuppression({
       tokenId: payload.tokenId,
       marketSlug: payload.marketSlug,
@@ -8446,6 +8458,209 @@ class BotEngine {
     };
   }
 
+  gabagoolRecentSameTokenLossState({
+    tokenId,
+    marketSlug,
+    outcome = null,
+    now = Date.now(),
+  } = {}) {
+    const key = String(tokenId || '');
+    if (!key) {
+      return {
+        blocked: true,
+        reason: 'gabagool_reentry_guard_uncertain_state',
+        guardType: 'missing_token_id',
+      };
+    }
+
+    const knownOutcome = this.gabagoolKnownOutcome(outcome);
+    const maxAgeMs = Math.max(1_000, Number(this.config.gabagoolReenterCooldownMs || 0));
+    const cutoffTs = now - maxAgeMs;
+    for (let i = this.portfolio.executionEvents.length - 1; i >= 0; i -= 1) {
+      const event = this.portfolio.executionEvents[i];
+      const eventTs = Number(event?.ts || 0);
+      if (eventTs > 0 && eventTs < cutoffTs) break;
+      if (!isBtcOracleStrategy(event?.strategy)) continue;
+      if (String(event?.tokenId || '') !== key) continue;
+      if (
+        event.type !== 'gabagool_blocked_loss_exit' &&
+        !(event.type === 'gabagool_exit' && (event.reason === 'loss_exit' || event.reason === 'blocked_loss_exit'))
+      ) {
+        continue;
+      }
+
+      const eventMarketSlug = String(event?.marketSlug || event?.marketId || '');
+      const eventOutcome = this.gabagoolKnownOutcome(event?.outcome);
+      if (
+        (marketSlug && eventMarketSlug && eventMarketSlug !== marketSlug) ||
+        (knownOutcome && eventOutcome && eventOutcome !== knownOutcome)
+      ) {
+        return {
+          blocked: true,
+          reason: 'gabagool_reentry_guard_uncertain_state',
+          guardType: 'conflicting_recent_loss_state',
+          tokenId: key,
+          marketSlug,
+          outcome: knownOutcome,
+          recentEventType: event.type,
+          recentEventReason: event.reason || null,
+          recentEventMarketSlug: eventMarketSlug || null,
+          recentEventOutcome: eventOutcome || null,
+          recentEventAgeMs: eventTs > 0 ? Math.max(0, now - eventTs) : null,
+        };
+      }
+      return {
+        blocked: true,
+        reason: 'gabagool_reentry_guard',
+        guardType: event.type === 'gabagool_blocked_loss_exit'
+          ? 'recent_blocked_loss_exit'
+          : 'recent_loss_exit',
+        tokenId: key,
+        marketSlug: marketSlug || eventMarketSlug || null,
+        outcome: knownOutcome || eventOutcome || null,
+        recentEventType: event.type,
+        recentEventReason: event.reason || null,
+        recentEventAgeMs: eventTs > 0 ? Math.max(0, now - eventTs) : null,
+        reenterCooldownMs: maxAgeMs,
+      };
+    }
+    return { blocked: false, reason: null };
+  }
+
+  gabagoolSameTokenEntryGuard(signal, markPrices = this.cache.markPrices(), now = Date.now()) {
+    if (!isGabagoolStrategy(signal) || String(signal?.side || '').toLowerCase() !== 'buy') {
+      return { blocked: false, reason: null };
+    }
+
+    const tokenId = String(signal?.tokenId || '');
+    if (!tokenId) {
+      return {
+        blocked: true,
+        reason: 'gabagool_reentry_guard_uncertain_state',
+        guardType: 'missing_token_id',
+      };
+    }
+
+    const marketSlug = this.gabagoolMarketSlugForSignal(signal);
+    const outcome = this.gabagoolKnownOutcome(signal?.metadata?.outcome) ||
+      this.gabagoolTargetOutcomeForToken(tokenId, marketSlug);
+    const matchingOrders = [...this.portfolio.openOrders.values()]
+      .filter((order) => (
+        isGabagoolStrategy(order?.strategy) &&
+        String(order?.tokenId || '') === tokenId &&
+        Number(order?.remainingUsd?.() || 0) > 0
+      ))
+      .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+    if (matchingOrders.length > 0) {
+      const conflictingOrder = matchingOrders.find((order) => {
+        const orderMarketSlug = this.gabagoolMarketSlugForSignal(order?.signal || order);
+        const orderOutcome = this.gabagoolKnownOutcome(order?.signal?.metadata?.outcome || order?.metadata?.outcome) ||
+          this.gabagoolTargetOutcomeForToken(order?.tokenId, orderMarketSlug || marketSlug);
+        return (
+          (marketSlug && orderMarketSlug && orderMarketSlug !== marketSlug) ||
+          (outcome && orderOutcome && orderOutcome !== outcome)
+        );
+      });
+      if (conflictingOrder) {
+        return {
+          blocked: true,
+          reason: 'gabagool_reentry_guard_uncertain_state',
+          guardType: 'conflicting_open_order_state',
+          tokenId,
+          marketSlug,
+          outcome,
+          conflictingOrderSide: String(conflictingOrder?.side || '').toLowerCase() || null,
+          conflictingOrderMarketSlug: this.gabagoolMarketSlugForSignal(conflictingOrder?.signal || conflictingOrder) || null,
+          conflictingOrderOutcome: this.gabagoolKnownOutcome(
+            conflictingOrder?.signal?.metadata?.outcome || conflictingOrder?.metadata?.outcome
+          ) || null,
+          openOrderCount: matchingOrders.length,
+        };
+      }
+      const order = matchingOrders[0];
+      return {
+        blocked: true,
+        reason: 'gabagool_reentry_guard',
+        guardType: 'same_token_open_order',
+        tokenId,
+        marketSlug,
+        outcome,
+        openOrderSide: String(order?.side || '').toLowerCase() || null,
+        openOrderCount: matchingOrders.length,
+        openOrderAgeMs: Number(order?.createdAt) > 0 ? Math.max(0, now - Number(order.createdAt)) : null,
+      };
+    }
+
+    const positionQty = Number(this.portfolio.position(tokenId) || 0);
+    if (positionQty > 0) {
+      const context = this.gabagoolPositionContext(tokenId, this.portfolio.positionMarketId(tokenId) || signal?.marketId);
+      const contextOutcome = this.gabagoolKnownOutcome(context?.outcome) ||
+        this.gabagoolTargetOutcomeForToken(tokenId, context?.marketSlug || marketSlug);
+      if (
+        (marketSlug && context?.marketSlug && String(context.marketSlug) !== marketSlug) ||
+        (outcome && contextOutcome && contextOutcome !== outcome)
+      ) {
+        return {
+          blocked: true,
+          reason: 'gabagool_reentry_guard_uncertain_state',
+          guardType: 'conflicting_position_state',
+          tokenId,
+          marketSlug,
+          outcome,
+          positionMarketSlug: context?.marketSlug || null,
+          positionOutcome: contextOutcome || null,
+          positionQty,
+        };
+      }
+      const cleanupState = this.gabagoolExposureCleanupState(context, now);
+      const tradeability = this.portfolio.paperTokenTradeability instanceof Map
+        ? (this.portfolio.paperTokenTradeability.get(tokenId) || null)
+        : null;
+      const tradeabilityStatus = String(tradeability?.status || '');
+      const mark = Number(this.portfolio.markPriceForExposure(tokenId, markPrices));
+      const positionValueUsd = positionQty * (
+        Number.isFinite(mark) && mark > 0
+          ? mark
+          : Number(signal?.price || 0)
+      );
+      let guardType = 'active_position';
+      if (cleanupState?.staleMarket === true) {
+        guardType = 'expired_btc_5m_exposure';
+      } else if (tradeabilityStatus === 'no_orderbook_404') {
+        guardType = 'confirmed_no_orderbook_404_exposure';
+      } else if (
+        cleanupState?.staleEvidence === true ||
+        tradeabilityStatus === 'stale_token_cooldown' ||
+        tradeabilityStatus === 'no_bid'
+      ) {
+        guardType = 'unresolved_btc_5m_exposure';
+      }
+      return {
+        blocked: true,
+        reason: 'gabagool_reentry_guard',
+        guardType,
+        tokenId,
+        marketSlug,
+        outcome: outcome || contextOutcome || null,
+        positionQty,
+        positionValueUsd,
+        tradeabilityStatus: tradeabilityStatus || null,
+        staleMarket: cleanupState?.staleMarket === true,
+        staleEvidence: cleanupState?.staleEvidence === true,
+        lastEvidenceAgeMs: Number.isFinite(Number(cleanupState?.lastEvidenceAgeMs))
+          ? Number(cleanupState.lastEvidenceAgeMs)
+          : null,
+      };
+    }
+
+    return this.gabagoolRecentSameTokenLossState({
+      tokenId,
+      marketSlug,
+      outcome,
+      now,
+    });
+  }
+
   recordGabagoolSameMarketIgnores(signal, activeDirections = {}) {
     if (!signal || !activeDirections) return;
     if (!signal.metadata || typeof signal.metadata !== 'object') signal.metadata = {};
@@ -8550,10 +8765,15 @@ class BotEngine {
         Number(tokenGuard.expiresAt || 0) > now
       )
     ) {
+      const tokenGuardType = tokenGuard.permanent === true
+        ? 'round_trip_lockout'
+        : tokenGuard.reason === 'blocked_loss_exit_cooldown'
+          ? 'recent_blocked_loss_exit'
+          : 'recent_sell_cooldown';
       return {
         blocked: true,
         reason: 'gabagool_reentry_guard',
-        guardType: tokenGuard.permanent === true ? 'round_trip_lockout' : 'recent_sell_cooldown',
+        guardType: tokenGuardType,
         tokenId,
         marketSlug,
         outcome,
@@ -8562,6 +8782,9 @@ class BotEngine {
         expiresAt: Number(tokenGuard.expiresAt || 0),
       };
     }
+
+    const sameTokenGuard = this.gabagoolSameTokenEntryGuard(signal, markPrices, now);
+    if (sameTokenGuard.blocked) return sameTokenGuard;
 
     const activeDirections = this.gabagoolActiveMarketDirections(marketSlug, markPrices);
     this.recordGabagoolSameMarketIgnores(signal, activeDirections);
@@ -9783,7 +10006,11 @@ class BotEngine {
               confidence: rawSignal.confidence,
               reason: entryGuard.reason,
             });
-          } else if (entryGuard.reason === 'gabagool_reentry_guard' || entryGuard.reason === 'gabagool_market_lockout') {
+          } else if (
+            entryGuard.reason === 'gabagool_reentry_guard' ||
+            entryGuard.reason === 'gabagool_reentry_guard_uncertain_state' ||
+            entryGuard.reason === 'gabagool_market_lockout'
+          ) {
             this.recordGabagoolMetric('gabagool_reentry_blocked', {
               tokenId: rawSignal.tokenId,
               marketId: rawSignal.marketId,
@@ -10078,9 +10305,19 @@ class BotEngine {
     const riskExposureUsd = Number(riskExposure.riskTotalExposureUsd || 0);
     const portfolioExposureUsd = Number(portfolioExposure.totalExposureUsd || 0);
     const btcOracleExposureUsd = Number(ledger.totalExposureUsd || 0);
-    const exposureMismatchUsd = riskExposureUsd - portfolioExposureUsd;
+    const exposureExclusionUsd = Number(riskExposure.paperEntryExposureExclusionUsd || 0);
+    const excludedDeadExposureReasonSummary = String(riskExposure.excludedDeadExposureReasonSummary || 'none');
+    const exposureMismatchUsd = (riskExposureUsd + exposureExclusionUsd) - portfolioExposureUsd;
     const exposureMismatchReason = Math.abs(exposureMismatchUsd) <= 0.01
-      ? 'none_formulas_aligned_latest_mark_or_avg_cost_plus_open_buys'
+      ? (
+        exposureExclusionUsd > 0.01
+          ? (
+            excludedDeadExposureReasonSummary.startsWith('expired_btc_5m_window:')
+              ? 'intentional_expired_btc_5m_exclusion'
+              : 'intentional_dead_exposure_exclusion'
+          )
+          : 'none'
+      )
       : 'portfolio_and_risk_formulas_diverged';
 
     const marketStartMs = Number.isFinite(Number(target?.ts)) ? Number(target.ts) * 1000 : null;
@@ -10250,7 +10487,7 @@ class BotEngine {
           exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
           capBlockingExposureUsd: Number(riskExposure.capBlockingExposureUsd || 0),
           excludedDeadExposureUsd: Number(riskExposure.excludedDeadExposureUsd || 0),
-          excludedDeadExposureReasonSummary: riskExposure.excludedDeadExposureReasonSummary || 'none',
+          excludedDeadExposureReasonSummary: excludedDeadExposureReasonSummary,
         },
       },
       tradeQuality: {
@@ -11030,7 +11267,11 @@ class BotEngine {
           metricType = 'gabagool_entry_paused';
         } else if (entryGuard.reason === 'gabagool_same_market_direction_guard') {
           metricType = 'gabagool_same_market_direction_blocked';
-        } else if (entryGuard.reason === 'gabagool_reentry_guard' || entryGuard.reason === 'gabagool_market_lockout') {
+        } else if (
+          entryGuard.reason === 'gabagool_reentry_guard' ||
+          entryGuard.reason === 'gabagool_reentry_guard_uncertain_state' ||
+          entryGuard.reason === 'gabagool_market_lockout'
+        ) {
           metricType = 'gabagool_reentry_blocked';
         } else if (entryGuard.reason === 'gabagool_churn_guard') {
           metricType = 'gabagool_churn_blocked';
