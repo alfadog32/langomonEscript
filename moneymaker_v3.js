@@ -4809,8 +4809,11 @@ class RiskEngine {
     };
   }
 
-  exposureBreakdown(signal = null) {
-    const markPrices = this.portfolio.markPricesSnapshot();
+  exposureBreakdown(signal = null, options = {}) {
+    const optionMarkPrices = options && typeof options === 'object' && options.markPrices instanceof Map
+      ? options.markPrices
+      : null;
+    const markPrices = optionMarkPrices || this.portfolio.markPricesSnapshot();
     const portfolioExposure = this.portfolio.portfolioExposureBreakdown(markPrices);
     const now = Date.now();
     const btcOracleLedger = this.portfolio.strategyLedger(isBtcOracleStrategy, markPrices, now);
@@ -7863,6 +7866,98 @@ class BotEngine {
     });
   }
 
+  maybeEmitGabagoolExposureCapRiskRelay(signal, {
+    sophieDecision = 'NOT_RUN',
+    quality = null,
+  } = {}) {
+    if (!isGabagoolStrategy(signal) || String(signal?.side || '').toLowerCase() !== 'buy') return false;
+    const maxTotalExposureUsd = Number(this.config.maxTotalExposureUsd || 0);
+    if (!(maxTotalExposureUsd > 0)) return false;
+    const riskDetails = this.risk.riskDetails(signal);
+    if (!(Number(riskDetails?.wouldTotalExposureUsd || 0) > maxTotalExposureUsd)) return false;
+    this.emitGabagoolUpdate('risk_blocked', {
+      strategy: signal.strategy,
+      marketSlug: signal.metadata?.marketSlug,
+      marketQuestion: signal.metadata?.marketQuestion,
+      tokenId: signal.tokenId,
+      outcome: signal.metadata?.outcome,
+      side: signal.side,
+      price: signal.price,
+      sizeUsd: signal.sizeUsd,
+      expectedEdge: signal.expectedEdge,
+      confidence: signal.confidence,
+      sophieDecision,
+      riskDecision: 'BLOCK:max_total_exposure',
+      blockReason: 'max_total_exposure',
+      oracleEventKey: signal.metadata?.gabagool?.oracleEventKey || null,
+      distanceFromTouch: quality?.distanceFromTouch,
+      predictedFillProbability: quality?.predictedFillProbability,
+      ...riskDetails,
+    });
+    return true;
+  }
+
+  maybeRecordGabagoolDuplicatePlacementGuard(signal, book) {
+    if (!isGabagoolStrategy(signal) || String(signal?.side || '').toLowerCase() !== 'buy') return false;
+    const comparableOrders = this.execution.findComparableOpenOrders(signal);
+    if (comparableOrders.length === 0) return false;
+    const decisions = comparableOrders.map((order) => this.execution.shouldReplaceOpenOrder(order, signal, book));
+    if (decisions.some((decision) => decision?.replace === true)) return false;
+
+    const decision = decisions[0] || {};
+    this.lastGabagoolPlacementBlockReason = 'duplicate_order';
+    this.lastGabagoolPlacementDecision = 'PLACEMENT_BLOCKED:duplicate_order';
+    this.recordGabagoolMetric('gabagool_placement_attempted', {
+      tokenId: signal.tokenId,
+      marketId: signal.marketId,
+      marketSlug: signal.metadata?.marketSlug,
+      outcome: signal.metadata?.outcome,
+      side: signal.side,
+      price: signal.price,
+      sizeUsd: signal.sizeUsd,
+      expectedEdge: signal.expectedEdge,
+      confidence: signal.confidence,
+      reason: 'attempt',
+    });
+    this.recordGabagoolMetric('gabagool_placement_blocked', {
+      tokenId: signal.tokenId,
+      marketId: signal.marketId,
+      marketSlug: signal.metadata?.marketSlug,
+      outcome: signal.metadata?.outcome,
+      side: signal.side,
+      price: signal.price,
+      sizeUsd: signal.sizeUsd,
+      expectedEdge: signal.expectedEdge,
+      confidence: signal.confidence,
+      reason: 'duplicate_order',
+    });
+    this.recordGabagoolMetric('gabagool_placement_decision', {
+      tokenId: signal.tokenId,
+      marketId: signal.marketId,
+      marketSlug: signal.metadata?.marketSlug,
+      outcome: signal.metadata?.outcome,
+      side: signal.side,
+      price: signal.price,
+      sizeUsd: signal.sizeUsd,
+      expectedEdge: signal.expectedEdge,
+      confidence: signal.confidence,
+      reason: this.lastGabagoolPlacementDecision,
+    });
+    this.portfolio.recordExecutionEvent('placement_block', {
+      ...signal,
+      marketSlug: signal?.metadata?.marketSlug,
+      outcome: signal?.metadata?.outcome,
+      reason: 'duplicate_order',
+      detail: decision.reason || 'duplicate',
+      source: 'gabagool_entry_guard_duplicate_open_order',
+    });
+    warn(
+      `[GABAGOOL NO PLACE] stage=entry_guard reason=duplicate_order token=${shortId(signal.tokenId)} ` +
+      `price=${fmtPrice(signal.price)} sizeUsd=${cleanLogValue(signal.sizeUsd)} detail=${cleanLogValue(decision.reason || 'duplicate')}`
+    );
+    return true;
+  }
+
   recordGabagoolBlockedLossExit(details = {}, now = Date.now()) {
     const payload = {
       tokenId: details.tokenId ? String(details.tokenId) : null,
@@ -9980,6 +10075,11 @@ class BotEngine {
           const exitAttemptSummary = attemptGabagoolExits();
           this.lastGabagoolBlockedReason = entryGuard.reason;
           this.lastGabagoolPlacementDecision = `IDLE:${entryGuard.reason}`;
+          const duplicatePlacementGuarded = (
+            entryGuard.reason === 'gabagool_reentry_guard' &&
+            entryGuard.guardType === 'same_token_open_order' &&
+            this.maybeRecordGabagoolDuplicatePlacementGuard(rawSignal, entryBook)
+          );
           if (entryGuard.reason === 'gabagool_loss_guard') {
             this.recordGabagoolMetric('gabagool_entry_paused', {
               tokenId: rawSignal.tokenId,
@@ -10011,18 +10111,20 @@ class BotEngine {
             entryGuard.reason === 'gabagool_reentry_guard_uncertain_state' ||
             entryGuard.reason === 'gabagool_market_lockout'
           ) {
-            this.recordGabagoolMetric('gabagool_reentry_blocked', {
-              tokenId: rawSignal.tokenId,
-              marketId: rawSignal.marketId,
-              marketSlug: rawSignal.metadata?.marketSlug,
-              outcome: rawSignal.metadata?.outcome,
-              side: rawSignal.side,
-              price: rawSignal.price,
-              sizeUsd: rawSignal.sizeUsd,
-              expectedEdge: rawSignal.expectedEdge,
-              confidence: rawSignal.confidence,
-              reason: entryGuard.reason,
-            });
+            if (!duplicatePlacementGuarded) {
+              this.recordGabagoolMetric('gabagool_reentry_blocked', {
+                tokenId: rawSignal.tokenId,
+                marketId: rawSignal.marketId,
+                marketSlug: rawSignal.metadata?.marketSlug,
+                outcome: rawSignal.metadata?.outcome,
+                side: rawSignal.side,
+                price: rawSignal.price,
+                sizeUsd: rawSignal.sizeUsd,
+                expectedEdge: rawSignal.expectedEdge,
+                confidence: rawSignal.confidence,
+                reason: entryGuard.reason,
+              });
+            }
           } else if (entryGuard.reason === 'gabagool_churn_guard') {
             this.recordGabagoolMetric('gabagool_churn_blocked', {
               tokenId: rawSignal.tokenId,
@@ -10063,26 +10165,33 @@ class BotEngine {
               reason: entryGuard.reason,
             });
           }
-          this.recordGabagoolMetric('gabagool_placement_decision', {
-            tokenId: rawSignal.tokenId,
-            marketId: rawSignal.marketId,
-            marketSlug: rawSignal.metadata?.marketSlug,
-            outcome: rawSignal.metadata?.outcome,
-            side: rawSignal.side,
-            price: rawSignal.price,
-            sizeUsd: rawSignal.sizeUsd,
-            expectedEdge: rawSignal.expectedEdge,
-            confidence: rawSignal.confidence,
-            reason: this.lastGabagoolPlacementDecision,
+          if (!duplicatePlacementGuarded) {
+            this.recordGabagoolMetric('gabagool_placement_decision', {
+              tokenId: rawSignal.tokenId,
+              marketId: rawSignal.marketId,
+              marketSlug: rawSignal.metadata?.marketSlug,
+              outcome: rawSignal.metadata?.outcome,
+              side: rawSignal.side,
+              price: rawSignal.price,
+              sizeUsd: rawSignal.sizeUsd,
+              expectedEdge: rawSignal.expectedEdge,
+              confidence: rawSignal.confidence,
+              reason: this.lastGabagoolPlacementDecision,
+            });
+          }
+          this.maybeEmitGabagoolExposureCapRiskRelay(rawSignal, {
+            sophieDecision: 'NOT_RUN',
           });
-          warn(
-            `[GABAGOOL IDLE] reason=${entryGuard.reason} token=${shortId(rawSignal.tokenId)} ` +
-            `marketSlug=${rawSignal.metadata?.marketSlug || 'unknown'} exitsAttempted=${exitAttemptSummary.attempts} ` +
-            `${Object.entries(entryGuard)
-              .filter(([key, value]) => !['blocked', 'reason'].includes(key) && value != null)
-              .map(([key, value]) => `${key}=${cleanLogValue(value)}`)
-              .join(' ')}`
-          );
+          if (!duplicatePlacementGuarded) {
+            warn(
+              `[GABAGOOL IDLE] reason=${entryGuard.reason} token=${shortId(rawSignal.tokenId)} ` +
+              `marketSlug=${rawSignal.metadata?.marketSlug || 'unknown'} exitsAttempted=${exitAttemptSummary.attempts} ` +
+              `${Object.entries(entryGuard)
+                .filter(([key, value]) => !['blocked', 'reason'].includes(key) && value != null)
+                .map(([key, value]) => `${key}=${cleanLogValue(value)}`)
+                .join(' ')}`
+            );
+          }
           maybeLogActiveExitIdle(exitAttemptSummary, rawSignal);
         } else {
           const exposureBreakdown = this.risk.exposureBreakdown(rawSignal);
@@ -10286,7 +10395,7 @@ class BotEngine {
     ].filter((value) => Number.isFinite(value) && value > 0);
     const currentExposureCapUsd = capCandidates.length > 0 ? Math.min(...capCandidates) : null;
     const portfolioExposure = this.portfolio.portfolioExposureBreakdown(markPrices);
-    const riskExposure = this.risk.exposureBreakdown();
+    const riskExposure = this.risk.exposureBreakdown(null, { markPrices });
     const gabagoolNetPnl = this.gabagoolNetPnl(ledger);
     const gabagoolDrawdownPct = this.gabagoolDrawdownPct(ledger);
     const gabagoolClosedLossUsd = Math.max(0, -Number(ledger.closedPnl || 0));
@@ -11301,6 +11410,9 @@ class BotEngine {
           expectedEdge: rawSignal?.expectedEdge,
           confidence: rawSignal?.confidence,
           reason: this.lastGabagoolPlacementDecision,
+        });
+        this.maybeEmitGabagoolExposureCapRiskRelay(rawSignal, {
+          sophieDecision: 'NOT_RUN',
         });
         warn(
           `[GABAGOOL IDLE] reason=${entryGuard.reason} token=${shortId(rawSignal?.tokenId)} ` +

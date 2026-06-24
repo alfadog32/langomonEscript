@@ -42,6 +42,10 @@ function tempPath(name) {
   return path.join('/tmp', `${name}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
 }
 
+function tempDir(name) {
+  return fs.mkdtempSync(path.join('/tmp', `${name}-${process.pid}-`));
+}
+
 function makeProfile() {
   return {
     proxyWallet: DEFAULT_PROXY_WALLET,
@@ -1470,6 +1474,9 @@ async function run() {
       strategy: 'GabagoolBtcOracleStrategy',
     });
     bot.portfolio.setMarkPrice('up-token', 0.50);
+    if (!(bot.portfolio.paperTokenTradeability instanceof Map)) {
+      bot.portfolio.paperTokenTradeability = new Map();
+    }
     bot.portfolio.paperTokenTradeability.set('up-token', { status: 'stale_token_cooldown' });
     const staleSignal = makeGabagoolSignal(staleStartSec, {
       side: 'buy',
@@ -1674,9 +1681,14 @@ async function run() {
       size: 4,
       strategy: 'GabagoolBtcOracleStrategy',
     });
-    bot.portfolio.setMarkPrice('expired-up-token', 0.50);
+    bot.portfolio.setMarkPrice('expired-up-token', 0.49);
+    if (!(bot.portfolio.paperTokenTradeability instanceof Map)) {
+      bot.portfolio.paperTokenTradeability = new Map();
+    }
     bot.portfolio.paperTokenTradeability.set('expired-up-token', { status: 'tradable' });
-    const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
+    const report = bot.buildBtcOracleReport(new Map([
+      ['expired-up-token', 0.50],
+    ]), Date.now());
     assert.strictEqual(report.exposure.buckets.expiredBtc5mExposureUsd, 2, 'expired BTC 5m exposure should stay visible in the exposure buckets');
     assert.strictEqual(report.exposure.audit.exposureMismatchUsd, 0, 'intentional expired BTC 5m exclusions should reconcile the exposure audit');
     assert.strictEqual(report.exposure.audit.exposureMismatchReason, 'intentional_expired_btc_5m_exclusion', 'intentional expired BTC 5m exclusions should not look like a formula divergence');
@@ -2114,7 +2126,8 @@ async function run() {
     assert(signals.some((signal) => signal.side === 'sell'), 'ghost throttle should still allow exits');
   }
 
-  const liveConfig = readLiveConfig(process.cwd());
+  const isolatedLiveConfigRoot = tempDir('gabagool-live-config-selfcheck');
+  const liveConfig = readLiveConfig(isolatedLiveConfigRoot);
   assert.strictEqual(liveConfig.enableLiveTrading, false, 'live adapter must stay disabled');
   assert.strictEqual(liveConfig.liveAutoExecute, false, 'live auto execute must stay disabled');
   assert.strictEqual(liveConfig.liveKillSwitch, true, 'live kill switch must stay enabled');

@@ -7,10 +7,12 @@ const path = require('path');
 
 const { LiveAdapter } = require('../live_adapter_polymarket');
 
-const ROOT = process.cwd();
-
 function tempPath(name, ext = 'env') {
   return path.join('/tmp', `${name}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`);
+}
+
+function tempDir(name) {
+  return fs.mkdtempSync(path.join('/tmp', `${name}-${process.pid}-`));
 }
 
 function writeTempSecrets() {
@@ -100,6 +102,7 @@ function makeIntent(overrides = {}) {
 }
 
 async function main() {
+  const root = tempDir('live-final-boss-selfcheck');
   const tempSecrets = writeTempSecrets();
   const missingSecrets = tempPath('live-final-boss-missing');
 
@@ -130,44 +133,44 @@ async function main() {
   };
 
   await withEnv({ ...baseEnv, LIVE_SECRETS_PATH: missingSecrets }, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const decision = adapter.live.secretAccessDecision('submit');
     assert.strictEqual(decision.ok, false, 'missing secrets must block live submit');
     assert(decision.reasons.includes('LIVE_SECRETS_FILE_MISSING'), 'missing secrets reason should be reported');
   });
 
   await withEnv({ ...baseEnv, LIVE_KILL_SWITCH: 'true' }, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const evaluation = await adapter.evaluate(makeIntent(), { mode: 'submit', fetchMetadata: false });
     assert(evaluation.reasons.includes('KILL_SWITCH_ACTIVE'), 'kill switch must block submit');
   });
 
   await withEnv(baseEnv, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const result = await adapter.handleIntent(makeIntent(), { mode: 'dry-run', fetchMetadata: false });
     assert.strictEqual(result.decision, 'DRY_RUN_ALLOWED_BUT_NOT_SUBMITTED', 'dry-run must not submit');
   });
 
   await withEnv(baseEnv, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const evaluation = await adapter.evaluate(makeIntent({ sizeUsd: 1.25 }), { mode: 'submit', fetchMetadata: false });
     assert(evaluation.reasons.includes('MAX_LIVE_ORDER_USD_EXCEEDED'), 'oversized live order must be blocked');
   });
 
   await withEnv(baseEnv, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const evaluation = await adapter.evaluate(makeIntent({ bookFresh: false, bookAgeMs: 5_000 }), { mode: 'submit', fetchMetadata: false });
     assert(evaluation.reasons.includes('BOOK_NOT_FRESH') || evaluation.reasons.includes('BOOK_TOO_OLD'), 'stale book must be blocked');
   });
 
   await withEnv(baseEnv, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const evaluation = await adapter.evaluate(makeIntent({ expectedEdge: 0.005 }), { mode: 'submit', fetchMetadata: false });
     assert(evaluation.reasons.includes('EXPECTED_EDGE_TOO_LOW'), 'weak edge must be blocked');
   });
 
   await withEnv(baseEnv, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const evaluation = await adapter.evaluate(makeIntent({ sophieApproved: true, riskApproved: false }), { mode: 'submit', fetchMetadata: false });
     assert(evaluation.reasons.includes('RISK_NOT_APPROVED'), 'risk disagreement must block submit');
   });
@@ -185,7 +188,7 @@ async function main() {
     LIVE_TRADING_STAGE: '1',
     LIVE_FINAL_BOSS_READY: 'false',
   }, async () => {
-    const adapter = new LiveAdapter({ baseDir: ROOT });
+    const adapter = new LiveAdapter({ baseDir: root });
     const result = await adapter.signingTest(makeIntent());
     assert.strictEqual(result.submitted, false, 'signing test must never submit');
 
