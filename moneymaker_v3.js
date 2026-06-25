@@ -195,6 +195,8 @@ const CONFIG = {
   paperActionBurnInMaxLiquidityConsumedPct: envNum('PAPER_ACTION_BURNIN_MAX_LIQUIDITY_CONSUMED_PCT', 0.35),
   paperActionBurnInGhostGracePct: envNum('PAPER_ACTION_BURNIN_GHOST_GRACE_PCT', 2),
   paperActionBurnInGhostMinConfidence: envNum('PAPER_ACTION_BURNIN_GHOST_MIN_CONFIDENCE', 0.30),
+  paperBurnInResetMode: envBool('PAPER_BURNIN_RESET_MODE', false),
+  paperBurnInLabel: envStr('PAPER_BURNIN_LABEL', ''),
   paperMakerDistanceDecayPerNoFill: envNum('PAPER_MAKER_DISTANCE_DECAY_PER_NOFILL', 0.18),
   paperMakerMinOptimizedDistance: envNum('PAPER_MAKER_MIN_OPTIMIZED_DISTANCE', 0.015),
   paperMakerMaxNoFillDecayStreak: envInt('PAPER_MAKER_MAX_NOFILL_DECAY_STREAK', 5),
@@ -462,6 +464,24 @@ function envBool(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined) return fallback;
   return ['1', 'true', 'yes', 'y', 'on'].includes(String(raw).toLowerCase());
+}
+
+function deriveBurnInStateBasename(config = {}, explicitProfileUsd = null) {
+  const hasExplicitProfileUsd =
+    explicitProfileUsd !== null &&
+    explicitProfileUsd !== undefined &&
+    String(explicitProfileUsd).trim() !== '';
+  const profileUsd = Math.max(
+    1,
+    hasExplicitProfileUsd && Number.isFinite(Number(explicitProfileUsd))
+      ? Number(explicitProfileUsd)
+      : Number(config.initialCash || 0)
+  );
+  return `moneymaker_v3_state_post_patch_burnin_${Math.round(profileUsd)}.json`;
+}
+
+function burnInStateLabel(config = {}) {
+  return String(config.paperBurnInLabel || '').trim() || 'post_patch_burnin';
 }
 
 function envList(name, fallback = []) {
@@ -3024,9 +3044,36 @@ class VolatilityGuard {
 class PaperPortfolio {
   constructor(config) {
     this.config = config;
-    this.cash = config.initialCash;
-    this.startingCash = config.initialCash;
-    this.peakEquity = config.initialCash;
+    this.resetInMemoryState('constructor_boot');
+  }
+
+  recommendedFreshBurnInStateFile(explicitProfileUsd = null) {
+    return deriveBurnInStateBasename(this.config, explicitProfileUsd);
+  }
+
+  createBurnInState(reason = 'fresh_state', now = Date.now()) {
+    return {
+      label: burnInStateLabel(this.config),
+      intendedProfileUsd: Number(this.config.initialCash || 0),
+      stateFile: path.basename(String(this.config.stateFile || '')),
+      recommendedFreshStateFile: this.recommendedFreshBurnInStateFile(),
+      lifecycleStatus: 'clean_burnin_running',
+      lifecycleReason: reason,
+      createdAt: new Date(now).toISOString(),
+      lastResetAt: new Date(now).toISOString(),
+      resetModeApplied: this.config.paperBurnInResetMode === true,
+      failedAt: null,
+      failedReason: null,
+      failedDrawdownPct: null,
+      failedClosedPnl: null,
+      freshStateRequired: false,
+    };
+  }
+
+  resetInMemoryState(reason = 'manual_reset', now = Date.now()) {
+    this.cash = this.config.initialCash;
+    this.startingCash = this.config.initialCash;
+    this.peakEquity = this.config.initialCash;
     this.positions = new Map();
     this.costBasis = new Map();
     this.positionMarkets = new Map();
@@ -3046,6 +3093,67 @@ class PaperPortfolio {
       paperOrderReplacements: 0,
       paperDuplicateSkips: 0,
       paperFills: 0,
+    };
+    this.burnInState = this.createBurnInState(reason, now);
+  }
+
+  markBurnInFailedByDrawdown({
+    reason = 'drawdown_limit',
+    drawdownPct = this.getDrawdownPct(),
+    closedPnl = this.closedPnl,
+    now = Date.now(),
+  } = {}) {
+    const current = this.burnInState || this.createBurnInState('restored_state', now);
+    if (current.lifecycleStatus === 'burn_in_failed_by_drawdown') return current;
+    this.burnInState = {
+      ...current,
+      lifecycleStatus: 'burn_in_failed_by_drawdown',
+      lifecycleReason: reason,
+      failedAt: new Date(now).toISOString(),
+      failedReason: reason,
+      failedDrawdownPct: Number.isFinite(Number(drawdownPct)) ? Number(drawdownPct) : null,
+      failedClosedPnl: Number.isFinite(Number(closedPnl)) ? Number(closedPnl) : null,
+      freshStateRequired: true,
+      recommendedFreshStateFile: current.recommendedFreshStateFile || this.recommendedFreshBurnInStateFile(),
+    };
+    return this.burnInState;
+  }
+
+  buildPersistedState() {
+    return {
+      cash: this.cash,
+      startingCash: this.startingCash,
+      peakEquity: this.peakEquity,
+      deadExposureCashReserveOutstandingUsd: this.deadExposureCashReserveOutstanding(),
+      deadExposureCashReserveCreditsUsd: Number(this.deadExposureCashReserveCreditsUsd || 0),
+      deadExposureCashReserveRepaymentsUsd: Number(this.deadExposureCashReserveRepaymentsUsd || 0),
+      positions: Object.fromEntries(this.positions),
+      positionMarkets: Object.fromEntries(this.positionMarkets),
+      costBasis: Object.fromEntries(this.costBasis),
+      latestMarks: Object.fromEntries(this.latestMarks),
+      closedPnl: this.closedPnl,
+      strategyPnl: Object.fromEntries(this.strategyPnl),
+      ghostStats: this.ghostStats,
+      fills: this.fills.slice(-500),
+      executionTotals: this.executionTotals,
+      executionEvents: this.executionEvents.slice(-1000),
+      burnInState: this.burnInState || this.createBurnInState('state_save'),
+    };
+  }
+
+  writeFreshBurnInStateFile(reason = 'paper_burnin_reset_mode') {
+    const now = Date.now();
+    this.resetInMemoryState(reason, now);
+    const data = this.buildPersistedState();
+    fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
+    return {
+      stateFile: this.config.stateFile,
+      initialCash: Number(this.config.initialCash || 0),
+      lifecycleStatus: data.burnInState.lifecycleStatus,
+      recommendedFreshStateFile: data.burnInState.recommendedFreshStateFile,
+      liveTradingEnabled: this.config.enableLiveTrading === true,
+      liveKillSwitch: this.config.liveKillSwitch === true,
+      liveDryRunOnly: this.config.liveDryRunOnly === true,
     };
   }
 
@@ -3814,6 +3922,12 @@ class PaperPortfolio {
       realizedPnl: numeric(details.realizedPnl),
       trustedRealizedPnl: numeric(details.trustedRealizedPnl),
       untrustedRealizedPnl: numeric(details.untrustedRealizedPnl),
+      drawdownGateActive: details.drawdownGateActive === true ? true : details.drawdownGateActive === false ? false : null,
+      paperProbationActive: details.paperProbationActive === true ? true : details.paperProbationActive === false ? false : null,
+      probationAdmission: details.probationAdmission ? String(details.probationAdmission) : null,
+      paperProbationTrigger: details.paperProbationTrigger ? String(details.paperProbationTrigger) : null,
+      sophieDecision: details.sophieDecision ? String(details.sophieDecision) : null,
+      finalBlockerAfterProbation: details.finalBlockerAfterProbation ? String(details.finalBlockerAfterProbation) : null,
       positionQtyBefore: numeric(details.positionQtyBefore),
       positionQtyAfter: numeric(details.positionQtyAfter),
       positionQty: numeric(details.positionQty),
@@ -4017,6 +4131,33 @@ class PaperPortfolio {
     )).length;
     const probationAdmissionsLastHour = countType('paper_probation_admit');
     const probationBlocksLastHour = countType('paper_probation_block');
+    const probationAdmissionsBeforeRisk = probationAdmissionsLastHour;
+    const probationOrdersBlockedByDrawdown = recent.filter((event) => (
+      event.type === 'risk_block' &&
+      event.reason === 'drawdown_limit' &&
+      event.paperProbationActive === true
+    )).length;
+    const sophieAdmittedRiskBlocksLastHour = recent.filter((event) => (
+      event.type === 'risk_block' &&
+      ['ADMIT', 'PAPER_PROBATION_ADMIT', 'CALIBRATED_ADMIT', 'OPTIMIZED_MAKER_ADMIT'].includes(String(event.sophieDecision || ''))
+    ));
+    const sophieAdmittedButRiskBlockedLastHour = sophieAdmittedRiskBlocksLastHour.length;
+    const sophieAdmittedButRiskBlockedByDrawdownLastHour = sophieAdmittedRiskBlocksLastHour
+      .filter((event) => event.reason === 'drawdown_limit')
+      .length;
+    const finalProbationBlockers = new Map();
+    for (const event of recent) {
+      if (event.type !== 'risk_block' && event.type !== 'placement_block') continue;
+      if (event.paperProbationActive !== true) continue;
+      const key = String(event.reason || 'unknown_final_blocker');
+      finalProbationBlockers.set(key, Number(finalProbationBlockers.get(key) || 0) + 1);
+    }
+    const finalBlockerAfterProbation = [...finalProbationBlockers.entries()]
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        return a[0].localeCompare(b[0]);
+      })[0]?.[0] || 'none';
+    const drawdownGateActive = this.getDrawdownPct() > this.config.maxDrawdownPct;
     const topBlockReasons = new Map();
     for (const event of recent) {
       let key = null;
@@ -4043,6 +4184,9 @@ class PaperPortfolio {
         openOrders.length > 0 ? `openOrders=${openOrders.length}` : null,
         paperOrdersAdmittedLastHour > 0 ? `admitted=${paperOrdersAdmittedLastHour}` : null,
         paperOrdersRejectedBySophieLastHour > 0 ? `sophieRejected=${paperOrdersRejectedBySophieLastHour}` : null,
+        sophieAdmittedButRiskBlockedLastHour > 0 ? `sophieAdmittedButRiskBlocked=${sophieAdmittedButRiskBlockedLastHour}` : null,
+        probationOrdersBlockedByDrawdown > 0 ? `probationBlockedByDrawdown=${probationOrdersBlockedByDrawdown}` : null,
+        finalBlockerAfterProbation !== 'none' ? `finalBlockerAfterProbation=${finalBlockerAfterProbation}` : null,
         spreadHunterGhostBlocksLastHour > 0 ? `ghost=${spreadHunterGhostBlocksLastHour}` : null,
         spreadHunterConfidenceBlocksLastHour > 0 ? `confidence=${spreadHunterConfidenceBlocksLastHour}` : null,
         probationBlocksLastHour > 0 ? `probationBlocked=${probationBlocksLastHour}` : null,
@@ -4086,14 +4230,32 @@ class PaperPortfolio {
     const actionRateStatus = paperActionBurnInActive
       ? (actionRateBelowTarget ? 'action_rate_below_target' : 'action_rate_on_target')
       : 'action_rate_not_applicable';
+    const finalRiskGateBlockedAfterAdmission = (
+      actionRateBelowTarget &&
+      paperOrdersPlacedLast15m === 0 &&
+      sophieAdmittedButRiskBlockedByDrawdownLastHour > 0
+    );
     const actionRateReason = actionRateBelowTarget
       ? [
         'action_rate_below_target',
         `orders15m=${paperOrdersPlacedLast15m}/${targetOrdersPer15m}`,
         `fills15m=${paperOrdersFilledLast15m}/${targetFillsPer15m}`,
-        dominantActionRateBlock ? `dominantBlock=${dominantActionRateBlock[0]}:${dominantActionRateBlock[1]}` : null,
+        finalRiskGateBlockedAfterAdmission
+          ? 'sophie_admitted_but_final_risk_gate_blocked'
+          : null,
+        finalRiskGateBlockedAfterAdmission ? 'finalBlocker=drawdown_limit' : null,
+        finalRiskGateBlockedAfterAdmission
+          ? `probationAdmissionsBeforeRisk=${probationAdmissionsBeforeRisk}`
+          : null,
+        finalRiskGateBlockedAfterAdmission
+          ? `probationOrdersBlockedByDrawdown=${probationOrdersBlockedByDrawdown}`
+          : null,
+        !finalRiskGateBlockedAfterAdmission && dominantActionRateBlock
+          ? `dominantBlock=${dominantActionRateBlock[0]}:${dominantActionRateBlock[1]}`
+          : null,
       ].filter(Boolean).join(' ')
       : actionRateStatus;
+    const burnInLifecycle = this.burnInLifecycleState(now);
     const lastFillEvent = fillEvents.slice().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))[0] || null;
     const deadExposureCashReserve = this.deadExposureCashReserveState();
 
@@ -4213,7 +4375,13 @@ class PaperPortfolio {
       spreadHunterCooldownBlocksLastHour,
       spreadHunterExecutionRealismBlocksLastHour,
       probationAdmissionsLastHour,
+      probationAdmissionsBeforeRisk,
       probationBlocksLastHour,
+      probationOrdersBlockedByDrawdown,
+      finalBlockerAfterProbation,
+      sophieAdmittedButRiskBlockedLastHour,
+      sophieAdmittedButRiskBlockedByDrawdownLastHour,
+      drawdownGateActive,
       topBlockReasonsLastHour,
       whyTotalOrdersZeroLastHour,
       paperOrdersPlacedLast15m,
@@ -4224,6 +4392,10 @@ class PaperPortfolio {
       paperActionBurnInActive,
       actionRateStatus,
       actionRateReason,
+      burnInLifecycleStatus: burnInLifecycle.lifecycleStatus,
+      burnInLifecycleReason: burnInLifecycle.lifecycleReason,
+      burnInFreshStateRequired: burnInLifecycle.freshStateRequired,
+      burnInRecommendedFreshStateFile: burnInLifecycle.recommendedFreshStateFile,
       gabagoolLossGuardExitBlockedLastReason: latestGabagoolReason('gabagool_loss_guard_exit_blocked'),
       gabagoolLossGuardPositionsScanned: latestGabagoolField('gabagool_loss_guard_exit_scan', 'positionsScanned') || 0,
       gabagoolLossGuardPositionsClosable: latestGabagoolField('gabagool_loss_guard_exit_scan', 'positionsClosable') || 0,
@@ -4261,6 +4433,73 @@ class PaperPortfolio {
         adverseSelectionBufferApplied: lastFillEvent.adverseSelectionBufferApplied,
         trustedPnl: lastFillEvent.trustedPnl,
       } : null,
+    };
+  }
+
+  burnInLifecycleState(now = Date.now()) {
+    const current = this.burnInState || this.createBurnInState('computed_runtime', now);
+    const drawdownGateActive = this.getDrawdownPct() > this.config.maxDrawdownPct;
+    if (drawdownGateActive && current.lifecycleStatus !== 'burn_in_failed_by_drawdown') {
+      return this.markBurnInFailedByDrawdown({
+        reason: 'drawdown_limit',
+        drawdownPct: this.getDrawdownPct(),
+        closedPnl: this.closedPnl,
+        now,
+      });
+    }
+    return {
+      ...current,
+      stateFile: path.basename(String(this.config.stateFile || '')),
+      recommendedFreshStateFile: current.recommendedFreshStateFile || this.recommendedFreshBurnInStateFile(),
+    };
+  }
+
+  gabagoolDrawdownBreakdown(markPrices = new Map(), now = Date.now()) {
+    const ledger = this.strategyLedger(isBtcOracleStrategy, markPrices, now);
+    const breachEvent = this.executionEvents.find((event) => (
+      isBtcOracleStrategy(event?.strategy) &&
+      event.type === 'risk_block' &&
+      event.reason === 'drawdown_limit'
+    )) || null;
+    const breachTs = breachEvent ? Number(breachEvent.ts || 0) : NaN;
+    const gabagoolBuyFills = this.fills
+      .filter((fill) => (
+        isBtcOracleStrategy(fill?.strategy) &&
+        String(fill?.side || '').toLowerCase() === 'buy'
+      ))
+      .slice()
+      .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+    const entriesBeforeBreach = Number.isFinite(breachTs)
+      ? gabagoolBuyFills.filter((fill) => Number(fill.ts || 0) <= breachTs)
+      : gabagoolBuyFills;
+    const avgEntryPriceBeforeBreach = entriesBeforeBreach.length > 0
+      ? entriesBeforeBreach.reduce((sum, fill) => sum + Number(fill.price || 0), 0) / entriesBeforeBreach.length
+      : null;
+    const postBreachEntries = Number.isFinite(breachTs)
+      ? gabagoolBuyFills.filter((fill) => Number(fill.ts || 0) > breachTs).length
+      : 0;
+    const lossesByToken = new Map();
+    for (const trip of ledger.roundTrips || []) {
+      const pnl = Number(trip.realizedPnl || 0);
+      if (!(pnl < 0)) continue;
+      const key = [
+        String(trip.marketSlug || trip.marketId || 'unknown_market'),
+        String(trip.tokenId || 'unknown_token'),
+      ].join('/');
+      lossesByToken.set(key, Number(lossesByToken.get(key) || 0) + pnl);
+    }
+    const lossPerMarketToken = [...lossesByToken.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .slice(0, 3)
+      .map(([key, pnl]) => `${key}:${Number(pnl).toFixed(2)}`)
+      .join(',') || 'none';
+    return {
+      entriesBeforeDrawdownBreach: entriesBeforeBreach.length,
+      averageEntryPriceBeforeDrawdownBreach: avgEntryPriceBeforeBreach,
+      lastExitClassification: (ledger.roundTrips || []).slice(-1)[0]?.classification || 'none',
+      lossPerMarketToken,
+      lossGuardTriggeredTooLate: postBreachEntries > 0,
+      repeatedEntriesAlreadyBlocked: this.executionHealth(now).gabagoolRepeatedSameMarketSameTokenEntriesLastHour === 0,
     };
   }
 
@@ -4649,25 +4888,7 @@ class PaperPortfolio {
     if (!this.config.saveState) return;
 
     try {
-      const data = {
-        cash: this.cash,
-        startingCash: this.startingCash,
-        peakEquity: this.peakEquity,
-        deadExposureCashReserveOutstandingUsd: this.deadExposureCashReserveOutstanding(),
-        deadExposureCashReserveCreditsUsd: Number(this.deadExposureCashReserveCreditsUsd || 0),
-        deadExposureCashReserveRepaymentsUsd: Number(this.deadExposureCashReserveRepaymentsUsd || 0),
-        positions: Object.fromEntries(this.positions),
-        positionMarkets: Object.fromEntries(this.positionMarkets),
-        costBasis: Object.fromEntries(this.costBasis),
-        latestMarks: Object.fromEntries(this.latestMarks),
-        closedPnl: this.closedPnl,
-        strategyPnl: Object.fromEntries(this.strategyPnl),
-        ghostStats: this.ghostStats,
-        fills: this.fills.slice(-500),
-        executionTotals: this.executionTotals,
-        executionEvents: this.executionEvents.slice(-1000),
-      };
-
+      const data = this.buildPersistedState();
       fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
     } catch (e) {
       warn(`State save failed: ${e.message}`);
@@ -4678,6 +4899,17 @@ class PaperPortfolio {
     if (!this.config.saveState) return;
 
     try {
+      if (this.config.paperBurnInResetMode === true) {
+        const freshState = this.writeFreshBurnInStateFile('paper_burnin_reset_mode');
+        info(
+          `[BURN-IN RESET] stateFile=${freshState.stateFile} initialCash=${cleanLogValue(freshState.initialCash)} ` +
+          `lifecycleStatus=${freshState.lifecycleStatus} recommendedFreshStateFile=${freshState.recommendedFreshStateFile} ` +
+          `liveTradingEnabled=${freshState.liveTradingEnabled ? 'true' : 'false'} ` +
+          `liveKillSwitch=${freshState.liveKillSwitch ? 'true' : 'false'} ` +
+          `liveDryRunOnly=${freshState.liveDryRunOnly ? 'true' : 'false'}`
+        );
+        return;
+      }
       if (!fs.existsSync(this.config.stateFile)) return;
 
       const data = JSON.parse(fs.readFileSync(this.config.stateFile, 'utf8'));
@@ -4708,6 +4940,15 @@ class PaperPortfolio {
         ...(data.executionTotals || {}),
       };
       this.executionEvents = Array.isArray(data.executionEvents) ? data.executionEvents : [];
+      this.burnInState = data.burnInState && typeof data.burnInState === 'object'
+        ? {
+          ...this.createBurnInState('restored_state'),
+          ...data.burnInState,
+          stateFile: path.basename(String(this.config.stateFile || '')),
+          recommendedFreshStateFile: data.burnInState.recommendedFreshStateFile || this.recommendedFreshBurnInStateFile(),
+          resetModeApplied: this.config.paperBurnInResetMode === true,
+        }
+        : this.createBurnInState('restored_state');
       for (const fill of this.fills) {
         const tokenId = String(fill?.tokenId || '');
         const marketId = String(fill?.marketId || '');
@@ -5273,7 +5514,15 @@ class RiskEngine {
 
   block(signal, reason, extra = {}) {
     this.lastBlockReason = reason;
-    this.lastBlockDetails = { ...this.riskDetails(signal), ...extra };
+    this.lastBlockDetails = {
+      ...this.riskDetails(signal),
+      drawdownGateActive: this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct,
+      paperProbationActive: signal?.metadata?.paperProbation?.active === true,
+      probationAdmission: signal?.metadata?.paperProbation?.admissionReason || null,
+      paperProbationTrigger: signal?.metadata?.paperProbation?.trigger || null,
+      finalBlockerAfterProbation: signal?.metadata?.paperProbation?.active === true ? reason : null,
+      ...extra,
+    };
     this.diagnostics?.record({
       strategy: signal?.strategy,
       scorePassed: Boolean(signal?.metadata?.consensus?.score >= this.config.consensusThreshold),
@@ -5473,7 +5722,20 @@ class RiskEngine {
       }
     }
 
-    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) return this.block(signal, 'drawdown_limit');
+    if (this.portfolio.getDrawdownPct() > this.config.maxDrawdownPct) {
+      if (this.config.enableLiveTrading !== true && this.config.paperActionBurnInEnabled === true) {
+        this.portfolio.markBurnInFailedByDrawdown({
+          reason: 'drawdown_limit',
+          drawdownPct: this.portfolio.getDrawdownPct(),
+          closedPnl: this.portfolio.closedPnl,
+        });
+      }
+      return this.block(signal, 'drawdown_limit', {
+        burnInLifecycleStatus: this.portfolio.burnInState?.lifecycleStatus || null,
+        burnInFreshStateRequired: this.portfolio.burnInState?.freshStateRequired === true,
+        recommendedFreshStateFile: this.portfolio.burnInState?.recommendedFreshStateFile || this.portfolio.recommendedFreshBurnInStateFile?.(),
+      });
+    }
 
     return signal;
   }
@@ -11985,17 +12247,43 @@ class BotEngine {
     }
     signal = this.risk.evaluate(signal);
     if (!signal) {
+      const riskBlockReason = this.risk.lastBlockReason || 'invalid_signal';
+      const probationActive = rawSignal?.metadata?.paperProbation?.active === true;
+      const probationAdmission = rawSignal?.metadata?.paperProbation?.admissionReason || null;
+      const sophieDecision = quality?.qualityDecision || 'ADMIT';
       if (rawSignal) {
         this.portfolio.recordExecutionEvent('risk_block', {
           ...rawSignal,
           marketSlug: rawSignal?.metadata?.marketSlug,
           outcome: rawSignal?.metadata?.outcome,
-          reason: this.risk.lastBlockReason || 'invalid_signal',
+          reason: riskBlockReason,
+          drawdownGateActive: riskBlockReason === 'drawdown_limit',
+          paperProbationActive: probationActive,
+          probationAdmission,
+          paperProbationTrigger: rawSignal?.metadata?.paperProbation?.trigger || null,
+          sophieDecision,
+          finalBlockerAfterProbation: probationActive ? riskBlockReason : null,
           ...this.risk.lastBlockDetails,
         });
       }
+      if (
+        rawSignal &&
+        this.config.enableLiveTrading !== true &&
+        isStandardPaperStrategy(rawSignal.strategy) &&
+        riskBlockReason === 'drawdown_limit' &&
+        ['ADMIT', 'PAPER_PROBATION_ADMIT', 'CALIBRATED_ADMIT', 'OPTIMIZED_MAKER_ADMIT'].includes(sophieDecision)
+      ) {
+        warn(
+          `[PAPER BURN-IN FINAL BLOCK] strategy=${rawSignal.strategy} side=${String(rawSignal.side || '').toUpperCase()} ` +
+          `token=${shortId(rawSignal.tokenId)} sophieDecision=${sophieDecision} ` +
+          `paperProbationActive=${probationActive ? 'true' : 'false'} ` +
+          `probationAdmission=${probationAdmission || 'none'} finalBlocker=drawdown_limit ` +
+          `drawdownPct=${cleanLogValue(this.risk.lastBlockDetails?.drawdownPct)} ` +
+          `maxDrawdownPct=${cleanLogValue(this.risk.lastBlockDetails?.maxDrawdownPct)} ` +
+          `recommendedAction=fresh_state_required stateFile=${path.basename(String(this.config.stateFile || ''))}`
+        );
+      }
       if (gabagoolSignal) {
-        const riskBlockReason = this.risk.lastBlockReason || 'invalid_signal';
         const noPlacementReason = this.gabagoolNoPlacementReasonFromRisk(riskBlockReason, rawSignal);
         this.lastGabagoolBlockedReason = riskBlockReason;
         this.lastGabagoolRiskBlockReason = riskBlockReason;
@@ -12267,6 +12555,23 @@ class BotEngine {
     const rawSignal = signal;
     const risked = this.risk.evaluate(signal);
     if (!risked) {
+      if (rawSignal) {
+        this.portfolio.recordExecutionEvent('risk_block', {
+          ...rawSignal,
+          marketSlug: rawSignal?.metadata?.marketSlug,
+          outcome: rawSignal?.metadata?.outcome,
+          reason: this.risk.lastBlockReason || 'invalid_signal',
+          drawdownGateActive: (this.risk.lastBlockReason || 'invalid_signal') === 'drawdown_limit',
+          paperProbationActive: rawSignal?.metadata?.paperProbation?.active === true,
+          probationAdmission: rawSignal?.metadata?.paperProbation?.admissionReason || null,
+          paperProbationTrigger: rawSignal?.metadata?.paperProbation?.trigger || null,
+          sophieDecision: this.lastSophieQualityDecision?.qualityDecision || 'ADMIT',
+          finalBlockerAfterProbation: rawSignal?.metadata?.paperProbation?.active === true
+            ? (this.risk.lastBlockReason || 'invalid_signal')
+            : null,
+          ...this.risk.lastBlockDetails,
+        });
+      }
       if (this.config.consensusLogRejected && rawSignal) {
         const details = formatRiskBlockDetails(this.risk.lastBlockDetails);
         warn(
@@ -12768,6 +13073,21 @@ class BotEngine {
 
       const risked = this.risk.evaluate(candidate.signal);
       if (!risked) {
+        this.portfolio.recordExecutionEvent('risk_block', {
+          ...candidate.signal,
+          marketSlug: candidate.signal?.metadata?.marketSlug,
+          outcome: candidate.signal?.metadata?.outcome,
+          reason: this.risk.lastBlockReason || 'invalid_signal',
+          drawdownGateActive: (this.risk.lastBlockReason || 'invalid_signal') === 'drawdown_limit',
+          paperProbationActive: candidate.signal?.metadata?.paperProbation?.active === true,
+          probationAdmission: candidate.signal?.metadata?.paperProbation?.admissionReason || null,
+          paperProbationTrigger: candidate.signal?.metadata?.paperProbation?.trigger || null,
+          sophieDecision: 'OPTIMIZED_MAKER_ADMIT',
+          finalBlockerAfterProbation: candidate.signal?.metadata?.paperProbation?.active === true
+            ? (this.risk.lastBlockReason || 'invalid_signal')
+            : null,
+          ...this.risk.lastBlockDetails,
+        });
         this.logStarvedOptimizerBlock(candidate.signal, candidate.quality, 'risk_rejected', candidate.oldPrice, candidate.optimizedPrice, candidate.edgeAfterMove, candidate.quality, {
           recoveryFloor: this.formatMakerRecoveryFloor(candidate.recoveryFloor),
           riskOk: false,
@@ -13552,6 +13872,8 @@ class BotEngine {
     const pnlBreakdown = this.portfolio.pnlBreakdownByStrategy(markPrices, now);
 
     const health = this.portfolio.executionHealth();
+    const burnInLifecycle = this.portfolio.burnInLifecycleState(now);
+    const gabagoolDrawdownBreakdown = this.portfolio.gabagoolDrawdownBreakdown(markPrices, now);
     info(
       `Execution Health: candidateEvaluationsLastHour=${health.candidateEvaluationsLastHour} ` +
       `paperOrdersPlacedLastHour=${health.paperOrdersPlacedLastHour} ` +
@@ -13651,6 +13973,11 @@ class BotEngine {
       `whyTotalOrdersZero=${health.whyTotalOrdersZeroLastHour || 'none'} ` +
       `topBlockReasons=${health.topBlockReasonsLastHour || 'none'} ` +
       `probationAdmissions=${health.probationAdmissionsLastHour || 0} ` +
+      `probationAdmissionsBeforeRisk=${health.probationAdmissionsBeforeRisk || 0} ` +
+      `probationOrdersBlockedByDrawdown=${health.probationOrdersBlockedByDrawdown || 0} ` +
+      `finalBlockerAfterProbation=${health.finalBlockerAfterProbation || 'none'} ` +
+      `drawdownGateActive=${health.drawdownGateActive === true ? 'true' : 'false'} ` +
+      `sophieAdmittedButRiskBlocked=${health.sophieAdmittedButRiskBlockedLastHour || 0} ` +
       `probationBlocks=${health.probationBlocksLastHour || 0}`
     );
     info(
@@ -13661,6 +13988,12 @@ class BotEngine {
       `targetFillsPer15m=${health.targetFillsPer15m || 0} ` +
       `reason=${health.actionRateReason || 'none'} ` +
       `paperActionBurnInActive=${health.paperActionBurnInActive === true ? 'true' : 'false'}`
+    );
+    info(
+      `Burn-In Lifecycle: status=${burnInLifecycle.lifecycleStatus || 'unknown'} ` +
+      `reason=${burnInLifecycle.lifecycleReason || 'none'} ` +
+      `freshStateRequired=${burnInLifecycle.freshStateRequired === true ? 'true' : 'false'} ` +
+      `recommendedFreshStateFile=${burnInLifecycle.recommendedFreshStateFile || 'none'}`
     );
     info(
       `Strategy Orders 1h: ${Object.entries(health.strategyOrderCountsLastHour || {})
@@ -13716,6 +14049,14 @@ class BotEngine {
       `gabagoolLastPlacementDecision=${health.gabagoolLastPlacementDecision || 'none'} ` +
       `gabagoolLastExitClassification=${health.gabagoolLastExitClassification || 'none'} ` +
       `gabagoolLastExitPnl=${fmtMoney(health.gabagoolLastExitPnl)}`
+    );
+    info(
+      `Gabagool Drawdown Breakdown: entriesBeforeDrawdownBreach=${gabagoolDrawdownBreakdown.entriesBeforeDrawdownBreach} ` +
+      `averageEntryPriceBeforeDrawdownBreach=${fmtPrice(gabagoolDrawdownBreakdown.averageEntryPriceBeforeDrawdownBreach)} ` +
+      `lastExitClassification=${gabagoolDrawdownBreakdown.lastExitClassification || 'none'} ` +
+      `lossPerMarketToken=${gabagoolDrawdownBreakdown.lossPerMarketToken || 'none'} ` +
+      `lossGuardTriggeredTooLate=${gabagoolDrawdownBreakdown.lossGuardTriggeredTooLate === true ? 'true' : 'false'} ` +
+      `repeatedEntriesAlreadyBlocked=${gabagoolDrawdownBreakdown.repeatedEntriesAlreadyBlocked === true ? 'true' : 'false'}`
     );
 
     if (
@@ -14209,6 +14550,23 @@ function banner() {
 // =========================
 
 async function main() {
+  const command = String(process.argv[2] || '').trim().toLowerCase();
+  if (command === 'burnin-reset-state') {
+    const portfolio = new PaperPortfolio(CONFIG);
+    const result = portfolio.writeFreshBurnInStateFile('cli_burnin_reset_state');
+    console.log(JSON.stringify({
+      ok: true,
+      command: 'burnin-reset-state',
+      stateFile: result.stateFile,
+      lifecycleStatus: result.lifecycleStatus,
+      initialCash: result.initialCash,
+      recommendedFreshStateFile: result.recommendedFreshStateFile,
+      liveTradingEnabled: result.liveTradingEnabled,
+      liveKillSwitch: result.liveKillSwitch,
+      liveDryRunOnly: result.liveDryRunOnly,
+    }, null, 2));
+    return;
+  }
   const bot = new BotEngine(CONFIG);
   await bot.start();
 }

@@ -210,36 +210,61 @@ function collectStatus() {
 
 function analyzeStateFileUsage(state, settings, report) {
   const warnings = [];
+  const failureReasons = [];
   const rawValue = String(state?.metadata?.rawValue || '');
   const declaredProfileUsd = extractStateFileProfileUsd(rawValue);
   const runtimeInitialCash = numberOrNull(settings?.runtime?.INITIAL_CASH);
   const stateStartingCash = numberOrNull(state?.data?.startingCash);
   const stateCash = numberOrNull(state?.data?.cash);
+  const burnInState = state?.data?.burnInState && typeof state.data.burnInState === 'object'
+    ? state.data.burnInState
+    : null;
   const inferredBankrollUsd = firstFinite(stateStartingCash, runtimeInitialCash, stateCash, report?.equity);
   if (declaredProfileUsd != null && inferredBankrollUsd != null && Math.abs(declaredProfileUsd - inferredBankrollUsd) > 5) {
-    warnings.push(
-      `state_file_profile_mismatch: filename suggests ~$${declaredProfileUsd.toFixed(0)} but state/runtime suggests ~$${inferredBankrollUsd.toFixed(2)}`
-    );
+    const message = `state_profile_mismatch: filename suggests ~$${declaredProfileUsd.toFixed(0)} but state/runtime suggests ~$${inferredBankrollUsd.toFixed(2)}`;
+    warnings.push(message);
+    failureReasons.push(message);
   }
   if (
     stateStartingCash != null &&
     runtimeInitialCash != null &&
     Math.abs(stateStartingCash - runtimeInitialCash) > 5
   ) {
-    warnings.push(
-      `state_starting_cash_mismatch: STATE_FILE startingCash=$${stateStartingCash.toFixed(2)} runtime INITIAL_CASH=$${runtimeInitialCash.toFixed(2)}`
-    );
+    const message = `state_profile_mismatch: STATE_FILE startingCash=$${stateStartingCash.toFixed(2)} runtime INITIAL_CASH=$${runtimeInitialCash.toFixed(2)}`;
+    warnings.push(message);
+    failureReasons.push(message);
+  }
+  if (
+    burnInState &&
+    Number.isFinite(Number(burnInState.intendedProfileUsd)) &&
+    runtimeInitialCash != null &&
+    Math.abs(Number(burnInState.intendedProfileUsd) - runtimeInitialCash) > 5
+  ) {
+    const message = `state_profile_mismatch: burnInState intendedProfileUsd=$${Number(burnInState.intendedProfileUsd).toFixed(2)} runtime INITIAL_CASH=$${runtimeInitialCash.toFixed(2)}`;
+    warnings.push(message);
+    failureReasons.push(message);
   }
   if (warnings.length > 0 && Number((state?.data?.executionEvents || []).length || 0) > 0) {
     warnings.push('possible_old_state_reuse_after_reset');
+  }
+  if (String(burnInState?.lifecycleStatus || '') === 'burn_in_failed_by_drawdown') {
+    failureReasons.push('burn_in_failed_by_drawdown');
   }
   return {
     declaredProfileUsd,
     runtimeInitialCash,
     stateStartingCash,
     inferredBankrollUsd,
+    burnInLifecycleStatus: String(burnInState?.lifecycleStatus || ''),
+    recommendedFreshStateFile: String(burnInState?.recommendedFreshStateFile || ''),
     warnings,
-    summary: warnings.join(' | ') || null,
+    failureReasons,
+    status: failureReasons.includes('burn_in_failed_by_drawdown')
+      ? 'burn_in_failed_by_drawdown'
+      : failureReasons.length > 0
+        ? 'state_profile_mismatch'
+        : 'state_profile_clean',
+    summary: [...failureReasons, ...warnings.filter((warning) => !failureReasons.includes(warning))].join(' | ') || null,
   };
 }
 
@@ -311,6 +336,11 @@ function buildPortfolioSummary(state, report, stateFileAnalysis = null) {
     targetOrdersPer15m: numberOrNull(report.targetOrdersPer15m),
     targetFillsPer15m: numberOrNull(report.targetFillsPer15m),
     probationAdmissionsLastHour: numberOrNull(report.probationAdmissionsLastHour),
+    probationAdmissionsBeforeRisk: numberOrNull(report.probationAdmissionsBeforeRisk),
+    probationOrdersBlockedByDrawdown: numberOrNull(report.probationOrdersBlockedByDrawdown),
+    finalBlockerAfterProbation: report.finalBlockerAfterProbation || '',
+    drawdownGateActive: report.drawdownGateActive,
+    sophieAdmittedButRiskBlockedLastHour: numberOrNull(report.sophieAdmittedButRiskBlockedLastHour),
     probationBlocksLastHour: numberOrNull(report.probationBlocksLastHour),
     lossGuardConfiguredClosedLossUsd: numberOrNull(report.lossGuardConfiguredClosedLossUsd),
     lossGuardCurrentClosedLossUsd: numberOrNull(report.lossGuardCurrentClosedLossUsd),
@@ -320,6 +350,16 @@ function buildPortfolioSummary(state, report, stateFileAnalysis = null) {
     lossGuardRecoveryActive: report.lossGuardRecoveryActive,
     lossGuardRecoveryBlockedReason: report.lossGuardRecoveryBlockedReason || '',
     lossGuardTriggerSource: report.lossGuardTriggerSource || '',
+    burnInLifecycleStatusFromLogs: report.burnInLifecycleStatus || '',
+    burnInLifecycleReason: report.burnInLifecycleReason || '',
+    burnInFreshStateRequired: report.burnInFreshStateRequired,
+    recommendedFreshStateFileFromLogs: report.recommendedFreshStateFile || '',
+    gabagoolEntriesBeforeDrawdownBreach: numberOrNull(report.gabagoolEntriesBeforeDrawdownBreach),
+    gabagoolAverageEntryPriceBeforeDrawdownBreach: numberOrNull(report.gabagoolAverageEntryPriceBeforeDrawdownBreach),
+    gabagoolDrawdownLastExitClassification: report.gabagoolDrawdownLastExitClassification || '',
+    gabagoolLossPerMarketToken: report.gabagoolLossPerMarketToken || '',
+    gabagoolLossGuardTriggeredTooLate: report.gabagoolLossGuardTriggeredTooLate,
+    gabagoolRepeatedEntriesAlreadyBlocked: report.gabagoolRepeatedEntriesAlreadyBlocked,
     topBlockReasonsLastHour: report.topBlockReasonsLastHour || '',
     whyTotalOrdersZeroLastHour: report.whyTotalOrdersZeroLastHour || '',
     strategyOrdersLastHour: report.strategyOrdersLastHour || '',
@@ -332,6 +372,10 @@ function buildPortfolioSummary(state, report, stateFileAnalysis = null) {
     stateExists: state.metadata.exists,
     stateFileSizeBytes: state.metadata.sizeBytes,
     stateFileModifiedAt: state.metadata.modifiedAt,
+    stateProfileStatus: stateFileAnalysis?.status || '',
+    stateFailureReasons: stateFileAnalysis?.failureReasons || [],
+    recommendedFreshStateFile: stateFileAnalysis?.recommendedFreshStateFile || '',
+    burnInLifecycleStatus: stateFileAnalysis?.burnInLifecycleStatus || '',
     stateWarnings: stateFileAnalysis?.warnings || [],
     stateWarningSummary: stateFileAnalysis?.summary || '',
   };
@@ -512,13 +556,18 @@ function parseLatestPortfolioReport(lines) {
       continue;
     }
 
-    match = line.match(/Paper Flow:\s*totalOrders=(\d+)\s*whyTotalOrdersZero=(.*?)\s+topBlockReasons=(.*?)\s+probationAdmissions=(\d+)\s+probationBlocks=(\d+)/);
+    match = line.match(/Paper Flow:\s*totalOrders=(\d+)\s*whyTotalOrdersZero=(.*?)\s+topBlockReasons=(.*?)\s+probationAdmissions=(\d+)\s+probationAdmissionsBeforeRisk=(\d+)\s+probationOrdersBlockedByDrawdown=(\d+)\s+finalBlockerAfterProbation=([^\s]+)\s+drawdownGateActive=(true|false)\s+sophieAdmittedButRiskBlocked=(\d+)\s+probationBlocks=(\d+)/);
     if (match) {
       report.paperOrdersPlacedLastHour = Number(match[1]);
       report.whyTotalOrdersZeroLastHour = match[2];
       report.topBlockReasonsLastHour = match[3];
       report.probationAdmissionsLastHour = Number(match[4]);
-      report.probationBlocksLastHour = Number(match[5]);
+      report.probationAdmissionsBeforeRisk = Number(match[5]);
+      report.probationOrdersBlockedByDrawdown = Number(match[6]);
+      report.finalBlockerAfterProbation = match[7];
+      report.drawdownGateActive = match[8] === 'true';
+      report.sophieAdmittedButRiskBlockedLastHour = Number(match[9]);
+      report.probationBlocksLastHour = Number(match[10]);
       continue;
     }
 
@@ -544,6 +593,26 @@ function parseLatestPortfolioReport(lines) {
       report.lossGuardRecoveryActive = match[6] === 'true';
       report.lossGuardRecoveryBlockedReason = match[7];
       report.lossGuardTriggerSource = match[8];
+      continue;
+    }
+
+    match = line.match(/Burn-In Lifecycle:\s*status=([^\s]+)\s*reason=([^\s]+)\s*freshStateRequired=(true|false)\s*recommendedFreshStateFile=(.*)$/);
+    if (match) {
+      report.burnInLifecycleStatus = match[1];
+      report.burnInLifecycleReason = match[2];
+      report.burnInFreshStateRequired = match[3] === 'true';
+      report.recommendedFreshStateFile = match[4];
+      continue;
+    }
+
+    match = line.match(/Gabagool Drawdown Breakdown:\s*entriesBeforeDrawdownBreach=(\d+)\s*averageEntryPriceBeforeDrawdownBreach=([^\s]+)\s*lastExitClassification=([^\s]+)\s*lossPerMarketToken=(.*?)\s+lossGuardTriggeredTooLate=(true|false)\s+repeatedEntriesAlreadyBlocked=(true|false)$/);
+    if (match) {
+      report.gabagoolEntriesBeforeDrawdownBreach = Number(match[1]);
+      report.gabagoolAverageEntryPriceBeforeDrawdownBreach = match[2] === 'n/a' ? null : Number(String(match[2]).replace(/^\$/, ''));
+      report.gabagoolDrawdownLastExitClassification = match[3];
+      report.gabagoolLossPerMarketToken = match[4];
+      report.gabagoolLossGuardTriggeredTooLate = match[5] === 'true';
+      report.gabagoolRepeatedEntriesAlreadyBlocked = match[6] === 'true';
       continue;
     }
 
@@ -651,6 +720,11 @@ function emptyReport() {
     paperActionBurnInActive: null,
     probationAdmissionsLastHour: null,
     probationBlocksLastHour: null,
+    probationAdmissionsBeforeRisk: null,
+    probationOrdersBlockedByDrawdown: null,
+    finalBlockerAfterProbation: '',
+    drawdownGateActive: null,
+    sophieAdmittedButRiskBlockedLastHour: null,
     lossGuardConfiguredClosedLossUsd: null,
     lossGuardCurrentClosedLossUsd: null,
     lossGuardCooldownMs: null,
@@ -659,6 +733,16 @@ function emptyReport() {
     lossGuardRecoveryActive: null,
     lossGuardRecoveryBlockedReason: '',
     lossGuardTriggerSource: '',
+    burnInLifecycleStatus: '',
+    burnInLifecycleReason: '',
+    burnInFreshStateRequired: null,
+    recommendedFreshStateFile: '',
+    gabagoolEntriesBeforeDrawdownBreach: null,
+    gabagoolAverageEntryPriceBeforeDrawdownBreach: null,
+    gabagoolDrawdownLastExitClassification: '',
+    gabagoolLossPerMarketToken: '',
+    gabagoolLossGuardTriggeredTooLate: null,
+    gabagoolRepeatedEntriesAlreadyBlocked: null,
     topBlockReasonsLastHour: '',
     whyTotalOrdersZeroLastHour: '',
     strategyOrdersLastHour: '',
@@ -1115,9 +1199,24 @@ function renderHtml(status) {
       ${metric('Fills 15m', intVal(p.paperOrdersFilledLast15m))}
       ${metric('Action Rate', p.actionRateStatus || 'n/a')}
       ${metric('Action Rate Reason', p.actionRateReason || 'n/a')}
+      ${metric('Probation Before Risk', intVal(p.probationAdmissionsBeforeRisk))}
+      ${metric('Probation Drawdown Blocks', intVal(p.probationOrdersBlockedByDrawdown))}
+      ${metric('Final Blocker After Probation', p.finalBlockerAfterProbation || 'n/a')}
+      ${metric('Drawdown Gate Active', boolVal(p.drawdownGateActive))}
+      ${metric('Sophie Admitted But Risk Blocked', intVal(p.sophieAdmittedButRiskBlockedLastHour))}
       ${metric('Why Total Orders Zero', p.whyTotalOrdersZeroLastHour || 'n/a')}
       ${metric('Gabagool Exit Blocks', p.gabagoolExitBlocks || 'n/a')}
       ${metric('Gabagool Last Decision', p.gabagoolLastPlacementDecision || 'n/a')}
+    </div>
+  </section>
+  <section>
+    <h2>Burn-In</h2>
+    <div class="grid">
+      ${metric('Lifecycle Status', p.burnInLifecycleStatusFromLogs || p.burnInLifecycleStatus || 'n/a')}
+      ${metric('Lifecycle Reason', p.burnInLifecycleReason || 'n/a')}
+      ${metric('Fresh State Required', boolVal(p.burnInFreshStateRequired))}
+      ${metric('Suggested Fresh State', p.recommendedFreshStateFileFromLogs || p.recommendedFreshStateFile || 'n/a')}
+      ${metric('State Profile Status', p.stateProfileStatus || 'n/a')}
     </div>
   </section>
   <section>
@@ -1130,6 +1229,17 @@ function renderHtml(status) {
       ${metric('Recovery Active', boolVal(p.lossGuardRecoveryActive))}
       ${metric('Blocked Reason', p.lossGuardRecoveryBlockedReason || 'n/a')}
       ${metric('Trigger Source', p.lossGuardTriggerSource || 'n/a')}
+    </div>
+  </section>
+  <section>
+    <h2>Gabagool Drawdown</h2>
+    <div class="grid">
+      ${metric('Entries Before Breach', intVal(p.gabagoolEntriesBeforeDrawdownBreach))}
+      ${metric('Avg Entry Before Breach', money(p.gabagoolAverageEntryPriceBeforeDrawdownBreach))}
+      ${metric('Last Exit Classification', p.gabagoolDrawdownLastExitClassification || 'n/a')}
+      ${metric('Loss Guard Too Late', boolVal(p.gabagoolLossGuardTriggeredTooLate))}
+      ${metric('Repeated Entries Blocked', boolVal(p.gabagoolRepeatedEntriesAlreadyBlocked))}
+      ${metric('Loss Per Market/Token', p.gabagoolLossPerMarketToken || 'n/a')}
     </div>
   </section>
   <section>

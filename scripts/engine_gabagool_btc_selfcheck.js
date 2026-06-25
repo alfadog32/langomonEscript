@@ -1791,8 +1791,64 @@ async function run() {
     }, {
       equity: 57.67,
     });
-    assert(analysis.warnings.some((value) => value.startsWith('state_file_profile_mismatch:')), 'state analysis should warn when the filename burn-in profile is stale');
+    assert.strictEqual(analysis.status, 'state_profile_mismatch', 'state analysis should fail stale burn-in profile reuse');
+    assert(analysis.warnings.some((value) => value.startsWith('state_profile_mismatch:')), 'state analysis should warn when the filename burn-in profile is stale');
     assert(analysis.warnings.includes('possible_old_state_reuse_after_reset'), 'state analysis should flag likely reuse after reset');
+  }
+
+  {
+    const tempDir = fs.mkdtempSync(path.join('/tmp', 'paper-burnin-reset-'));
+    const stateFile = path.join(tempDir, 'moneymaker_v3_state_post_patch_burnin_59.json');
+    const portfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile,
+      initialCash: 59,
+      paperBurnInResetMode: true,
+    }));
+    const reset = portfolio.writeFreshBurnInStateFile('selfcheck_reset');
+    const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert.strictEqual(reset.liveTradingEnabled, false, 'burn-in reset state should keep live trading off');
+    assert.strictEqual(reset.liveKillSwitch, true, 'burn-in reset state should keep kill switch on');
+    assert.strictEqual(reset.liveDryRunOnly, true, 'burn-in reset state should keep dry-run only on');
+    assert.strictEqual(state.startingCash, 59, 'burn-in reset state should start with the configured paper bankroll');
+    assert.strictEqual(state.closedPnl, 0, 'burn-in reset state should clear prior closed PnL');
+    assert.strictEqual(state.executionEvents.length, 0, 'burn-in reset state should clear prior execution history');
+    assert.strictEqual(state.burnInState.lifecycleStatus, 'clean_burnin_running', 'burn-in reset state should be marked clean');
+  }
+
+  {
+    const portfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      initialCash: 59,
+      maxDrawdownPct: 5,
+      paperActionBurnInEnabled: true,
+      paperActionBurnInTargetOrdersPer15m: 3,
+    }));
+    portfolio.cash = 56.03;
+    portfolio.peakEquity = 59;
+    portfolio.closedPnl = -2.97;
+    portfolio.recordExecutionEvent('paper_probation_admit', {
+      strategy: 'SpreadHunter',
+      tokenId: 'probation-token',
+      side: 'buy',
+      reason: 'paper_flow_probation',
+    });
+    portfolio.recordExecutionEvent('risk_block', {
+      strategy: 'SpreadHunter',
+      tokenId: 'probation-token',
+      side: 'buy',
+      reason: 'drawdown_limit',
+      paperProbationActive: true,
+      probationAdmission: 'probation_admission',
+      sophieDecision: 'PAPER_PROBATION_ADMIT',
+      finalBlockerAfterProbation: 'drawdown_limit',
+      drawdownGateActive: true,
+    });
+    const health = portfolio.executionHealth(Date.now());
+    assert.strictEqual(health.probationAdmissionsBeforeRisk, 1, 'paper flow should expose probation admissions before Risk');
+    assert.strictEqual(health.probationOrdersBlockedByDrawdown, 1, 'paper flow should expose probation orders blocked by drawdown');
+    assert.strictEqual(health.finalBlockerAfterProbation, 'drawdown_limit', 'paper flow should expose the final blocker after probation');
+    assert.strictEqual(health.drawdownGateActive, true, 'paper flow should expose an active drawdown gate');
+    assert(health.actionRateReason.includes('sophie_admitted_but_final_risk_gate_blocked'), 'action-rate reason should explain when Sophie admitted but final Risk blocked');
   }
 
   {

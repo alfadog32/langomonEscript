@@ -14,6 +14,7 @@ const {
   REQUIRED_FUNDER_ENV,
 } = require('../live_adapter_polymarket');
 const { readConfig: readTelegramConfig } = require('../telegram/telegram_approval_bot');
+const { analyzeStateFileUsage, buildSettingsStatus, readState } = require('../dashboard_server');
 
 const ROOT = process.cwd();
 const REQUIRED_PM2 = {
@@ -309,6 +310,7 @@ async function main() {
     lastPortfolioReport && Date.now() - lastPortfolioReport.ts <= (Number.isFinite(portfolioReportFreshMs) ? portfolioReportFreshMs : 900_000)
   );
   const openOrders = parseLastNumber(currentEngineLines, /Open Orders:\s+(\d+)/);
+  const equity = parseLastNumber(currentEngineLines, /Equity:\s+\$([0-9.]+)/);
   const drawdownPct = parseLastNumber(currentEngineLines, /Drawdown:\s+([0-9.]+)%/);
   const openOrderExposureUsd = parseLastNumber(currentEngineLines, /Open Order Exposure:\s+\$([0-9.]+)/);
   const totalExposureUsd = parseLastNumber(currentEngineLines, /Open Orders:\s+\d+\s+\|\s+Exposure:\s+\$([0-9.]+)/);
@@ -316,12 +318,17 @@ async function main() {
   const pipelineReport = parseLastKeyValueLine(currentEngineLines, 'Pipeline 1h:');
   const paperFlowReport = parseLastKeyValueLine(currentEngineLines, 'Paper Flow:');
   const actionRateReport = parseLastKeyValueLine(currentEngineLines, 'Action Rate 15m:');
+  const burnInLifecycleReport = parseLastKeyValueLine(currentEngineLines, 'Burn-In Lifecycle:');
+  const gabagoolDrawdownReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Drawdown Breakdown:');
   const fillRealismReport = parseLastKeyValueLine(currentEngineLines, 'Fill Realism:');
   const exposureAuditReport = parseLastKeyValueLine(currentEngineLines, 'Exposure Audit:');
   const exposureBucketsReport = parseLastKeyValueLine(currentEngineLines, 'Exposure Buckets:');
   const lastDecisionsReport = parseLastKeyValueLine(currentEngineLines, 'Last Decisions:');
   const gabagoolHealthReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Health:');
   const gabagoolExitBlocksReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Exit Blocks:');
+  const settingsStatus = buildSettingsStatus(pm2);
+  const state = readState(settingsStatus.runtime.STATE_FILE || settingsStatus.envFile.STATE_FILE || '');
+  const stateFileAnalysis = analyzeStateFileUsage(state, settingsStatus, { equity });
   const fillsLastHour = Number.isFinite(executionHealth.fillsLastHour)
     ? executionHealth.fillsLastHour
     : Number.isFinite(pipelineReport?.values?.fills)
@@ -394,6 +401,25 @@ async function main() {
     : 0;
   const actionRateStatus = String(actionRateReport?.values?.status || 'action_rate_not_applicable');
   const actionRateReason = String(actionRateReport?.values?.reason || 'none');
+  const probationAdmissionsBeforeRisk = Number.isFinite(paperFlowReport?.values?.probationAdmissionsBeforeRisk)
+    ? paperFlowReport.values.probationAdmissionsBeforeRisk
+    : 0;
+  const probationOrdersBlockedByDrawdown = Number.isFinite(paperFlowReport?.values?.probationOrdersBlockedByDrawdown)
+    ? paperFlowReport.values.probationOrdersBlockedByDrawdown
+    : 0;
+  const finalBlockerAfterProbation = String(paperFlowReport?.values?.finalBlockerAfterProbation || 'none');
+  const drawdownGateActive = paperFlowReport?.values?.drawdownGateActive === true;
+  const sophieAdmittedButRiskBlocked = Number.isFinite(paperFlowReport?.values?.sophieAdmittedButRiskBlocked)
+    ? paperFlowReport.values.sophieAdmittedButRiskBlocked
+    : 0;
+  const burnInLifecycleStatus = String(burnInLifecycleReport?.values?.status || stateFileAnalysis.status || 'unknown');
+  const burnInLifecycleReason = String(burnInLifecycleReport?.values?.reason || 'none');
+  const burnInFreshStateRequired = burnInLifecycleReport?.values?.freshStateRequired === true || stateFileAnalysis.status === 'burn_in_failed_by_drawdown';
+  const recommendedFreshStateFile = String(
+    burnInLifecycleReport?.values?.recommendedFreshStateFile ||
+    stateFileAnalysis.recommendedFreshStateFile ||
+    ''
+  );
   const trustedFillsLastHour = Number.isFinite(fillRealismReport?.values?.trustedFills)
     ? fillRealismReport.values.trustedFills
     : Number.isFinite(fillRealismReport?.values?.trustedFillCountLastHour)
@@ -466,6 +492,17 @@ async function main() {
   };
 
   if (!recentPortfolioReportFound) reasons.push('recent portfolio report not found');
+  if (stateFileAnalysis.status === 'state_profile_mismatch') {
+    reasons.push(`state_profile_mismatch ${stateFileAnalysis.summary || 'active STATE_FILE does not match intended burn-in profile'}`);
+  }
+  if (burnInLifecycleStatus === 'burn_in_failed_by_drawdown' || drawdownGateActive || burnInFreshStateRequired) {
+    reasons.push(
+      `burn_in_failed_by_drawdown reason=${burnInLifecycleReason} ` +
+      `drawdownPct=${Number.isFinite(drawdownPct) ? drawdownPct : 'NA'} ` +
+      `maxDrawdownPct=${CONFIG.maxDrawdownPct} ` +
+      `recommendedFreshStateFile=${recommendedFreshStateFile || 'none'}`
+    );
+  }
   if (researchStuck) reasons.push(`research refresh stuck for ${Math.round(researchAgeMs)}ms`);
   if (lastResearchComplete && candidateEvaluationsLastHour <= 0) reasons.push('candidate evaluations are zero after research completed');
   if (candidateEvaluationsLastHour <= 0) reasons.push(`candidateEvaluationsLastHour ${candidateEvaluationsLastHour} below required > 0`);
@@ -476,6 +513,15 @@ async function main() {
       `action_rate_below_target orders15m=${ordersPlacedLast15m}/${targetOrdersPer15m} ` +
       `fills15m=${fillsLast15m}/${targetFillsPer15m} reason=${actionRateReason}`
     );
+  }
+  if (sophieAdmittedButRiskBlocked > 0) {
+    reasons.push(
+      `sophie_admitted_but_final_risk_gate_blocked finalBlocker=${finalBlockerAfterProbation} ` +
+      `probationAdmissionsBeforeRisk=${probationAdmissionsBeforeRisk} ` +
+      `probationOrdersBlockedByDrawdown=${probationOrdersBlockedByDrawdown}`
+    );
+  } else if (candidateEvaluationsLastHour <= 0 && paperOrdersAdmittedLastHour <= 0) {
+    reasons.push('true_no_candidate_starvation no admitted candidates reached final risk gate');
   }
   if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push(`no active paper orders; candidateEvaluationsLastHour=${candidateEvaluationsLastHour} paperOrdersAdmittedLastHour=${paperOrdersAdmittedLastHour} paperOrdersPlacedLastHour=${paperOrdersPlacedLastHour} makerOptimizerAdmitsLastHour=${makerOptimizerAdmitsLastHour} makerOptimizerBlocksLastHour=${makerOptimizerBlocksLastHour}`);
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
@@ -601,6 +647,20 @@ async function main() {
       exposureBuckets: exposureBucketsReport?.values || null,
       pipeline1h: pipelineReport?.values || null,
       paperFlow: paperFlowReport?.values || null,
+      burnInLifecycle: {
+        status: burnInLifecycleStatus,
+        reason: burnInLifecycleReason,
+        freshStateRequired: burnInFreshStateRequired,
+        recommendedFreshStateFile,
+      },
+      gabagoolDrawdownBreakdown: gabagoolDrawdownReport?.values || null,
+      stateProfile: {
+        status: stateFileAnalysis.status,
+        warnings: stateFileAnalysis.warnings,
+        failureReasons: stateFileAnalysis.failureReasons,
+        summary: stateFileAnalysis.summary,
+        recommendedFreshStateFile: stateFileAnalysis.recommendedFreshStateFile || '',
+      },
       fillRealism: fillRealismReport?.values || null,
       fillsDetected: fillsLastHour > 0,
       makerOptimizerAdmitsLastHour,

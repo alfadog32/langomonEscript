@@ -29,6 +29,7 @@
     "dashboard:check": "node --check dashboard_server.js",
     "repo:sanity": "bash scripts/repo_sanity_check.sh",
     "paper": "node moneymaker_v3.js",
+    "paper:burnin-reset": "node moneymaker_v3.js burnin-reset-state",
     "paper:debug": "CONSENSUS_LOG_REJECTED=true node moneymaker_v3.js",
     "paper:whales:unsafe": "ENABLE_WHALE_TRACKING=true ENABLE_WHALE_COPY_STRATEGY=true node moneymaker_v3.js",
     "pm2:start": "pm2 start ./moneymaker_v3.js --name langomonEscript --update-env",
