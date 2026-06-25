@@ -348,9 +348,27 @@ function runCycle() {
   }
 
   // 10. repeatSameTokenEntries > 0
-  const repeatSameToken = numberOrNull(health.fillRealism?.repeatedSameMarketSameTokenEntriesLastHour);
-  if (repeatSameToken !== null && repeatSameToken > 0) {
-    detections.push({ type: 'repeat_same_token_entries', detail: `repeatedSameMarketSameTokenEntriesLastHour=${repeatSameToken}` });
+  // Primary: pipeline1h.repeatSameTokenEntries from live_readiness_report.
+  // Fallback: any older fillRealism repeated-entry field.
+  const pipeline1h = health.pipeline1h || {};
+  const repeatFromPipeline = numberOrNull(pipeline1h.repeatSameTokenEntries);
+  const repeatFromFillRealism = numberOrNull(
+    health.fillRealism?.repeatedSameMarketSameTokenEntriesLastHour ??
+    health.fillRealism?.repeatSameTokenEntries ??
+    health.repeatedSameMarketSameTokenEntriesLastHour
+  );
+  const repeatSameToken = repeatFromPipeline !== null ? repeatFromPipeline : repeatFromFillRealism;
+
+  if (repeatSameToken === null) {
+    detections.push({
+      type: 'repeat_same_token_entries_unavailable',
+      detail: 'repeatSameTokenEntries telemetry missing from pipeline1h and fillRealism'
+    });
+  } else if (repeatSameToken > 0) {
+    detections.push({
+      type: 'repeat_same_token_entries',
+      detail: `repeatSameTokenEntries=${repeatSameToken}`
+    });
   }
 
   // 11. unexplained exposure mismatch
@@ -382,7 +400,10 @@ function runCycle() {
     readyForMicroLive: readinessReport?.READY_FOR_MICRO_LIVE || false,
     detections,
     metrics: {
+      ordersPlacedLastHour: numberOrNull(health.ordersPlacedLastHour ?? health.paperOrdersPlacedLastHour),
       fillsLastHour,
+      fillRateLastHour: numberOrNull(health.fillRateLastHour),
+      fillRateByPlacedOrdersLastHour: numberOrNull(health.fillRateByPlacedOrdersLastHour),
       trustedFillsLastHour: trustedFills,
       untrustedFillsLastHour: untrustedFills,
       drawdownPct,
@@ -441,9 +462,11 @@ function isProofCyclePassing(cycle) {
     blockers.push('readiness_report_failed');
   }
 
-  // repeatSameTokenEntries=0
+  // repeatSameTokenEntries=0. Fail closed if telemetry is unavailable.
   const repeat = cycle.metrics.repeatSameTokenEntries;
-  if (repeat !== null && repeat > PROOF_THRESHOLDS.maxRepeatSameTokenEntries) {
+  if (repeat === null) {
+    blockers.push('repeatSameTokenEntries_unavailable');
+  } else if (repeat > PROOF_THRESHOLDS.maxRepeatSameTokenEntries) {
     blockers.push(`repeatSameTokenEntries=${repeat}`);
   }
 
@@ -490,11 +513,19 @@ async function runStableProof() {
     console.log(`--- Cycle ${cycleNum}/${PROOF_CYCLES} @ ${new Date().toISOString()} ---`);
 
     const cycle = runCycle();
-    const proofCheck = isProofCyclePassing(cycle);
+    const rawProofCheck = isProofCyclePassing(cycle);
+    const labeledBlockers = rawProofCheck.blockers.map((blocker) => {
+      const text = String(blocker);
+      if (text.startsWith('fillsLastHour=')) return `fills_below_target_cycle_${cycleNum}: ${text}`;
+      if (text === 'repeatSameTokenEntries_unavailable') return `repeatSameTokenEntries_unavailable_cycle_${cycleNum}`;
+      return text;
+    });
+    const proofCheck = { passing: rawProofCheck.passing, blockers: labeledBlockers };
     cycleResults.push({ cycle: cycleNum, ...proofCheck, metrics: cycle.metrics, detectionCount: cycle.detections.length });
 
     console.log(`  Detections: ${cycle.detections.length}`);
-    console.log(`  Fills: ${cycle.metrics.fillsLastHour}, Trusted: ${cycle.metrics.trustedFillsLastHour}, Untrusted: ${cycle.metrics.untrustedFillsLastHour}`);
+    console.log(`  Orders: ${cycle.metrics.ordersPlacedLastHour}, Fills: ${cycle.metrics.fillsLastHour}, FillRate: ${cycle.metrics.fillRateLastHour}%`);
+    console.log(`  Trusted: ${cycle.metrics.trustedFillsLastHour}, Untrusted: ${cycle.metrics.untrustedFillsLastHour}`);
     console.log(`  Drawdown: ${cycle.metrics.drawdownPct}%`);
     console.log(`  RepeatSameToken: ${cycle.metrics.repeatSameTokenEntries}`);
     console.log(`  BurnIn: ${cycle.metrics.burnInLifecycleStatus}`);
@@ -583,7 +614,9 @@ function runSingleInspection() {
   }
 
   console.log('\nMetrics:');
+  console.log(`  ordersPlacedLastHour: ${cycle.metrics.ordersPlacedLastHour}`);
   console.log(`  fillsLastHour: ${cycle.metrics.fillsLastHour}`);
+  console.log(`  fillRateLastHour: ${cycle.metrics.fillRateLastHour}%`);
   console.log(`  trustedFillsLastHour: ${cycle.metrics.trustedFillsLastHour}`);
   console.log(`  untrustedFillsLastHour: ${cycle.metrics.untrustedFillsLastHour}`);
   console.log(`  drawdownPct: ${cycle.metrics.drawdownPct}%`);
