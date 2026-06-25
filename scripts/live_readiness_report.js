@@ -98,7 +98,25 @@ function readPm2List() {
     return { ok: false, processes: [], error: concise };
   }
   try {
-    return { ok: true, processes: JSON.parse(result.stdout), error: null };
+    const raw = JSON.parse(result.stdout);
+    // Normalize raw PM2 jlist output to match dashboard_server getPm2Status()
+    // format so that buildSettingsStatus / analyzeStateFileUsage receive the
+    // expected { rawPm2Env } shape instead of raw { pm2_env }.
+    const processes = Array.isArray(raw) ? raw.map((proc) => ({
+      name: proc.name || '',
+      pmId: proc.pm_id,
+      status: proc.pm2_env?.status || 'unknown',
+      pm2_env: proc.pm2_env || {},
+      restartCount: proc.pm2_env?.restart_time,
+      unstableRestarts: proc.pm2_env?.unstable_restarts,
+      uptime: proc.pm2_env?.pm_uptime ? new Date(proc.pm2_env.pm_uptime).toISOString() : null,
+      memoryBytes: proc.monit?.memory,
+      cpuPct: proc.monit?.cpu,
+      outLogPath: proc.pm2_env?.pm_out_log_path || null,
+      errLogPath: proc.pm2_env?.pm_err_log_path || null,
+      rawPm2Env: proc.pm2_env || {},
+    })) : [];
+    return { ok: true, processes, error: null };
   } catch (error) {
     return { ok: false, processes: [], error: `pm2 jlist parse failed: ${error.message}` };
   }

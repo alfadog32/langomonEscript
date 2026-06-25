@@ -213,7 +213,20 @@ function analyzeStateFileUsage(state, settings, report) {
   const failureReasons = [];
   const rawValue = String(state?.metadata?.rawValue || '');
   const declaredProfileUsd = extractStateFileProfileUsd(rawValue);
-  const runtimeInitialCash = numberOrNull(settings?.runtime?.INITIAL_CASH);
+  // Resolve runtimeInitialCash with a fallback chain:
+  //   1. PM2 runtime env  2. .env file  3. loaded CONFIG
+  // numberOrNull('') returns 0 (Number('') === 0), which is a false positive
+  // when PM2 env simply doesn't contain the key. Treat 0 as "not set" only
+  // when the raw string was empty/missing — a real $0 INITIAL_CASH is nonsensical.
+  const rawRuntimeIC = settings?.runtime?.INITIAL_CASH;
+  const rawEnvFileIC = settings?.envFile?.INITIAL_CASH;
+  const pm2IC = (rawRuntimeIC !== undefined && rawRuntimeIC !== null && rawRuntimeIC !== '')
+    ? numberOrNull(rawRuntimeIC)
+    : null;
+  const envFileIC = (rawEnvFileIC !== undefined && rawEnvFileIC !== null && rawEnvFileIC !== '')
+    ? numberOrNull(rawEnvFileIC)
+    : null;
+  const runtimeInitialCash = pm2IC !== null ? pm2IC : envFileIC;
   const stateStartingCash = numberOrNull(state?.data?.startingCash);
   const stateCash = numberOrNull(state?.data?.cash);
   const burnInState = state?.data?.burnInState && typeof state.data.burnInState === 'object'
