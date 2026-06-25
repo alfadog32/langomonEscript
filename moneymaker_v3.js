@@ -12547,6 +12547,7 @@ class BotEngine {
           });
         }
       }
+      signal._riskApproved = true;
       this.maybeWriteLiveCandidate(signal, asset, book);
     }
   }
@@ -12599,6 +12600,7 @@ class BotEngine {
       );
     }
     if (placed) {
+      risked._riskApproved = true;
       this.maybeWriteLiveCandidate(risked, asset, book);
     }
     return Boolean(placed);
@@ -13814,6 +13816,70 @@ class BotEngine {
       ghostFavorablePct: Number.isFinite(ghostFavorablePct) ? Number(ghostFavorablePct.toFixed(2)) : null,
     };
 
+    const expectedEdge = Number(signal.expectedEdge);
+    if (!Number.isFinite(expectedEdge)) {
+      info(`[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=expected_edge_missing [${strategy}]`);
+      return false;
+    }
+
+    const minOrderSize = Number(
+      book.minOrderSize ??
+      book.min_order_size ??
+      book.minimum_order_size ??
+      asset.minOrderSize ??
+      asset.min_order_size ??
+      5
+    );
+    const sizeUsd = Number(signal.sizeUsd);
+    const price = Number(signal.price);
+    const sizeShares = sizeUsd / price;
+    if (
+      Number.isFinite(minOrderSize) &&
+      minOrderSize > 0 &&
+      Number.isFinite(sizeShares) &&
+      sizeShares < minOrderSize
+    ) {
+      info(
+        `[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=size_below_min_order ` +
+        `sizeShares=${cleanLogValue(sizeShares)} minOrderSize=${cleanLogValue(minOrderSize)} ` +
+        `price=${fmtPrice(price)} sizeUsd=$${sizeUsd.toFixed(2)} [${strategy}]`
+      );
+      return false;
+    }
+
+    // Stage 2 canary exposure cap check
+    const maxOrderUsd = Number(process.env.MAX_LIVE_ORDER_USD) || 1;
+    const maxTotalExposureUsd = Number(process.env.MAX_LIVE_TOTAL_EXPOSURE_USD) || 1;
+    const currentLiveExposureUsd = Number(this.currentLiveExposureUsd || 0);
+    if (sizeUsd > maxOrderUsd) {
+      info(
+        `[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=canary_max_order_exceeded ` +
+        `sizeUsd=$${sizeUsd.toFixed(2)} maxOrderUsd=$${maxOrderUsd.toFixed(2)} [${strategy}]`
+      );
+      return false;
+    }
+    if (currentLiveExposureUsd + sizeUsd > maxTotalExposureUsd) {
+      info(
+        `[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=canary_exposure_cap_exceeded ` +
+        `currentExposure=$${currentLiveExposureUsd.toFixed(2)} sizeUsd=$${sizeUsd.toFixed(2)} ` +
+        `maxTotalExposureUsd=$${maxTotalExposureUsd.toFixed(2)} [${strategy}]`
+      );
+      return false;
+    }
+
+    const riskApproved = Boolean(signal._riskApproved);
+    if (!riskApproved) {
+      info(
+        `[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=risk_not_approved ` +
+        `strategy=${strategy} price=${fmtPrice(price)} sizeUsd=$${sizeUsd.toFixed(2)} expectedEdge=${cleanLogValue(expectedEdge)}`
+      );
+      return false;
+    }
+
+    const marketSlug = asset.market?.slug || signal.metadata?.marketSlug || signal.metadata?.market_slug || null;
+    const marketQuestion = asset.market?.question || signal.metadata?.marketQuestion || signal.metadata?.market_question || null;
+    const outcome = asset.outcome || signal.metadata?.outcome || null;
+
     const candidate = {
       id: candidateId,
       candidate_id: candidateId,
@@ -13825,31 +13891,51 @@ class BotEngine {
       marketId: signal.marketId || asset.market?.marketId || null,
       market_id: signal.marketId || asset.market?.marketId || null,
       side,
-      price: Number(signal.price),
-      sizeUsd: Number(signal.sizeUsd),
-      size_usd: Number(signal.sizeUsd),
+      price,
+      sizeUsd,
+      size_usd: sizeUsd,
+      sizeShares: Number.isFinite(sizeShares) ? sizeShares : null,
+      size_shares: Number.isFinite(sizeShares) ? sizeShares : null,
       confidence: Number(signal.confidence),
       consensusScore: Number(consensus?.score ?? signal.confidence),
       consensus_score: Number(consensus?.score ?? signal.confidence),
+      expectedEdge,
+      expected_edge: expectedEdge,
       sophieApproved: true,
       sophie_approved: true,
+      riskApproved: true,
+      risk_approved: true,
       bookFresh: true,
       book_fresh: true,
       bookAgeMs,
       book_age_ms: bookAgeMs,
+      minOrderSize: Number.isFinite(minOrderSize) && minOrderSize > 0 ? Number(minOrderSize) : null,
+      min_order_size: Number.isFinite(minOrderSize) && minOrderSize > 0 ? Number(minOrderSize) : null,
+      marketSlug,
+      market_slug: marketSlug,
+      marketQuestion,
+      market_question: marketQuestion,
+      outcome,
       reason: signal.reason || 'MoneyMaker paper-approved candidate',
       route,
       paperBurnIn,
       metadata: {
-        marketQuestion: asset.market?.question || signal.metadata?.marketQuestion || null,
-        outcome: asset.outcome || signal.metadata?.outcome || null,
-        expectedEdge: signal.expectedEdge,
+        marketQuestion,
+        outcome,
+        expectedEdge,
+        riskApproved: true,
+        risk_approved: true,
         consensus,
       },
     };
 
     appendJsonLine(this.config.autoLiveCandidatesPath, candidate);
-    info(`[AUTO-LIVE CANDIDATE] ${side} ${shortId(signal.tokenId)} @ ${fmtPrice(signal.price)} size=$${signal.sizeUsd.toFixed(2)} [${strategy}]`);
+    info(
+      `[AUTO-LIVE CANDIDATE WRITTEN] ${side} ${shortId(signal.tokenId)} @ ${fmtPrice(price)} ` +
+      `sizeUsd=$${sizeUsd.toFixed(2)} sizeShares=${cleanLogValue(sizeShares)} minOrderSize=${cleanLogValue(minOrderSize)} ` +
+      `expectedEdge=${cleanLogValue(expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
+      `riskApproved=true bookAgeMs=${bookAgeMs} [${strategy}]`
+    );
     return true;
   }
 

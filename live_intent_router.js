@@ -241,6 +241,34 @@ function normalizeCandidate(raw, filePath) {
   const candidateId = firstString(raw.intent_id, raw.id, raw.candidate_id, raw.signal_id, `candidate_${rawHash}`);
   const consensus = raw.metadata?.consensus || raw.consensus || raw.sophie || null;
 
+  const riskApproved = Boolean(
+    raw.riskApproved ??
+    raw.risk_approved ??
+    raw.risk?.approved ??
+    raw.metadata?.riskApproved ??
+    raw.metadata?.risk_approved ??
+    false
+  );
+
+  const expectedEdge = firstFinite(
+    raw.expectedEdge,
+    raw.expected_edge,
+    raw.metadata?.expectedEdge,
+    raw.risk?.expectedEdge,
+    raw.metadata?.risk?.expectedEdge
+  );
+
+  const sophieApproved = Boolean(
+    raw.sophieApproved ||
+    raw.sophie_approved ||
+    raw.sophie?.approved ||
+    consensus?.authorized ||
+    raw.metadata?.consensus?.authorized
+  );
+
+  const sizeShares = firstFinite(raw.sizeShares, raw.size_shares);
+  const minOrderSizeRaw = raw.minOrderSize ?? raw.min_order_size ?? null;
+
   return {
     candidateId,
     rawHash,
@@ -258,7 +286,9 @@ function normalizeCandidate(raw, filePath) {
     expiresAt: firstString(raw.expires_at, raw.expiresAt),
     interruptLevel: firstString(raw.interrupt_level, raw.interruptLevel),
     action: firstString(raw.action, raw.suggested_action),
-    sophieApproved: Boolean(raw.sophieApproved || raw.sophie?.approved || consensus?.authorized || raw.metadata?.consensus?.authorized),
+    riskApproved,
+    expectedEdge,
+    sophieApproved,
     consensusScore: Number.isFinite(confidence) ? confidence : firstFinite(consensus?.score, raw.metadata?.consensus?.score),
     bookFresh: raw.bookFresh !== undefined ? Boolean(raw.bookFresh) : raw.book_fresh !== undefined ? Boolean(raw.book_fresh) : inferBookFresh(raw),
     bookAgeMs: firstFinite(raw.bookAgeMs, raw.book_age_ms, raw.book_after_persistence?.age_ms, raw.bookAfterPersistence?.ageMs),
@@ -266,7 +296,11 @@ function normalizeCandidate(raw, filePath) {
     oracleSignal: source === 'BTC_ORACLE' || strategy === 'BTC_TEMPORAL_LAG_OBI_V5',
     tickSize: raw.tickSize || raw.tick_size || raw.book_after_persistence?.tick_size || raw.bookAfterPersistence?.tickSize || null,
     negRisk: raw.negRisk ?? raw.neg_risk ?? null,
-    minOrderSize: raw.minOrderSize ?? raw.min_order_size ?? null,
+    sizeShares: Number.isFinite(sizeShares) ? sizeShares : null,
+    minOrderSize: minOrderSizeRaw !== null && minOrderSizeRaw !== undefined ? Number(minOrderSizeRaw) : null,
+    marketSlug: firstString(raw.marketSlug, raw.market_slug, raw.metadata?.marketSlug),
+    marketQuestion: firstString(raw.marketQuestion, raw.market_question, raw.metadata?.marketQuestion),
+    outcome: firstString(raw.outcome, raw.metadata?.outcome),
     paperBurnIn: raw.paperBurnIn || raw.burnIn || raw.paper_burn_in || null,
     raw,
     rawSourcePath: filePath,
@@ -292,19 +326,33 @@ function toLiveAdapterIntent(candidate) {
     side: candidate.side,
     price: candidate.price,
     sizeUsd: candidate.sizeUsd,
+    size_usd: candidate.sizeUsd,
     reason: candidate.reason,
     confidence: Number.isFinite(candidate.confidence) ? candidate.confidence : null,
     sophieApproved: candidate.sophieApproved,
+    sophie_approved: candidate.sophieApproved,
+    riskApproved: candidate.riskApproved,
+    risk_approved: candidate.riskApproved,
+    expectedEdge: Number.isFinite(candidate.expectedEdge) ? candidate.expectedEdge : null,
+    expected_edge: Number.isFinite(candidate.expectedEdge) ? candidate.expectedEdge : null,
     consensusScore: Number.isFinite(candidate.consensusScore) ? candidate.consensusScore : null,
     whaleCopy: candidate.whaleCopy,
     oracleSignal: candidate.oracleSignal,
     bookFresh: candidate.bookFresh,
     bookAgeMs: Number.isFinite(candidate.bookAgeMs) ? candidate.bookAgeMs : null,
+    sizeShares: Number.isFinite(candidate.sizeShares) ? candidate.sizeShares : null,
+    size_shares: Number.isFinite(candidate.sizeShares) ? candidate.sizeShares : null,
+    minOrderSize: candidate.minOrderSize,
+    min_order_size: candidate.minOrderSize,
     currentLiveExposureUsd: 0,
     currentDailyLivePnlUsd: 0,
     tickSize: candidate.tickSize,
     negRisk: candidate.negRisk,
-    minOrderSize: candidate.minOrderSize,
+    marketSlug: candidate.marketSlug || null,
+    market_slug: candidate.marketSlug || null,
+    marketQuestion: candidate.marketQuestion || null,
+    market_question: candidate.marketQuestion || null,
+    outcome: candidate.outcome || null,
     paperBurnIn: candidate.paperBurnIn,
     raw: candidate.raw,
   };
@@ -334,7 +382,10 @@ function evaluateRouterSafety(candidate, config) {
 
   if (!config.allowedSources.has(source)) reasons.push(`SOURCE_NOT_ALLOWED:${source || 'blank'}`);
   if (config.blockedStrategies.has(strategy) || type.includes('REJECTED')) reasons.push(`STRATEGY_BLOCKED:${strategy || type || 'blank'}`);
-  if (!config.allowedStrategies.has(strategy)) reasons.push(`STRATEGY_NOT_ALLOWED:${strategy || 'blank'}`);
+  if (!config.allowedStrategies.has(strategy)) {
+    reasons.push(`STRATEGY_NOT_ALLOWED:${strategy || 'blank'}`);
+    console.log(`[live-router] STRATEGY_NOT_ALLOWED strategy=${strategy} allowList=[${[...config.allowedStrategies].join(',')}]`);
+  }
   if (config.blockTestSignals && /test|manual/i.test(`${source}|${strategy}|${candidate.tokenId}|${candidate.reason}`)) reasons.push('TEST_OR_MANUAL_SIGNAL_BLOCKED');
 
   if (config.requireSophieApproval && source === 'MONEYMAKER' && !candidate.sophieApproved) reasons.push('SOPHIE_APPROVAL_MISSING');
@@ -394,13 +445,14 @@ function readConfig(baseDir = process.cwd()) {
     .map((p) => path.resolve(baseDir, p));
 
   const allowedSources = new Set(envList('LIVE_ALLOWED_SOURCES', ['MONEYMAKER', 'BTC_ORACLE']));
-  const allowedStrategies = new Set(envList('LIVE_ALLOWED_STRATEGIES', [
+  const allowedStrategies = new Set(envList('LIVE_ROUTER_ALLOWED_STRATEGIES', envList('LIVE_ALLOWED_STRATEGIES', [
     'SpreadHunter',
+    'GabagoolBtcOracleStrategy',
     'InventoryExit',
     'StopLossExit',
     'TakeProfitExit',
     'BTC_TEMPORAL_LAG_OBI_V5',
-  ]));
+  ])));
   const blockedStrategies = new Set(envList('LIVE_BLOCKED_STRATEGIES', [
     'BTC_TEMPORAL_LAG_OBI_REJECTED',
     'WhaleCopy',
@@ -574,6 +626,12 @@ async function processCandidate(config, state, adapter, item) {
 
   const routerSafety = evaluateRouterSafety(candidate, config);
   if (!routerSafety.ok) {
+    console.log(
+      `[live-router] AUTO_LIVE_CANDIDATE_SKIP strategy=${candidate.strategy} side=${candidate.side} ` +
+      `token=${shortId(candidate.tokenId)} price=${candidate.price} sizeUsd=${candidate.sizeUsd} ` +
+      `riskApproved=${candidate.riskApproved} expectedEdge=${candidate.expectedEdge} ` +
+      `sophieApproved=${candidate.sophieApproved} reasons=[${routerSafety.reasons.join(',')}]`
+    );
     const event = {
       timestamp: nowIso(),
       type: 'LIVE_ROUTER_REFUSED',
@@ -586,6 +644,11 @@ async function processCandidate(config, state, adapter, item) {
       side: candidate.side,
       price: candidate.price,
       size_usd: candidate.sizeUsd,
+      risk_approved: candidate.riskApproved,
+      expected_edge: candidate.expectedEdge,
+      sophie_approved: candidate.sophieApproved,
+      size_shares: candidate.sizeShares,
+      min_order_size: candidate.minOrderSize,
       reasons: routerSafety.reasons,
     };
     appendNdjson(config.eventsPath, event);
@@ -598,6 +661,13 @@ async function processCandidate(config, state, adapter, item) {
   }
 
   const rawIntent = toLiveAdapterIntent(candidate);
+  console.log(
+    `[live-router] AUTO_LIVE_CANDIDATE_ROUTED strategy=${candidate.strategy} side=${candidate.side} ` +
+    `token=${shortId(candidate.tokenId)} price=${candidate.price} sizeUsd=${candidate.sizeUsd} ` +
+    `riskApproved=${candidate.riskApproved} expectedEdge=${candidate.expectedEdge} ` +
+    `sophieApproved=${candidate.sophieApproved} sizeShares=${candidate.sizeShares} minOrderSize=${candidate.minOrderSize} ` +
+    `mode=${config.mode}`
+  );
   const result = await adapter.handleIntent(rawIntent, {
     mode: config.mode === 'submit' ? 'submit' : 'dry-run',
     fetchMetadata: config.mode === 'submit',
@@ -615,6 +685,11 @@ async function processCandidate(config, state, adapter, item) {
     side: candidate.side,
     price: candidate.price,
     size_usd: candidate.sizeUsd,
+    risk_approved: candidate.riskApproved,
+    expected_edge: candidate.expectedEdge,
+    sophie_approved: candidate.sophieApproved,
+    size_shares: candidate.sizeShares,
+    min_order_size: candidate.minOrderSize,
     adapter_decision: result?.decision || result?.type || 'UNKNOWN',
     adapter_reasons: result?.reasons || [],
     adapter_type: result?.type || null,
