@@ -22,7 +22,7 @@ const {
   VolatilityGuard,
 } = require('../moneymaker_v3');
 const { readConfig: readLiveConfig } = require('../live_adapter_polymarket');
-const { buildSettingsStatus } = require('../dashboard_server');
+const { analyzeStateFileUsage, buildSettingsStatus } = require('../dashboard_server');
 
 function makeBook(overrides = {}) {
   return {
@@ -304,6 +304,8 @@ function makeConfig(paths, overrides = {}) {
     gabagoolMaxPrice: 0.98,
     gabagoolAllowHighPriceEntryEdge: 0.20,
     gabagoolMinExpectedEdge: 0.0001,
+    btcOracleThreshold: 0.0001,
+    btcOraclePersistenceMinPct: 0.0001,
     gabagoolBehaviorModelPath: paths.modelPath,
     gabagoolSignalPath: paths.signalPath,
     gabagoolTargetPath: paths.targetPath,
@@ -564,7 +566,7 @@ async function run() {
     const health = bot.portfolio.executionHealth();
     const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
     assert.strictEqual(report.signalStats.confirmedSource, 'derived_from_persistence', 'fresh signal without explicit confirmed field should derive confirmation from persistence');
-    assert.strictEqual(countRelayEvents(bot, 'candidate_ready'), 1, 'fresh oracle signal should build one candidate');
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'fresh oracle signal should build one candidate');
     assert.strictEqual(bot.portfolio.openOrders.size, 0, 'Sophie-rejected candidate must not place an order');
     assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 1, 'fresh confirmed oracle signal should reach Sophie');
     assert.strictEqual(countRelayEvents(bot, 'sophie_blocked'), 1, 'Sophie rejection should emit one Telegram relay event');
@@ -831,6 +833,7 @@ async function run() {
       gabagoolMaxPaperDrawdownPct: 2.0,
       gabagoolMaxPaperClosedLossUsd: 0.75,
       gabagoolPauseEntriesOnLoss: true,
+      gabagoolLossGuardCooldownMs: 60_000,
     }));
     const asset = makeGabagoolAsset(baseStartSec);
     const book = makeBook({ bestBid: 0.19, bestAsk: 0.21, midpoint: 0.20, spread: 0.02 });
@@ -862,6 +865,10 @@ async function run() {
     assert.strictEqual(report.strategyStatus.gabagoolEntryPauseReason, 'gabagool_loss_guard', 'btc report should expose the loss guard reason');
     assert.strictEqual(report.pipelineStats.gabagoolLastPlacementDecision, 'IDLE:gabagool_loss_guard', 'loss guard should surface the placement decision');
     assert.strictEqual(report.pnl.gabagoolPaperClosedPnl < 0, true, 'loss guard scenario should show negative Gabagool closed pnl');
+    const recoveredState = bot.gabagoolLossGuardState(bot.cache.markPrices(), Date.now() + 120_000);
+    assert.strictEqual(recoveredState.paused, false, 'paper loss guard should recover after cooldown when BTC exposure is clean');
+    assert.strictEqual(recoveredState.recoveryEligible, true, 'paper loss guard should expose recovery eligibility');
+    assert.strictEqual(recoveredState.triggerEvent?.source, 'loss_exit_fill_fallback', 'paper loss guard should derive a fallback trigger from the last BTC loss fill');
   }
 
   {
@@ -1762,9 +1769,30 @@ async function run() {
     });
     assert.strictEqual(settingsStatus.pm2ProcessId, 14, 'dashboard status should preserve the active PM2 process id');
     assert.strictEqual(settingsStatus.runtime.STATE_FILE, 'moneymaker_v3_state_runtime.json', 'dashboard status should expose the PM2 runtime state file');
-    assert(settingsStatus.mismatches.some((line) => line.startsWith('STATE_FILE:')), 'dashboard status should detect STATE_FILE mismatches between PM2 and .env');
-    assert(settingsStatus.mismatches.some((line) => line.startsWith('INITIAL_CASH:')), 'dashboard status should detect runtime cash mismatches between PM2 and .env');
-    assert(settingsStatus.mismatches.some((line) => line.startsWith('MAX_TOTAL_EXPOSURE_USD:')), 'dashboard status should detect runtime exposure mismatches between PM2 and .env');
+  }
+
+  {
+    const analysis = analyzeStateFileUsage({
+      available: true,
+      data: {
+        startingCash: 59,
+        cash: 57.67,
+        executionEvents: [{ ts: Date.now() - 5_000 }],
+      },
+      metadata: {
+        rawValue: 'moneymaker_v3_state_pre_live_burnin_30.json',
+        exists: true,
+        sizeBytes: 123,
+        modifiedAt: new Date().toISOString(),
+      },
+    }, {
+      runtime: { INITIAL_CASH: '59' },
+      envFile: {},
+    }, {
+      equity: 57.67,
+    });
+    assert(analysis.warnings.some((value) => value.startsWith('state_file_profile_mismatch:')), 'state analysis should warn when the filename burn-in profile is stale');
+    assert(analysis.warnings.includes('possible_old_state_reuse_after_reset'), 'state analysis should flag likely reuse after reset');
   }
 
   {

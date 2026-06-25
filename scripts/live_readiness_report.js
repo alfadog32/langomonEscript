@@ -24,6 +24,7 @@ const REQUIRED_PM2 = {
 };
 
 function loadEnvFile(filePath) {
+  if (!localEnvFileReadEnabled()) return;
   const resolved = path.resolve(filePath);
   if (!fs.existsSync(resolved)) return;
 
@@ -41,6 +42,15 @@ function loadEnvFile(filePath) {
     }
     if (process.env[key] === undefined) process.env[key] = value;
   }
+}
+
+function localEnvFileReadEnabled() {
+  const raw = String(
+    process.env.MM_SKIP_LOCAL_ENV_FILE ||
+    process.env.SKIP_LOCAL_ENV_FILE ||
+    ''
+  ).trim().toLowerCase();
+  return !['1', 'true', 'yes', 'on'].includes(raw);
 }
 
 function normalizeBaseUrl(value) {
@@ -305,6 +315,7 @@ async function main() {
   const executionHealth = parseLastExecutionHealth(currentEngineLines);
   const pipelineReport = parseLastKeyValueLine(currentEngineLines, 'Pipeline 1h:');
   const paperFlowReport = parseLastKeyValueLine(currentEngineLines, 'Paper Flow:');
+  const actionRateReport = parseLastKeyValueLine(currentEngineLines, 'Action Rate 15m:');
   const fillRealismReport = parseLastKeyValueLine(currentEngineLines, 'Fill Realism:');
   const exposureAuditReport = parseLastKeyValueLine(currentEngineLines, 'Exposure Audit:');
   const exposureBucketsReport = parseLastKeyValueLine(currentEngineLines, 'Exposure Buckets:');
@@ -365,6 +376,24 @@ async function main() {
   const oldestOpenOrderAgeSec = Number.isFinite(executionHealth.oldestOpenOrderAgeSec) ? executionHealth.oldestOpenOrderAgeSec : 0;
   const avgOpenOrderAgeSec = Number.isFinite(executionHealth.avgOpenOrderAgeSec) ? executionHealth.avgOpenOrderAgeSec : 0;
   const avgActiveOrderAgeSec = Number.isFinite(executionHealth.avgActiveOrderAgeSec) ? executionHealth.avgActiveOrderAgeSec : avgOpenOrderAgeSec;
+  const ordersPlacedLast15m = Number.isFinite(actionRateReport?.values?.ordersPlacedLast15m)
+    ? actionRateReport.values.ordersPlacedLast15m
+    : Number.isFinite(executionHealth.paperOrdersPlacedLast15m)
+      ? executionHealth.paperOrdersPlacedLast15m
+      : 0;
+  const fillsLast15m = Number.isFinite(actionRateReport?.values?.fillsLast15m)
+    ? actionRateReport.values.fillsLast15m
+    : Number.isFinite(executionHealth.paperOrdersFilledLast15m)
+      ? executionHealth.paperOrdersFilledLast15m
+      : 0;
+  const targetOrdersPer15m = Number.isFinite(actionRateReport?.values?.targetOrdersPer15m)
+    ? actionRateReport.values.targetOrdersPer15m
+    : 0;
+  const targetFillsPer15m = Number.isFinite(actionRateReport?.values?.targetFillsPer15m)
+    ? actionRateReport.values.targetFillsPer15m
+    : 0;
+  const actionRateStatus = String(actionRateReport?.values?.status || 'action_rate_not_applicable');
+  const actionRateReason = String(actionRateReport?.values?.reason || 'none');
   const trustedFillsLastHour = Number.isFinite(fillRealismReport?.values?.trustedFills)
     ? fillRealismReport.values.trustedFills
     : Number.isFinite(fillRealismReport?.values?.trustedFillCountLastHour)
@@ -442,6 +471,12 @@ async function main() {
   if (candidateEvaluationsLastHour <= 0) reasons.push(`candidateEvaluationsLastHour ${candidateEvaluationsLastHour} below required > 0`);
   if (paperOrdersPlacedLastHour <= 0) reasons.push('no paper orders occurred during burn-in');
   if (fillsLastHour <= 0) reasons.push('no fills occurred during burn-in');
+  if (actionRateStatus === 'action_rate_below_target') {
+    reasons.push(
+      `action_rate_below_target orders15m=${ordersPlacedLast15m}/${targetOrdersPer15m} ` +
+      `fills15m=${fillsLast15m}/${targetFillsPer15m} reason=${actionRateReason}`
+    );
+  }
   if (!Number.isFinite(openOrders) || openOrders <= 0) reasons.push(`no active paper orders; candidateEvaluationsLastHour=${candidateEvaluationsLastHour} paperOrdersAdmittedLastHour=${paperOrdersAdmittedLastHour} paperOrdersPlacedLastHour=${paperOrdersPlacedLastHour} makerOptimizerAdmitsLastHour=${makerOptimizerAdmitsLastHour} makerOptimizerBlocksLastHour=${makerOptimizerBlocksLastHour}`);
   if (!crashLoopOk) reasons.push('langomonEscript appears to be crash-looping');
   if (Number.isFinite(drawdownPct) && drawdownPct > CONFIG.maxDrawdownPct) reasons.push(`drawdown ${drawdownPct}% exceeds max ${CONFIG.maxDrawdownPct}%`);

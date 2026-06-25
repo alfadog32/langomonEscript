@@ -184,6 +184,17 @@ const CONFIG = {
   paperMakerRecoveryMaxActive: envInt('PAPER_MAKER_RECOVERY_MAX_ACTIVE', 1),
   paperMakerRecoveryMinSignalScore: envNum('PAPER_MAKER_RECOVERY_MIN_SIGNAL_SCORE', 0.70),
   paperMakerRecoveryMinConfidence: envNum('PAPER_MAKER_RECOVERY_MIN_CONFIDENCE', 0.35),
+  paperActionBurnInEnabled: envBool('PAPER_ACTION_BURNIN_ENABLED', true),
+  paperActionBurnInWindowMs: envInt('PAPER_ACTION_BURNIN_WINDOW_MS', 15 * 60_000),
+  paperActionBurnInMaxBankrollUsd: envNum('PAPER_ACTION_BURNIN_MAX_BANKROLL_USD', 60),
+  paperActionBurnInTargetOrdersPer15m: envInt('PAPER_ACTION_BURNIN_TARGET_ORDERS_PER_15M', 3),
+  paperActionBurnInTargetFillsPer15m: envInt('PAPER_ACTION_BURNIN_TARGET_FILLS_PER_15M', 0),
+  paperActionBurnInMaxOpenOrders: envInt('PAPER_ACTION_BURNIN_MAX_OPEN_ORDERS', 0),
+  paperActionBurnInProbationOrderUsd: envNum('PAPER_ACTION_BURNIN_PROBATION_ORDER_USD', 1),
+  paperActionBurnInMaxSpread: envNum('PAPER_ACTION_BURNIN_MAX_SPREAD', 0.10),
+  paperActionBurnInMaxLiquidityConsumedPct: envNum('PAPER_ACTION_BURNIN_MAX_LIQUIDITY_CONSUMED_PCT', 0.35),
+  paperActionBurnInGhostGracePct: envNum('PAPER_ACTION_BURNIN_GHOST_GRACE_PCT', 2),
+  paperActionBurnInGhostMinConfidence: envNum('PAPER_ACTION_BURNIN_GHOST_MIN_CONFIDENCE', 0.30),
   paperMakerDistanceDecayPerNoFill: envNum('PAPER_MAKER_DISTANCE_DECAY_PER_NOFILL', 0.18),
   paperMakerMinOptimizedDistance: envNum('PAPER_MAKER_MIN_OPTIMIZED_DISTANCE', 0.015),
   paperMakerMaxNoFillDecayStreak: envInt('PAPER_MAKER_MAX_NOFILL_DECAY_STREAK', 5),
@@ -344,6 +355,8 @@ const CONFIG = {
   gabagoolMaxPaperDrawdownPct: envNum('GABAGOOL_MAX_PAPER_DRAWDOWN_PCT', 2.0),
   gabagoolMaxPaperClosedLossUsd: envNum('GABAGOOL_MAX_PAPER_CLOSED_LOSS_USD', 0.75),
   gabagoolPauseEntriesOnLoss: envBool('GABAGOOL_PAUSE_ENTRIES_ON_LOSS', true),
+  gabagoolLossGuardCooldownMs: envInt('GABAGOOL_LOSS_GUARD_COOLDOWN_MS', 10 * 60_000),
+  gabagoolLossGuardBlockedExitCooldownMs: envInt('GABAGOOL_LOSS_GUARD_BLOCKED_EXIT_COOLDOWN_MS', 5 * 60_000),
   gabagoolLossGuardExitMode: envStr('GABAGOOL_LOSS_GUARD_EXIT_MODE', 'reduce_only'),
   gabagoolMaxRoundTripsPerTokenPerMarket: envInt('GABAGOOL_MAX_ROUND_TRIPS_PER_TOKEN_PER_MARKET', 2),
   gabagoolReenterCooldownMs: envInt('GABAGOOL_REENTER_COOLDOWN_MS', 30_000),
@@ -390,6 +403,7 @@ const CONFIG = {
 
 function loadDotEnvFile(filePath = path.join(process.cwd(), '.env')) {
   try {
+    if (!localEnvFileReadEnabled()) return;
     if (!fs.existsSync(filePath)) return;
 
     const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
@@ -417,6 +431,15 @@ function loadDotEnvFile(filePath = path.join(process.cwd(), '.env')) {
   } catch (e) {
     console.warn(`[ENV] Failed to load .env file: ${e.message}`);
   }
+}
+
+function localEnvFileReadEnabled() {
+  const raw = String(
+    process.env.MM_SKIP_LOCAL_ENV_FILE ||
+    process.env.SKIP_LOCAL_ENV_FILE ||
+    ''
+  ).trim().toLowerCase();
+  return !['1', 'true', 'yes', 'on'].includes(raw);
 }
 
 function envStr(name, fallback) {
@@ -1471,11 +1494,11 @@ class SpreadHunterStrategy extends Strategy {
     }
 
     const health = this.portfolio.executionHealth(Date.now());
-    const paperFlowStarved = (
-      this.config.enableLiveTrading !== true &&
-      this.portfolio.openOrders.size === 0 &&
-      Number(health.paperOrdersPlacedLastHour || 0) === 0
-    );
+    const actionBurnIn = BotEngine.prototype.paperActionBurnInState.call({
+      config: this.config,
+      portfolio: this.portfolio,
+    }, Date.now(), health);
+    const paperFlowStarved = actionBurnIn.probationWindowOpen;
     const baseConfidenceFloor = Number(this.config.minConfidence || 0);
     const standardPaperConfidenceFloor = Number.isFinite(Number(this.config.standardPaperMinConfidence))
       ? Number(this.config.standardPaperMinConfidence)
@@ -1503,13 +1526,47 @@ class SpreadHunterStrategy extends Strategy {
       0,
       1
     );
-    const probationTinyOrderUsd = Math.max(minOrderUsd, 1);
-    const probationEligible = (
+    const probationTinyOrderUsd = Math.max(0.5, Number(this.config.paperActionBurnInProbationOrderUsd || 1));
+    const ghostNearThreshold = Boolean(
+      ghostThrottle &&
+      Number(ghostThrottle.favorablePct) < Number(ghostThrottle.thresholdPct) &&
+      Number(ghostThrottle.favorablePct) >= (
+        Number(ghostThrottle.thresholdPct) - Math.max(0, Number(this.config.paperActionBurnInGhostGracePct || 0))
+      )
+    );
+    const probationMaxSpread = Math.max(0.01, Number(this.config.paperActionBurnInMaxSpread || 0.10));
+    const probationMaxLiquidityConsumedPct = clamp(Number(this.config.paperActionBurnInMaxLiquidityConsumedPct || 0.35), 0, 1);
+    const ghostProbationConfidenceFloor = clamp(
+      Math.min(
+        probationConfidenceFloor,
+        Math.max(0.25, Number(this.config.paperActionBurnInGhostMinConfidence || 0.30))
+      ),
+      0,
+      1
+    );
+    const ghostProbationEligible = (
       paperFlowStarved &&
+      ghostNearThreshold &&
+      Number(edgeEstimate) >= strategyMinEdge &&
+      Number(spread) <= probationMaxSpread &&
+      Number(buyLiquidity.consumedPct) <= probationMaxLiquidityConsumedPct &&
+      Number(confidence) < strictPaperConfidenceFloor &&
+      Number(confidence) >= ghostProbationConfidenceFloor
+    );
+    const confidenceProbationEligible = (
+      paperFlowStarved &&
+      !ghostThrottle &&
       Number(edgeEstimate) >= strategyMinEdge &&
       Number(confidence) < strictPaperConfidenceFloor &&
       Number(confidence) >= probationConfidenceFloor
     );
+    const probationEligible = ghostProbationEligible || confidenceProbationEligible;
+    const probationTrigger = ghostProbationEligible
+      ? 'ghost_near_threshold_probation_admission'
+      : confidenceProbationEligible
+        ? 'confidence_action_burnin_probation_admission'
+        : null;
+    const probationFloorApplied = ghostProbationEligible ? ghostProbationConfidenceFloor : probationConfidenceFloor;
 
     const signals = [];
 
@@ -1518,16 +1575,27 @@ class SpreadHunterStrategy extends Strategy {
         ? {
           active: true,
           paperOnly: true,
-          trigger: ghostThrottle ? 'ghost_throttle_zero_order_drought' : 'confidence_zero_order_drought',
-          minConfidence: Number(probationConfidenceFloor.toFixed(3)),
+          trigger: probationTrigger,
+          admissionReason: 'probation_admission',
+          minConfidence: Number(probationFloorApplied.toFixed(3)),
           strictMinConfidence: Number(strictPaperConfidenceFloor.toFixed(3)),
           tinySizeUsd: Number(probationTinyOrderUsd.toFixed(2)),
           edgeFloor: Number(strategyMinEdge.toFixed(4)),
           ordersPlacedLastHour: Number(health.paperOrdersPlacedLastHour || 0),
+          ordersPlacedLast15m: Number(health.paperOrdersPlacedLast15m || 0),
+          fillsLast15m: Number(health.paperOrdersFilledLast15m || 0),
+          targetOrdersPer15m: Number(actionBurnIn.targetOrdersPer15m || 0),
+          targetFillsPer15m: Number(actionBurnIn.targetFillsPer15m || 0),
           openOrders: Number(this.portfolio.openOrders.size || 0),
           ghostThrottleActive: ghostThrottle ? true : false,
+          ghostNearThreshold,
           buyUsdBefore: Number(buyUsd.toFixed(6)),
           buyUsdAfter: Number(probationTinyOrderUsd.toFixed(6)),
+          maxOrderUsd: Number(probationTinyOrderUsd.toFixed(2)),
+          maxSpread: Number(probationMaxSpread.toFixed(4)),
+          maxLiquidityConsumedPct: Number(probationMaxLiquidityConsumedPct.toFixed(4)),
+          referenceBankrollUsd: Number(actionBurnIn.referenceBankrollUsd || 0),
+          maxBankrollUsd: Number(actionBurnIn.maxBankrollUsd || 0),
         }
         : null;
       signals.push(new Signal({
@@ -1550,6 +1618,7 @@ class SpreadHunterStrategy extends Strategy {
           liquidityConsumedPct: buyLiquidity.consumedPct,
           liquidityPenalty: buyLiquidity.penalty,
           entryMid: mark,
+          paperActionBurnIn: actionBurnIn,
           ...(paperProbation ? { paperProbation } : {}),
           ...(ghostThrottle ? { ghostThrottle } : {}),
         },
@@ -1576,6 +1645,8 @@ class SpreadHunterStrategy extends Strategy {
           `probationEligible=${probationEligible ? 'true' : 'false'} ` +
           `hasPaperProbationMetadata=${probationEligible ? 'true' : 'false'} ` +
           `paperFlowStarved=${paperFlowStarved ? 'true' : 'false'} ` +
+          `actionRateStatus=${actionBurnIn.status} ` +
+          `orders15m=${actionBurnIn.ordersPlacedLast15m} targetOrders15m=${actionBurnIn.targetOrdersPer15m} ` +
           `strictFloor=${cleanLogValue(strictPaperConfidenceFloor)} probationFloor=${cleanLogValue(probationConfidenceFloor)} ` +
           `reason=${probationTraceReason}`
         );
@@ -3765,7 +3836,10 @@ class PaperPortfolio {
 
   executionHealth(now = Date.now()) {
     const hourAgo = now - 60 * 60_000;
+    const actionWindowMs = Math.max(60_000, Number(this.config.paperActionBurnInWindowMs || 15 * 60_000));
+    const actionWindowAgo = now - actionWindowMs;
     const recent = this.executionEvents.filter((event) => Number(event.ts) >= hourAgo);
+    const recentActionWindow = this.executionEvents.filter((event) => Number(event.ts) >= actionWindowAgo);
     const countType = (type) => recent.filter((event) => event.type === type).length;
     const countGabagoolType = (type) => recent.filter((event) => event.type === type && isBtcOracleStrategy(event.strategy)).length;
     const gabagoolEvents = this.executionEvents.filter((event) => isBtcOracleStrategy(event.strategy));
@@ -3802,6 +3876,8 @@ class PaperPortfolio {
     const paperOrdersAdmittedLastHour = countType('order_admitted');
     const paperOrdersRejectedBySophieLastHour = countType('quality_block') + countType('quality_throttle');
     const fillsLastHour = countType('fill');
+    const paperOrdersPlacedLast15m = recentActionWindow.filter((event) => event.type === 'order_placed').length;
+    const paperOrdersFilledLast15m = recentActionWindow.filter((event) => event.type === 'fill').length;
     const duplicateSkipsLastHour = countType('duplicate_skip');
     const replacementsLastHour = countType('order_replacement');
     const maxOpenOrderBlocksLastHour = countType('max_open_orders_block');
@@ -3973,6 +4049,51 @@ class PaperPortfolio {
         topBlockReasonsLastHour !== 'none' ? `topBlocks=${topBlockReasonsLastHour}` : null,
       ].filter(Boolean).join(' ') || 'no_orders_recorded'
       : null;
+    const actionRateTopBlocks = new Map();
+    for (const event of recentActionWindow) {
+      let key = null;
+      if (event.reason === 'ghost_throttle') key = 'ghost_throttle';
+      else if (event.type === 'risk_block' && event.reason === 'confidence_below_min') key = 'confidence_below_min';
+      else if (event.type === 'quality_block') key = `quality_block:${event.reason || 'unknown'}`;
+      else if (event.type === 'quality_throttle') key = `quality_throttle:${event.reason || 'unknown'}`;
+      if (!key) continue;
+      actionRateTopBlocks.set(key, Number(actionRateTopBlocks.get(key) || 0) + 1);
+    }
+    const dominantActionRateBlock = [...actionRateTopBlocks.entries()]
+      .sort((a, b) => {
+        if (b[1] !== a[1]) return b[1] - a[1];
+        return a[0].localeCompare(b[0]);
+      })[0] || null;
+    const targetOrdersPer15m = Math.max(0, Number(this.config.paperActionBurnInTargetOrdersPer15m || 0));
+    const targetFillsPer15m = Math.max(0, Number(this.config.paperActionBurnInTargetFillsPer15m || 0));
+    const paperActionBurnInActive = (
+      this.config.enableLiveTrading !== true &&
+      this.config.paperActionBurnInEnabled === true &&
+      Math.max(
+        0,
+        Number(this.startingCash || 0),
+        Number(this.config.initialCash || 0),
+        Number(this.equity() || 0)
+      ) <= Math.max(0, Number(this.config.paperActionBurnInMaxBankrollUsd || 0))
+    );
+    const actionRateBelowTarget = (
+      paperActionBurnInActive &&
+      (
+        (targetOrdersPer15m > 0 && paperOrdersPlacedLast15m < targetOrdersPer15m) ||
+        (targetFillsPer15m > 0 && paperOrdersFilledLast15m < targetFillsPer15m)
+      )
+    );
+    const actionRateStatus = paperActionBurnInActive
+      ? (actionRateBelowTarget ? 'action_rate_below_target' : 'action_rate_on_target')
+      : 'action_rate_not_applicable';
+    const actionRateReason = actionRateBelowTarget
+      ? [
+        'action_rate_below_target',
+        `orders15m=${paperOrdersPlacedLast15m}/${targetOrdersPer15m}`,
+        `fills15m=${paperOrdersFilledLast15m}/${targetFillsPer15m}`,
+        dominantActionRateBlock ? `dominantBlock=${dominantActionRateBlock[0]}:${dominantActionRateBlock[1]}` : null,
+      ].filter(Boolean).join(' ')
+      : actionRateStatus;
     const lastFillEvent = fillEvents.slice().sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0))[0] || null;
     const deadExposureCashReserve = this.deadExposureCashReserveState();
 
@@ -4095,6 +4216,14 @@ class PaperPortfolio {
       probationBlocksLastHour,
       topBlockReasonsLastHour,
       whyTotalOrdersZeroLastHour,
+      paperOrdersPlacedLast15m,
+      paperOrdersFilledLast15m,
+      actionRateWindowMinutes: Math.round(actionWindowMs / 60_000),
+      targetOrdersPer15m,
+      targetFillsPer15m,
+      paperActionBurnInActive,
+      actionRateStatus,
+      actionRateReason,
       gabagoolLossGuardExitBlockedLastReason: latestGabagoolReason('gabagool_loss_guard_exit_blocked'),
       gabagoolLossGuardPositionsScanned: latestGabagoolField('gabagool_loss_guard_exit_scan', 'positionsScanned') || 0,
       gabagoolLossGuardPositionsClosable: latestGabagoolField('gabagool_loss_guard_exit_scan', 'positionsClosable') || 0,
@@ -4955,6 +5084,17 @@ class RiskEngine {
       const gabagoolCap = Number(this.config.gabagoolMaxPaperOrderUsd);
       if (Number.isFinite(gabagoolCap) && gabagoolCap > 0) {
         return Math.max(0.5, Math.min(this.config.minOrderUsd, gabagoolCap));
+      }
+    }
+    const paperProbation = signal?.metadata?.paperProbation || null;
+    if (
+      this.config.enableLiveTrading !== true &&
+      paperProbation?.active === true &&
+      paperProbation?.paperOnly === true
+    ) {
+      const tinySizeUsd = Number(paperProbation.tinySizeUsd || 0);
+      if (Number.isFinite(tinySizeUsd) && tinySizeUsd > 0) {
+        return Math.max(0.5, Math.min(this.config.minOrderUsd, tinySizeUsd));
       }
     }
     return this.config.minOrderUsd;
@@ -7341,6 +7481,60 @@ class BotEngine {
     );
   }
 
+  paperActionBurnInState(now = Date.now(), health = this.portfolio.executionHealth(now)) {
+    const targetOrdersPer15m = Math.max(0, Number(this.config.paperActionBurnInTargetOrdersPer15m || 0));
+    const targetFillsPer15m = Math.max(0, Number(this.config.paperActionBurnInTargetFillsPer15m || 0));
+    const maxOpenOrders = Math.max(0, Number(this.config.paperActionBurnInMaxOpenOrders || 0));
+    const maxBankrollUsd = Math.max(0, Number(this.config.paperActionBurnInMaxBankrollUsd || 0));
+    const referenceBankrollUsd = Math.max(
+      0,
+      Number(this.portfolio.startingCash || 0),
+      Number(this.config.initialCash || 0),
+      Number(this.portfolio.equity() || 0)
+    );
+    const active = (
+      this.config.enableLiveTrading !== true &&
+      this.config.paperActionBurnInEnabled === true &&
+      maxBankrollUsd > 0 &&
+      referenceBankrollUsd <= maxBankrollUsd
+    );
+    const ordersPlacedLast15m = Math.max(0, Number(health.paperOrdersPlacedLast15m || 0));
+    const fillsLast15m = Math.max(0, Number(health.paperOrdersFilledLast15m || 0));
+    const belowOrdersTarget = targetOrdersPer15m > 0 && ordersPlacedLast15m < targetOrdersPer15m;
+    const belowFillsTarget = targetFillsPer15m > 0 && fillsLast15m < targetFillsPer15m;
+    const actionRateBelowTarget = active && (belowOrdersTarget || belowFillsTarget);
+    let status = 'disabled';
+    let reason = 'paper_action_burnin_disabled';
+    if (this.config.enableLiveTrading === true) {
+      reason = 'live_mode';
+    } else if (this.config.paperActionBurnInEnabled !== true) {
+      reason = 'paper_action_burnin_disabled';
+    } else if (!(maxBankrollUsd > 0) || referenceBankrollUsd > maxBankrollUsd) {
+      reason = 'bankroll_above_burnin_cap';
+    } else if (actionRateBelowTarget) {
+      status = 'action_rate_below_target';
+      reason = 'action_rate_below_target';
+    } else {
+      status = 'action_rate_on_target';
+      reason = 'action_rate_on_target';
+    }
+    return {
+      active,
+      status,
+      reason,
+      actionRateBelowTarget,
+      referenceBankrollUsd,
+      maxBankrollUsd,
+      targetOrdersPer15m,
+      targetFillsPer15m,
+      ordersPlacedLast15m,
+      fillsLast15m,
+      maxOpenOrders,
+      openOrders: Number(this.portfolio.openOrders.size || 0),
+      probationWindowOpen: active && actionRateBelowTarget && Number(this.portfolio.openOrders.size || 0) <= maxOpenOrders,
+    };
+  }
+
   async buildGabagoolLossGuardExitScan({ model, books = new Map(), now = Date.now() } = {}) {
     const lossGuard = this.gabagoolLossGuardState(this.cache.markPrices(), now);
     const exitMode = this.gabagoolLossGuardExitMode();
@@ -8079,21 +8273,114 @@ class BotEngine {
     return Math.max(0, (-netPnl / baseCapitalUsd) * 100);
   }
 
+  gabagoolLossGuardTriggerEvent(now = Date.now()) {
+    let fallback = null;
+    for (let i = this.portfolio.executionEvents.length - 1; i >= 0; i -= 1) {
+      const event = this.portfolio.executionEvents[i];
+      const eventTs = Number(event?.ts || 0);
+      if (!(eventTs > 0) || eventTs > now) continue;
+      if (!isBtcOracleStrategy(event?.strategy)) continue;
+      if (
+        event.type === 'gabagool_blocked_loss_exit' ||
+        (event.type === 'gabagool_exit' && (event.reason === 'loss_exit' || event.reason === 'blocked_loss_exit'))
+      ) {
+        return {
+          ts: eventTs,
+          type: event.type,
+          reason: event.reason || event.type,
+          source: event.type === 'gabagool_blocked_loss_exit'
+            ? 'blocked_loss_exit'
+            : String(event.reason || 'loss_exit'),
+        };
+      }
+      if (fallback == null && (event.type === 'gabagool_exit' || event.type === 'fill')) {
+        fallback = {
+          ts: eventTs,
+          type: event.type,
+          reason: event.reason || event.type,
+          source: event.type === 'gabagool_exit' ? 'recent_exit_fallback' : 'recent_fill_fallback',
+        };
+      }
+    }
+    if (fallback == null && Array.isArray(this.portfolio.fills)) {
+      for (let i = this.portfolio.fills.length - 1; i >= 0; i -= 1) {
+        const fill = this.portfolio.fills[i];
+        const fillTs = Number(fill?.ts || 0);
+        if (!(fillTs > 0) || fillTs > now) continue;
+        if (!isBtcOracleStrategy(fill?.strategy)) continue;
+        return {
+          ts: fillTs,
+          type: 'fill',
+          reason: fill.side === 'sell' ? 'loss_exit_fill_fallback' : 'recent_fill_fallback',
+          source: fill.side === 'sell' ? 'loss_exit_fill_fallback' : 'recent_fill_fallback',
+        };
+      }
+    }
+    return fallback;
+  }
+
   gabagoolLossGuardState(markPrices = this.cache.markPrices(), now = Date.now()) {
     const ledger = this.gabagoolLedger(markPrices, now);
+    const riskExposure = this.risk?.exposureBreakdown
+      ? this.risk.exposureBreakdown(null, { markPrices, now })
+      : {};
     const closedPnl = Number(ledger.closedPnl || 0);
     const closedLossUsd = Math.max(0, -closedPnl);
     const drawdownPct = this.gabagoolDrawdownPct(ledger);
     const pauseOnLoss = this.config.gabagoolPauseEntriesOnLoss === true;
     const maxDrawdownPct = Math.max(0, Number(this.config.gabagoolMaxPaperDrawdownPct || 0));
     const maxClosedLossUsd = Math.max(0, Number(this.config.gabagoolMaxPaperClosedLossUsd || 0));
+    const cooldownMs = Math.max(0, Number(this.config.gabagoolLossGuardCooldownMs || 0));
+    const blockedExitCooldownMs = Math.max(0, Number(this.config.gabagoolLossGuardBlockedExitCooldownMs || 0));
     const reasons = [];
     if (pauseOnLoss && drawdownPct > maxDrawdownPct) reasons.push('drawdown_pct_exceeded');
     if (pauseOnLoss && closedLossUsd > maxClosedLossUsd) reasons.push('closed_loss_exceeded');
+    const thresholdTriggered = pauseOnLoss && reasons.length > 0;
+    const triggerEvent = thresholdTriggered ? this.gabagoolLossGuardTriggerEvent(now) : null;
+    const cooldownRemainingMs = triggerEvent
+      ? Math.max(0, (Number(triggerEvent.ts || 0) + cooldownMs) - now)
+      : 0;
+    const activeBtcPositionExposureUsd = Number(riskExposure.btcOracleActiveTradableExposureUsd || 0);
+    const openBtcOrderExposureUsd = Number(ledger.currentOpenOrderExposureUsd || 0);
+    const staleBtcExposureUsd = (
+      Number(riskExposure.btcOracleStaleNoBidExposureUsd || 0) +
+      Number(riskExposure.btcOracleConfirmedNoOrderbook404ExposureUsd || 0)
+    );
+    const unresolvedBtcExposureUsd = (
+      Number(riskExposure.btcOracleExpiredBtc5mExposureUsd || 0) +
+      Number(riskExposure.btcOracleResolutionPendingExposureUsd || 0)
+    );
+    const dustBtcExposureUsd = Number(riskExposure.btcOracleDustExposureUsd || 0);
+    let recentBlockedLossExitTs = null;
+    for (let i = this.portfolio.executionEvents.length - 1; i >= 0; i -= 1) {
+      const event = this.portfolio.executionEvents[i];
+      const eventTs = Number(event?.ts || 0);
+      if (!(eventTs > 0)) continue;
+      if (eventTs < now - blockedExitCooldownMs) break;
+      if (!isBtcOracleStrategy(event?.strategy)) continue;
+      if (event.type !== 'gabagool_blocked_loss_exit') continue;
+      recentBlockedLossExitTs = eventTs;
+      break;
+    }
+    const recoveryBlockedReasons = [];
+    if (thresholdTriggered && triggerEvent == null) recoveryBlockedReasons.push('loss_guard_trigger_not_observed');
+    if (thresholdTriggered && cooldownRemainingMs > 0) recoveryBlockedReasons.push('cooldown_active');
+    if (thresholdTriggered && activeBtcPositionExposureUsd > 0.01) recoveryBlockedReasons.push('active_btc_positions');
+    if (thresholdTriggered && openBtcOrderExposureUsd > 0.01) recoveryBlockedReasons.push('open_btc_orders');
+    if (thresholdTriggered && staleBtcExposureUsd > 0.01) recoveryBlockedReasons.push('stale_btc_exposure');
+    if (thresholdTriggered && unresolvedBtcExposureUsd > 0.01) recoveryBlockedReasons.push('unresolved_btc_exposure');
+    if (thresholdTriggered && dustBtcExposureUsd > 0.01) recoveryBlockedReasons.push('dust_btc_exposure');
+    if (thresholdTriggered && recentBlockedLossExitTs != null) recoveryBlockedReasons.push('recent_blocked_loss_exit');
+    const recoveryEligible = (
+      thresholdTriggered &&
+      this.config.enableLiveTrading !== true &&
+      recoveryBlockedReasons.length === 0
+    );
     return {
-      paused: pauseOnLoss && reasons.length > 0,
-      reason: pauseOnLoss && reasons.length > 0 ? 'gabagool_loss_guard' : null,
+      paused: thresholdTriggered && !recoveryEligible,
+      reason: thresholdTriggered && !recoveryEligible ? 'gabagool_loss_guard' : null,
       reasons,
+      thresholdTriggered,
       ledger,
       drawdownPct,
       closedPnl,
@@ -8102,6 +8389,20 @@ class BotEngine {
       netPnl: this.gabagoolNetPnl(ledger),
       maxDrawdownPct,
       maxClosedLossUsd,
+      cooldownMs,
+      cooldownRemainingMs,
+      triggerEvent,
+      recoveryEligible,
+      recoveryActive: recoveryEligible,
+      recoveryBlockedReason: recoveryBlockedReasons[0] || null,
+      recoveryBlockedReasons,
+      activeBtcPositionExposureUsd,
+      openBtcOrderExposureUsd,
+      staleBtcExposureUsd,
+      unresolvedBtcExposureUsd,
+      dustBtcExposureUsd,
+      recentBlockedLossExitTs,
+      blockedExitCooldownMs,
     };
   }
 
@@ -8918,6 +9219,12 @@ class BotEngine {
         maxDrawdownPct: lossGuard.maxDrawdownPct,
         maxClosedLossUsd: lossGuard.maxClosedLossUsd,
         lossGuardReasons: lossGuard.reasons.join('|'),
+        lossGuardCooldownMs: lossGuard.cooldownMs,
+        lossGuardCooldownRemainingMs: lossGuard.cooldownRemainingMs,
+        lossGuardRecoveryEligible: lossGuard.recoveryEligible === true,
+        lossGuardRecoveryBlockedReason: lossGuard.recoveryBlockedReason || null,
+        lossGuardRecoveryBlockedReasons: lossGuard.recoveryBlockedReasons.join('|'),
+        lossGuardTriggerSource: lossGuard.triggerEvent?.source || null,
       };
     }
 
@@ -10399,10 +10706,8 @@ class BotEngine {
     const gabagoolNetPnl = this.gabagoolNetPnl(ledger);
     const gabagoolDrawdownPct = this.gabagoolDrawdownPct(ledger);
     const gabagoolClosedLossUsd = Math.max(0, -Number(ledger.closedPnl || 0));
-    const gabagoolEntriesPaused = this.config.gabagoolPauseEntriesOnLoss === true && (
-      gabagoolDrawdownPct > Number(this.config.gabagoolMaxPaperDrawdownPct || 0) ||
-      gabagoolClosedLossUsd > Number(this.config.gabagoolMaxPaperClosedLossUsd || 0)
-    );
+    const lossGuard = this.gabagoolLossGuardState(markPrices, now);
+    const gabagoolEntriesPaused = lossGuard.paused;
     const roundTripsLastHour = (ledger.roundTrips || []).filter((trip) => Number(trip.exitTs || 0) >= hourAgo);
     const gabagoolAvgRoundTripPnl = roundTripsLastHour.length > 0
       ? roundTripsLastHour.reduce((sum, trip) => sum + Number(trip.realizedPnl || 0), 0) / roundTripsLastHour.length
@@ -10454,6 +10759,19 @@ class BotEngine {
         gabagoolEntriesPaused,
         gabagoolEntryPauseReason: gabagoolEntriesPaused ? 'gabagool_loss_guard' : 'none',
         gabagoolDrawdownPct,
+        gabagoolLossGuardConfiguredClosedLossUsd: Number(lossGuard.maxClosedLossUsd || 0),
+        gabagoolLossGuardCurrentClosedLossUsd: Number(lossGuard.closedLossUsd || 0),
+        gabagoolLossGuardCooldownMs: Number(lossGuard.cooldownMs || 0),
+        gabagoolLossGuardCooldownRemainingMs: Number(lossGuard.cooldownRemainingMs || 0),
+        gabagoolLossGuardRecoveryEligible: lossGuard.recoveryEligible === true,
+        gabagoolLossGuardRecoveryActive: lossGuard.recoveryActive === true,
+        gabagoolLossGuardRecoveryBlockedReason: lossGuard.recoveryBlockedReason || 'none',
+        gabagoolLossGuardTriggerSource: lossGuard.triggerEvent?.source || 'none',
+        gabagoolLossGuardActivePositionExposureUsd: Number(lossGuard.activeBtcPositionExposureUsd || 0),
+        gabagoolLossGuardOpenOrderExposureUsd: Number(lossGuard.openBtcOrderExposureUsd || 0),
+        gabagoolLossGuardStaleExposureUsd: Number(lossGuard.staleBtcExposureUsd || 0),
+        gabagoolLossGuardUnresolvedExposureUsd: Number(lossGuard.unresolvedBtcExposureUsd || 0),
+        gabagoolLossGuardDustExposureUsd: Number(lossGuard.dustBtcExposureUsd || 0),
         liveFlags: {
           enableLiveTrading: this.config.enableLiveTrading === true,
           liveAutoExecute: this.config.liveAutoExecute === true,
@@ -10694,6 +11012,16 @@ class BotEngine {
       `Entry Guard: gabagoolEntriesPaused=${formatBool(report.strategyStatus.gabagoolEntriesPaused)} ` +
       `gabagoolEntryPauseReason=${report.strategyStatus.gabagoolEntryPauseReason || 'none'} ` +
       `gabagoolDrawdownPct=${fmtCount(report.strategyStatus.gabagoolDrawdownPct, 2)}`
+    );
+    lines.push(
+      `Loss Guard: configuredClosedLossUsd=${fmtMoney(report.strategyStatus.gabagoolLossGuardConfiguredClosedLossUsd)} ` +
+      `currentClosedLossUsd=${fmtMoney(report.strategyStatus.gabagoolLossGuardCurrentClosedLossUsd)} ` +
+      `cooldownMs=${fmtCount(report.strategyStatus.gabagoolLossGuardCooldownMs, 0)} ` +
+      `cooldownRemainingMs=${fmtCount(report.strategyStatus.gabagoolLossGuardCooldownRemainingMs, 0)} ` +
+      `recoveryEligible=${formatBool(report.strategyStatus.gabagoolLossGuardRecoveryEligible)} ` +
+      `recoveryActive=${formatBool(report.strategyStatus.gabagoolLossGuardRecoveryActive)} ` +
+      `recoveryBlockedReason=${report.strategyStatus.gabagoolLossGuardRecoveryBlockedReason || 'none'} ` +
+      `triggerSource=${report.strategyStatus.gabagoolLossGuardTriggerSource || 'none'}`
     );
     lines.push(
       `Signals 1h: read=${report.signalStats.oracleSignalsReadLastHour} ` +
@@ -12497,14 +12825,14 @@ class BotEngine {
     const repeatKey = this.repeatCandidateKey(signal);
     const now = Date.now();
     const health = this.portfolio.executionHealth(now);
+    const actionBurnIn = this.paperActionBurnInState(now, health);
     const paperProbation = signal?.metadata?.paperProbation || null;
     const probationActive = (
       this.config.enableLiveTrading !== true &&
       resolveStrategyName(signal) === 'SpreadHunter' &&
       String(signal?.side || '').toLowerCase() === 'buy' &&
       paperProbation?.active === true &&
-      this.portfolio.openOrders.size === 0 &&
-      Number(health.paperOrdersPlacedLastHour || 0) === 0
+      actionBurnIn.probationWindowOpen
     );
     const probationTraceReasonBase = paperProbation?.active === true
       ? 'metadata_present'
@@ -12522,6 +12850,14 @@ class BotEngine {
         predictedFillProbability: quality.predictedFillProbability,
         reason,
         source: 'paper_probation',
+        probationAdmission: paperProbation?.admissionReason || null,
+        ordersPlacedLast15m: Number(actionBurnIn.ordersPlacedLast15m || 0),
+        fillsLast15m: Number(actionBurnIn.fillsLast15m || 0),
+        targetOrdersPer15m: Number(actionBurnIn.targetOrdersPer15m || 0),
+        targetFillsPer15m: Number(actionBurnIn.targetFillsPer15m || 0),
+        maxOrderUsd: Number(paperProbation?.maxOrderUsd || signal.sizeUsd || 0),
+        maxSpread: Number(paperProbation?.maxSpread || 0),
+        maxLiquidityConsumedPct: Number(paperProbation?.maxLiquidityConsumedPct || 0),
       });
     };
     const recordProbationBlock = (reason = 'paper_flow_probation_blocked') => {
@@ -12532,7 +12868,25 @@ class BotEngine {
         predictedFillProbability: quality.predictedFillProbability,
         reason,
         source: 'paper_probation',
+        probationAdmission: paperProbation?.admissionReason || null,
+        ordersPlacedLast15m: Number(actionBurnIn.ordersPlacedLast15m || 0),
+        fillsLast15m: Number(actionBurnIn.fillsLast15m || 0),
+        targetOrdersPer15m: Number(actionBurnIn.targetOrdersPer15m || 0),
+        targetFillsPer15m: Number(actionBurnIn.targetFillsPer15m || 0),
       });
+    };
+    const logProbationAdmission = (reason) => {
+      if (!probationActive) return;
+      info(
+        `[PAPER ACTION BURN-IN] probation_admission=true reason=${reason} strategy=${resolveStrategyName(signal)} ` +
+        `token=${shortId(signal.tokenId)} sizeUsd=${cleanLogValue(signal.sizeUsd)} ` +
+        `orders15m=${actionBurnIn.ordersPlacedLast15m} fills15m=${actionBurnIn.fillsLast15m} ` +
+        `targetOrders15m=${actionBurnIn.targetOrdersPer15m} targetFills15m=${actionBurnIn.targetFillsPer15m} ` +
+        `maxOrderUsd=${cleanLogValue(paperProbation?.maxOrderUsd || signal.sizeUsd)} ` +
+        `maxSpread=${cleanLogValue(paperProbation?.maxSpread)} ` +
+        `maxLiquidityConsumedPct=${cleanLogValue(paperProbation?.maxLiquidityConsumedPct)} ` +
+        `trigger=${paperProbation?.trigger || 'unknown'} paperOnly=true`
+      );
     };
     const repeatCooldownUntil = this.sophieRepeatCandidateCooldownUntil.get(repeatKey) || 0;
     if (repeatCooldownUntil > now) {
@@ -12643,6 +12997,7 @@ class BotEngine {
           quality.qualityDecision = 'PAPER_PROBATION_ADMIT';
           this.lastSophieQualityDecision = quality;
           recordProbationAdmit('paper_flow_probation_low_quality_recovery');
+          logProbationAdmission('paper_flow_probation_low_quality_recovery');
           this.recordSophieAdmission(signal, quality);
           info(
             `[SOPHIE PAPER PROBATION ADMIT] ${signal.side.toUpperCase()} ${shortId(signal.tokenId)} ` +
@@ -12696,7 +13051,8 @@ class BotEngine {
     quality.qualityDecision = 'ADMIT';
     this.lastSophieQualityDecision = quality;
     if (probationActive) {
-      recordProbationAdmit('paper_flow_probation');
+      recordProbationAdmit(paperProbation?.trigger || 'paper_flow_probation');
+      logProbationAdmission(paperProbation?.trigger || 'paper_flow_probation');
     }
     this.recordSophieAdmission(signal, quality);
     info(
@@ -13296,6 +13652,15 @@ class BotEngine {
       `topBlockReasons=${health.topBlockReasonsLastHour || 'none'} ` +
       `probationAdmissions=${health.probationAdmissionsLastHour || 0} ` +
       `probationBlocks=${health.probationBlocksLastHour || 0}`
+    );
+    info(
+      `Action Rate 15m: status=${health.actionRateStatus || 'action_rate_not_applicable'} ` +
+      `ordersPlacedLast15m=${health.paperOrdersPlacedLast15m || 0} ` +
+      `fillsLast15m=${health.paperOrdersFilledLast15m || 0} ` +
+      `targetOrdersPer15m=${health.targetOrdersPer15m || 0} ` +
+      `targetFillsPer15m=${health.targetFillsPer15m || 0} ` +
+      `reason=${health.actionRateReason || 'none'} ` +
+      `paperActionBurnInActive=${health.paperActionBurnInActive === true ? 'true' : 'false'}`
     );
     info(
       `Strategy Orders 1h: ${Object.entries(health.strategyOrderCountsLastHour || {})

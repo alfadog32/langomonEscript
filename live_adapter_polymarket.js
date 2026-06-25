@@ -106,6 +106,9 @@ function appendNdjson(filePath, obj) {
 }
 
 function loadEnvFile(filePath, opts = {}) {
+  if (!localEnvFileReadEnabled()) {
+    return { loaded: false, path: path.resolve(filePath), skipped: true };
+  }
   const { override = false, required = false } = opts;
   const resolved = path.resolve(filePath);
   if (!fs.existsSync(resolved)) {
@@ -128,6 +131,15 @@ function loadEnvFile(filePath, opts = {}) {
     }
   }
   return { loaded: true, path: resolved };
+}
+
+function localEnvFileReadEnabled() {
+  const raw = String(
+    process.env.MM_SKIP_LOCAL_ENV_FILE ||
+    process.env.SKIP_LOCAL_ENV_FILE ||
+    ''
+  ).trim().toLowerCase();
+  return !['1', 'true', 'yes', 'on'].includes(raw);
 }
 
 function createIntentId(intent) {

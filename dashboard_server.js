@@ -89,7 +89,7 @@ const SETTING_KEYS = [
   'DASHBOARD_PUBLIC_URL',
 ];
 
-const fileEnv = parseEnvFile(ENV_FILE);
+const fileEnv = localEnvFileReadEnabled() ? parseEnvFile(ENV_FILE) : {};
 const host = envStr('DASHBOARD_HOST', '127.0.0.1');
 const port = envInt('DASHBOARD_PORT', 18888);
 const dashboardEnabled = envStr('DASHBOARD_ENABLED', 'false').toLowerCase() === 'true';
@@ -105,6 +105,15 @@ function createServer() {
       sendJson(res, 500, { ok: false, error: 'dashboard_error', message: err.message });
     }
   });
+}
+
+function localEnvFileReadEnabled() {
+  const raw = String(
+    process.env.MM_SKIP_LOCAL_ENV_FILE ||
+    process.env.SKIP_LOCAL_ENV_FILE ||
+    ''
+  ).trim().toLowerCase();
+  return !['1', 'true', 'yes', 'on'].includes(raw);
 }
 
 function startServer() {
@@ -165,7 +174,8 @@ function collectStatus() {
   const logs = getLogs(pm2);
   const state = readState(settings.runtime.STATE_FILE || settings.envFile.STATE_FILE || '');
   const report = parseLatestPortfolioReport(logs.allLines);
-  const portfolio = buildPortfolioSummary(state, report);
+  const stateFileAnalysis = analyzeStateFileUsage(state, settings, report);
+  const portfolio = buildPortfolioSummary(state, report, stateFileAnalysis);
   const publicPm2 = {
     ...pm2,
     processes: (pm2.processes || []).map(({ rawPm2Env, ...proc }) => proc),
@@ -182,7 +192,11 @@ function collectStatus() {
     },
     git: getGitInfo(),
     pm2: publicPm2,
-    stateFile: state.metadata,
+    stateFile: {
+      ...state.metadata,
+      analysis: stateFileAnalysis,
+      warning: state.metadata.warning || stateFileAnalysis.summary || null,
+    },
     portfolio,
     latestPortfolioReport: report.lines,
     settings,
@@ -194,7 +208,48 @@ function collectStatus() {
   };
 }
 
-function buildPortfolioSummary(state, report) {
+function analyzeStateFileUsage(state, settings, report) {
+  const warnings = [];
+  const rawValue = String(state?.metadata?.rawValue || '');
+  const declaredProfileUsd = extractStateFileProfileUsd(rawValue);
+  const runtimeInitialCash = numberOrNull(settings?.runtime?.INITIAL_CASH);
+  const stateStartingCash = numberOrNull(state?.data?.startingCash);
+  const stateCash = numberOrNull(state?.data?.cash);
+  const inferredBankrollUsd = firstFinite(stateStartingCash, runtimeInitialCash, stateCash, report?.equity);
+  if (declaredProfileUsd != null && inferredBankrollUsd != null && Math.abs(declaredProfileUsd - inferredBankrollUsd) > 5) {
+    warnings.push(
+      `state_file_profile_mismatch: filename suggests ~$${declaredProfileUsd.toFixed(0)} but state/runtime suggests ~$${inferredBankrollUsd.toFixed(2)}`
+    );
+  }
+  if (
+    stateStartingCash != null &&
+    runtimeInitialCash != null &&
+    Math.abs(stateStartingCash - runtimeInitialCash) > 5
+  ) {
+    warnings.push(
+      `state_starting_cash_mismatch: STATE_FILE startingCash=$${stateStartingCash.toFixed(2)} runtime INITIAL_CASH=$${runtimeInitialCash.toFixed(2)}`
+    );
+  }
+  if (warnings.length > 0 && Number((state?.data?.executionEvents || []).length || 0) > 0) {
+    warnings.push('possible_old_state_reuse_after_reset');
+  }
+  return {
+    declaredProfileUsd,
+    runtimeInitialCash,
+    stateStartingCash,
+    inferredBankrollUsd,
+    warnings,
+    summary: warnings.join(' | ') || null,
+  };
+}
+
+function extractStateFileProfileUsd(value) {
+  const base = path.basename(String(value || ''));
+  const match = base.match(/(?:burnin|state)[^0-9]{0,12}(\d{2,3})(?=\.json|[^0-9]|$)/i);
+  return match ? Number(match[1]) : null;
+}
+
+function buildPortfolioSummary(state, report, stateFileAnalysis = null) {
   const stateSummary = summarizeState(state);
   return {
     equity: firstFinite(report.equity, stateSummary.equity),
@@ -249,8 +304,22 @@ function buildPortfolioSummary(state, report) {
     gabagoolLastPlacementDecision: report.gabagoolLastPlacementDecision || '',
     paperOrdersPlacedLastHour: numberOrNull(report.paperOrdersPlacedLastHour),
     paperOrdersFilledLastHour: numberOrNull(report.paperOrdersFilledLastHour),
+    paperOrdersPlacedLast15m: numberOrNull(report.paperOrdersPlacedLast15m),
+    paperOrdersFilledLast15m: numberOrNull(report.paperOrdersFilledLast15m),
+    actionRateStatus: report.actionRateStatus || '',
+    actionRateReason: report.actionRateReason || '',
+    targetOrdersPer15m: numberOrNull(report.targetOrdersPer15m),
+    targetFillsPer15m: numberOrNull(report.targetFillsPer15m),
     probationAdmissionsLastHour: numberOrNull(report.probationAdmissionsLastHour),
     probationBlocksLastHour: numberOrNull(report.probationBlocksLastHour),
+    lossGuardConfiguredClosedLossUsd: numberOrNull(report.lossGuardConfiguredClosedLossUsd),
+    lossGuardCurrentClosedLossUsd: numberOrNull(report.lossGuardCurrentClosedLossUsd),
+    lossGuardCooldownMs: numberOrNull(report.lossGuardCooldownMs),
+    lossGuardCooldownRemainingMs: numberOrNull(report.lossGuardCooldownRemainingMs),
+    lossGuardRecoveryEligible: report.lossGuardRecoveryEligible,
+    lossGuardRecoveryActive: report.lossGuardRecoveryActive,
+    lossGuardRecoveryBlockedReason: report.lossGuardRecoveryBlockedReason || '',
+    lossGuardTriggerSource: report.lossGuardTriggerSource || '',
     topBlockReasonsLastHour: report.topBlockReasonsLastHour || '',
     whyTotalOrdersZeroLastHour: report.whyTotalOrdersZeroLastHour || '',
     strategyOrdersLastHour: report.strategyOrdersLastHour || '',
@@ -263,6 +332,8 @@ function buildPortfolioSummary(state, report) {
     stateExists: state.metadata.exists,
     stateFileSizeBytes: state.metadata.sizeBytes,
     stateFileModifiedAt: state.metadata.modifiedAt,
+    stateWarnings: stateFileAnalysis?.warnings || [],
+    stateWarningSummary: stateFileAnalysis?.summary || '',
   };
 }
 
@@ -451,6 +522,31 @@ function parseLatestPortfolioReport(lines) {
       continue;
     }
 
+    match = line.match(/Action Rate 15m:\s*status=([^\s]+)\s*ordersPlacedLast15m=(\d+)\s*fillsLast15m=(\d+)\s*targetOrdersPer15m=(\d+)\s*targetFillsPer15m=(\d+)\s*reason=(.*?)\s+paperActionBurnInActive=(true|false)/);
+    if (match) {
+      report.actionRateStatus = match[1];
+      report.paperOrdersPlacedLast15m = Number(match[2]);
+      report.paperOrdersFilledLast15m = Number(match[3]);
+      report.targetOrdersPer15m = Number(match[4]);
+      report.targetFillsPer15m = Number(match[5]);
+      report.actionRateReason = match[6];
+      report.paperActionBurnInActive = match[7] === 'true';
+      continue;
+    }
+
+    match = line.match(/Loss Guard:\s*configuredClosedLossUsd=\$([\d.-]+)\s*currentClosedLossUsd=\$([\d.-]+)\s*cooldownMs=([A-Z\d.-]+)\s*cooldownRemainingMs=([A-Z\d.-]+)\s*recoveryEligible=(true|false)\s*recoveryActive=(true|false)\s*recoveryBlockedReason=([^\s]+)\s*triggerSource=(.*)$/);
+    if (match) {
+      report.lossGuardConfiguredClosedLossUsd = Number(match[1]);
+      report.lossGuardCurrentClosedLossUsd = Number(match[2]);
+      report.lossGuardCooldownMs = match[3] === 'NA' ? null : Number(match[3]);
+      report.lossGuardCooldownRemainingMs = match[4] === 'NA' ? null : Number(match[4]);
+      report.lossGuardRecoveryEligible = match[5] === 'true';
+      report.lossGuardRecoveryActive = match[6] === 'true';
+      report.lossGuardRecoveryBlockedReason = match[7];
+      report.lossGuardTriggerSource = match[8];
+      continue;
+    }
+
     match = line.match(/Execution Health:.*?paperOrdersPlacedLastHour=(\d+).*?paperOrdersFilledLastHour=(\d+)/);
     if (match) {
       if (report.paperOrdersPlacedLastHour === null) {
@@ -546,8 +642,23 @@ function emptyReport() {
     gabagoolLastPlacementDecision: '',
     paperOrdersPlacedLastHour: null,
     paperOrdersFilledLastHour: null,
+    paperOrdersPlacedLast15m: null,
+    paperOrdersFilledLast15m: null,
+    actionRateStatus: '',
+    actionRateReason: '',
+    targetOrdersPer15m: null,
+    targetFillsPer15m: null,
+    paperActionBurnInActive: null,
     probationAdmissionsLastHour: null,
     probationBlocksLastHour: null,
+    lossGuardConfiguredClosedLossUsd: null,
+    lossGuardCurrentClosedLossUsd: null,
+    lossGuardCooldownMs: null,
+    lossGuardCooldownRemainingMs: null,
+    lossGuardRecoveryEligible: null,
+    lossGuardRecoveryActive: null,
+    lossGuardRecoveryBlockedReason: '',
+    lossGuardTriggerSource: '',
     topBlockReasonsLastHour: '',
     whyTotalOrdersZeroLastHour: '',
     strategyOrdersLastHour: '',
@@ -1000,9 +1111,25 @@ function renderHtml(status) {
     <h2>Paper Flow</h2>
     <div class="grid">
       ${metric('Orders Placed 1h', intVal(p.paperOrdersPlacedLastHour))}
+      ${metric('Orders Placed 15m', intVal(p.paperOrdersPlacedLast15m))}
+      ${metric('Fills 15m', intVal(p.paperOrdersFilledLast15m))}
+      ${metric('Action Rate', p.actionRateStatus || 'n/a')}
+      ${metric('Action Rate Reason', p.actionRateReason || 'n/a')}
       ${metric('Why Total Orders Zero', p.whyTotalOrdersZeroLastHour || 'n/a')}
       ${metric('Gabagool Exit Blocks', p.gabagoolExitBlocks || 'n/a')}
       ${metric('Gabagool Last Decision', p.gabagoolLastPlacementDecision || 'n/a')}
+    </div>
+  </section>
+  <section>
+    <h2>Loss Guard</h2>
+    <div class="grid">
+      ${metric('Configured Closed Loss', money(p.lossGuardConfiguredClosedLossUsd))}
+      ${metric('Current Closed Loss', money(p.lossGuardCurrentClosedLossUsd))}
+      ${metric('Cooldown Remaining Ms', intVal(p.lossGuardCooldownRemainingMs))}
+      ${metric('Recovery Eligible', boolVal(p.lossGuardRecoveryEligible))}
+      ${metric('Recovery Active', boolVal(p.lossGuardRecoveryActive))}
+      ${metric('Blocked Reason', p.lossGuardRecoveryBlockedReason || 'n/a')}
+      ${metric('Trigger Source', p.lossGuardTriggerSource || 'n/a')}
     </div>
   </section>
   <section>
@@ -1016,6 +1143,7 @@ function renderHtml(status) {
       ${metric('PM2 Process', 'pm_id=' + intVal(status.settings.pm2ProcessId) + ' name=' + escapeHtml(status.settings.pm2ProcessName))}
     </div>
     <p>${escapeHtml(status.stateFile.warning || p.stateMessage)}</p>
+    ${renderList(p.stateWarnings)}
   </section>
   <section>
     <h2>PM2</h2>
@@ -1234,6 +1362,11 @@ function intVal(value) {
   return Number.isFinite(n) ? String(Math.round(n)) : 'n/a';
 }
 
+function boolVal(value) {
+  if (value === undefined || value === null || value === '') return 'n/a';
+  return value === true ? 'true' : value === false ? 'false' : 'n/a';
+}
+
 function money(value) {
   const n = Number(value);
   return Number.isFinite(n) ? `$${n.toFixed(2)}` : 'n/a';
@@ -1299,6 +1432,7 @@ if (require.main === module) {
 
 module.exports = {
   collectStatus,
+  analyzeStateFileUsage,
   buildSettingsStatus,
   stateFileMetadata,
   readState,

@@ -35,6 +35,7 @@ function num(value, fallback) {
 }
 
 function loadEnvFile(filePath) {
+  if (!localEnvFileReadEnabled()) return;
   if (!fs.existsSync(filePath)) return;
   const raw = fs.readFileSync(filePath, 'utf8');
   for (const line of raw.split(/\r?\n/)) {
@@ -49,6 +50,15 @@ function loadEnvFile(filePath) {
     }
     if (!(key in process.env)) process.env[key] = val;
   }
+}
+
+function localEnvFileReadEnabled() {
+  const raw = String(
+    process.env.MM_SKIP_LOCAL_ENV_FILE ||
+    process.env.SKIP_LOCAL_ENV_FILE ||
+    ''
+  ).trim().toLowerCase();
+  return !['1', 'true', 'yes', 'on'].includes(raw);
 }
 
 function ensureFile(filePath) {
