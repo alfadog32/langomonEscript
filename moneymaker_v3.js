@@ -14178,9 +14178,27 @@ class BotEngine {
     }
   }
 
+  logAutoLiveCandidateSkip(signal, reason, extra = '') {
+    const now = Date.now();
+    if (!(this.autoLiveSkipLogThrottle instanceof Map)) this.autoLiveSkipLogThrottle = new Map();
+    const last = this.autoLiveSkipLogThrottle.get(reason) || 0;
+    if (now - last < 60_000) return;
+    this.autoLiveSkipLogThrottle.set(reason, now);
+    info(
+      `[AUTO-LIVE CANDIDATE SKIP] ${String(signal?.side || '').toUpperCase() || 'UNKNOWN'} ${shortId(signal?.tokenId) || 'unknown'} ` +
+      `reason=${reason}${extra ? ` ${extra}` : ''} [${signal?.strategy || 'UNKNOWN'}]`
+    );
+  }
+
   maybeWriteLiveCandidate(signal, asset, book) {
-    if (!this.config.autoLiveCandidatesEnabled) return false;
-    if (!signal || !asset || !book) return false;
+    if (!this.config.autoLiveCandidatesEnabled) {
+      this.logAutoLiveCandidateSkip(signal, 'disabled');
+      return false;
+    }
+    if (!signal || !asset || !book) {
+      this.logAutoLiveCandidateSkip(signal, 'missing_signal_asset_or_book');
+      return false;
+    }
 
     const strategy = String(signal.strategy || '');
     const allowed = new Set(this.config.autoLiveAllowedStrategies || []);
@@ -14190,15 +14208,50 @@ class BotEngine {
     const bookFresh = isBookComplete(book) && bookAgeMs <= this.config.autoLiveMaxBookAgeMs;
     const consensus = signal.metadata?.consensus || null;
 
-    if (blocked.has(strategy)) return false;
-    if (allowed.size > 0 && !allowed.has(strategy)) return false;
-    if (!signal.tokenId) return false;
-    if (!['BUY', 'SELL'].includes(side)) return false;
-    if (!Number.isFinite(signal.price) || signal.price <= 0 || signal.price >= 1) return false;
-    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) return false;
-    if (!Number.isFinite(signal.confidence) || signal.confidence < this.config.autoLiveMinConfidence) return false;
-    if (!bookFresh) return false;
-    if (this.config.enableConsensus && consensus?.authorized !== true) return false;
+    if (blocked.has(strategy)) {
+      this.logAutoLiveCandidateSkip(signal, 'strategy_blocked', `strategy=${strategy}`);
+      return false;
+    }
+    if (allowed.size > 0 && !allowed.has(strategy)) {
+      this.logAutoLiveCandidateSkip(signal, 'strategy_not_allowed', `strategy=${strategy}`);
+      return false;
+    }
+    if (!signal.tokenId) {
+      this.logAutoLiveCandidateSkip(signal, 'token_id_missing');
+      return false;
+    }
+    if (!['BUY', 'SELL'].includes(side)) {
+      this.logAutoLiveCandidateSkip(signal, 'invalid_side', `side=${side || 'unknown'}`);
+      return false;
+    }
+    if (!Number.isFinite(signal.price) || signal.price <= 0 || signal.price >= 1) {
+      this.logAutoLiveCandidateSkip(signal, 'invalid_price', `price=${cleanLogValue(signal.price)}`);
+      return false;
+    }
+    if (!Number.isFinite(signal.sizeUsd) || signal.sizeUsd <= 0) {
+      this.logAutoLiveCandidateSkip(signal, 'invalid_size_usd', `sizeUsd=${cleanLogValue(signal.sizeUsd)}`);
+      return false;
+    }
+    if (!Number.isFinite(signal.confidence) || signal.confidence < this.config.autoLiveMinConfidence) {
+      this.logAutoLiveCandidateSkip(
+        signal,
+        'confidence_below_min',
+        `confidence=${cleanLogValue(signal.confidence)} minConfidence=${this.config.autoLiveMinConfidence}`
+      );
+      return false;
+    }
+    if (!bookFresh) {
+      this.logAutoLiveCandidateSkip(
+        signal,
+        'book_not_fresh',
+        `bookAgeMs=${bookAgeMs} maxBookAgeMs=${this.config.autoLiveMaxBookAgeMs} complete=${isBookComplete(book)}`
+      );
+      return false;
+    }
+    if (this.config.enableConsensus && consensus?.authorized !== true) {
+      this.logAutoLiveCandidateSkip(signal, 'consensus_not_authorized');
+      return false;
+    }
 
     const ghostTotal = this.portfolio.ghostStats?.total || 0;
     const ghostFavorablePct = ghostTotal > 0
@@ -14210,12 +14263,20 @@ class BotEngine {
       this.config.autoLiveMinGhostFavorablePct > 0 &&
       ghostFavorablePct < this.config.autoLiveMinGhostFavorablePct
     ) {
+      this.logAutoLiveCandidateSkip(
+        signal,
+        'ghost_favorable_below_min',
+        `ghostFavorablePct=${ghostFavorablePct.toFixed(2)} min=${this.config.autoLiveMinGhostFavorablePct}`
+      );
       return false;
     }
 
     const key = `${signal.tokenId}:${side}:${strategy}`;
     const last = this.autoLiveCandidateLastWritten.get(key) || 0;
-    if (Date.now() - last < this.config.autoLiveCandidateCooldownMs) return false;
+    if (Date.now() - last < this.config.autoLiveCandidateCooldownMs) {
+      this.logAutoLiveCandidateSkip(signal, 'cooldown_active', `cooldownMs=${this.config.autoLiveCandidateCooldownMs}`);
+      return false;
+    }
     this.autoLiveCandidateLastWritten.set(key, Date.now());
 
     const candidateId = `moneymaker_${Date.now()}_${shortId(signal.tokenId).replace(/\W/g, '')}`;
