@@ -353,6 +353,9 @@ async function main() {
   const lastDecisionsReport = parseLastKeyValueLine(currentEngineLines, 'Last Decisions:');
   const gabagoolHealthReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Health:');
   const gabagoolExitBlocksReport = parseLastKeyValueLine(currentEngineLines, 'Gabagool Exit Blocks:');
+  const entryGuardReport = parseLastKeyValueLine(currentEngineLines, 'Entry Guard:');
+  const lossGuardReport = parseLastKeyValueLine(currentEngineLines, 'Loss Guard:');
+  const gabagoolLossGuardIdleReport = parseLastKeyValueLine(currentEngineLines, '[GABAGOOL IDLE] reason=gabagool_loss_guard');
   const settingsStatus = buildSettingsStatus(pm2);
   const state = readState(settingsStatus.runtime.STATE_FILE || settingsStatus.envFile.STATE_FILE || '');
   const stateFileAnalysis = analyzeStateFileUsage(state, settingsStatus, { equity });
@@ -468,6 +471,22 @@ async function main() {
     || gabagoolHealthReport?.values?.gabagoolPlacementBlockReasonLast
     || 'none'
   );
+  const gabagoolEntriesPaused = entryGuardReport?.values?.gabagoolEntriesPaused === true;
+  const gabagoolEntryPauseReason = String(entryGuardReport?.values?.gabagoolEntryPauseReason || 'none');
+  const gabagoolLossGuardActive = gabagoolEntriesPaused === true || gabagoolEntryPauseReason === 'gabagool_loss_guard';
+  const gabagoolClosedLossUsd = Number.isFinite(lossGuardReport?.values?.currentClosedLossUsd)
+    ? lossGuardReport.values.currentClosedLossUsd
+    : (Number.isFinite(gabagoolLossGuardIdleReport?.values?.closedLossUsd) ? gabagoolLossGuardIdleReport.values.closedLossUsd : null);
+  const gabagoolMaxClosedLossUsd = Number.isFinite(lossGuardReport?.values?.configuredClosedLossUsd)
+    ? lossGuardReport.values.configuredClosedLossUsd
+    : (Number.isFinite(gabagoolLossGuardIdleReport?.values?.maxClosedLossUsd) ? gabagoolLossGuardIdleReport.values.maxClosedLossUsd : null);
+  const gabagoolLossGuardCooldownRemainingMs = Number.isFinite(lossGuardReport?.values?.cooldownRemainingMs)
+    ? lossGuardReport.values.cooldownRemainingMs
+    : null;
+  const gabagoolLossGuardRecoveryActive = lossGuardReport?.values?.recoveryActive === true;
+  const gabagoolClosedLossOverLimit = Number.isFinite(gabagoolClosedLossUsd)
+    && Number.isFinite(gabagoolMaxClosedLossUsd)
+    && gabagoolClosedLossUsd > gabagoolMaxClosedLossUsd;
   const reportedPortfolioExposureUsd = Number.isFinite(exposureAuditReport?.values?.portfolioExposureUsd)
     ? exposureAuditReport.values.portfolioExposureUsd
     : totalExposureUsd;
@@ -568,6 +587,20 @@ async function main() {
   }
   if (fillProbabilityOverestimated) reasons.push('predicted fill probability overestimated; no-fill learning active');
   if (recentStarvationWarning) reasons.push('recent engine starvation warning detected');
+  if (gabagoolLossGuardActive) {
+    reasons.push(
+      `gabagool_loss_guard_active gabagoolEntriesPaused=${gabagoolEntriesPaused} ` +
+      `reason=${gabagoolEntryPauseReason} currentClosedLossUsd=${gabagoolClosedLossUsd ?? 'NA'} ` +
+      `maxClosedLossUsd=${gabagoolMaxClosedLossUsd ?? 'NA'} cooldownRemainingMs=${gabagoolLossGuardCooldownRemainingMs ?? 'NA'} ` +
+      `recoveryActive=${gabagoolLossGuardRecoveryActive} — do not arm live canary yet`
+    );
+  }
+  if (gabagoolClosedLossOverLimit) {
+    reasons.push(
+      `gabagool_closed_loss_over_limit currentClosedLossUsd=$${gabagoolClosedLossUsd} ` +
+      `exceeds maxClosedLossUsd=$${gabagoolMaxClosedLossUsd} — do not arm live canary yet`
+    );
+  }
 
   const liveConfig = readLiveConfig(ROOT);
   const safetyFlags = {
@@ -692,6 +725,16 @@ async function main() {
         recommendedFreshStateFile,
       },
       gabagoolDrawdownBreakdown: gabagoolDrawdownReport?.values || null,
+      gabagoolEntryGuard: {
+        entriesPaused: gabagoolEntriesPaused,
+        pauseReason: gabagoolEntryPauseReason,
+        lossGuardActive: gabagoolLossGuardActive,
+        currentClosedLossUsd: gabagoolClosedLossUsd,
+        maxClosedLossUsd: gabagoolMaxClosedLossUsd,
+        closedLossOverLimit: gabagoolClosedLossOverLimit,
+        cooldownRemainingMs: gabagoolLossGuardCooldownRemainingMs,
+        recoveryActive: gabagoolLossGuardRecoveryActive,
+      },
       stateProfile: {
         status: stateFileAnalysis.status,
         warnings: stateFileAnalysis.warnings,

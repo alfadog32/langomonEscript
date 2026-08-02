@@ -240,8 +240,15 @@ function inspectCrashLoops() {
       const uptimeMs = proc.pm2_env?.pm_uptime
         ? Math.max(0, Date.now() - proc.pm2_env.pm_uptime)
         : 0;
-      // Crash loop heuristic: many restarts in a short uptime window
-      const crashLoop = (restarts > 5 && uptimeMs < 300_000) || unstableRestarts > 3 || status === 'errored';
+      // Crash loop heuristic: require crash evidence — errored status, unstable
+      // (abnormal) restarts, or very rapid restart churn. A high lifetime restart
+      // count alone (e.g. after controlled `pm2 restart` for patching/arming) is
+      // not treated as a crash loop.
+      const rapidChurn = restarts > 5 && uptimeMs < 60_000;
+      const crashLoop = status === 'errored'
+        || unstableRestarts > 3
+        || (unstableRestarts > 0 && uptimeMs < 120_000)
+        || rapidChurn;
       processes[name] = { status, restarts, unstableRestarts, uptimeMs, crashLoop };
     }
     return { available: true, processes };
@@ -326,6 +333,27 @@ function runCycle() {
   // 6. burn_in_failed_by_drawdown
   if (burnInLifecycle.status === 'burn_in_failed_by_drawdown' || stateProfile.status === 'burn_in_failed_by_drawdown') {
     detections.push({ type: 'burn_in_failed_by_drawdown', detail: `reason=${burnInLifecycle.reason || 'unknown'}` });
+  }
+
+  // 6b. gabagool loss guard active / closed loss over limit
+  const gabagoolGuard = health.gabagoolEntryGuard || {};
+  const gabagoolEntriesPaused = gabagoolGuard.entriesPaused === true;
+  const gabagoolEntryPauseReason = String(gabagoolGuard.pauseReason || 'none');
+  const gabagoolClosedLossUsd = numberOrNull(gabagoolGuard.currentClosedLossUsd);
+  const gabagoolMaxClosedLossUsd = numberOrNull(gabagoolGuard.maxClosedLossUsd);
+  if (gabagoolGuard.lossGuardActive === true || gabagoolEntriesPaused || gabagoolEntryPauseReason === 'gabagool_loss_guard') {
+    detections.push({
+      type: 'gabagool_loss_guard',
+      detail: `gabagoolEntriesPaused=${gabagoolEntriesPaused} reason=${gabagoolEntryPauseReason} ` +
+        `currentClosedLossUsd=${gabagoolClosedLossUsd ?? 'NA'} maxClosedLossUsd=${gabagoolMaxClosedLossUsd ?? 'NA'} ` +
+        `cooldownRemainingMs=${gabagoolGuard.cooldownRemainingMs ?? 'NA'} recoveryActive=${gabagoolGuard.recoveryActive === true}`,
+    });
+  }
+  if (gabagoolClosedLossUsd !== null && gabagoolMaxClosedLossUsd !== null && gabagoolClosedLossUsd > gabagoolMaxClosedLossUsd) {
+    detections.push({
+      type: 'gabagool_closed_loss_over_limit',
+      detail: `currentClosedLossUsd=${gabagoolClosedLossUsd} > maxClosedLossUsd=${gabagoolMaxClosedLossUsd}`,
+    });
   }
 
   // 7. action_rate_below_target
@@ -413,6 +441,12 @@ function runCycle() {
       openOrders: numberOrNull(health.openOrders),
       candidateEvaluationsLastHour: numberOrNull(health.candidateEvaluationsLastHour),
       paperOrdersPlacedLastHour: numberOrNull(health.paperOrdersPlacedLastHour),
+      gabagoolEntriesPaused,
+      gabagoolEntryPauseReason,
+      gabagoolClosedLossUsd,
+      gabagoolMaxClosedLossUsd,
+      gabagoolLossGuardCooldownRemainingMs: numberOrNull(gabagoolGuard.cooldownRemainingMs),
+      gabagoolLossGuardRecoveryActive: gabagoolGuard.recoveryActive === true,
     },
     flags: flagInspection.flags,
     secrets,
@@ -450,6 +484,16 @@ function isProofCyclePassing(cycle) {
   const burnInStatus = cycle.metrics.burnInLifecycleStatus || '';
   if (burnInStatus === 'burn_in_failed_by_drawdown') {
     blockers.push('burn_in_failed_by_drawdown');
+  }
+
+  // gabagool loss guard must be clear before a live canary can be considered stable
+  if (cycle.metrics.gabagoolEntriesPaused === true || cycle.metrics.gabagoolEntryPauseReason === 'gabagool_loss_guard') {
+    blockers.push('gabagool_loss_guard_active (do not arm live canary yet)');
+  }
+  const gabagoolClosedLoss = cycle.metrics.gabagoolClosedLossUsd;
+  const gabagoolMaxClosedLoss = cycle.metrics.gabagoolMaxClosedLossUsd;
+  if (gabagoolClosedLoss !== null && gabagoolMaxClosedLoss !== null && gabagoolClosedLoss > gabagoolMaxClosedLoss) {
+    blockers.push(`gabagool_closed_loss_over_limit ${gabagoolClosedLoss} > ${gabagoolMaxClosedLoss}`);
   }
 
   // no runtime errors (crash loops)
@@ -624,6 +668,8 @@ function runSingleInspection() {
   console.log(`  burnInLifecycleStatus: ${cycle.metrics.burnInLifecycleStatus}`);
   console.log(`  stateProfileStatus: ${cycle.metrics.stateProfileStatus}`);
   console.log(`  openOrders: ${cycle.metrics.openOrders}`);
+  console.log(`  gabagoolEntriesPaused: ${cycle.metrics.gabagoolEntriesPaused} (reason=${cycle.metrics.gabagoolEntryPauseReason})`);
+  console.log(`  gabagoolClosedLossUsd: ${cycle.metrics.gabagoolClosedLossUsd} (max ${cycle.metrics.gabagoolMaxClosedLossUsd}, cooldownRemainingMs=${cycle.metrics.gabagoolLossGuardCooldownRemainingMs}, recoveryActive=${cycle.metrics.gabagoolLossGuardRecoveryActive})`);
 
   console.log('\nFlags:');
   for (const [key, info] of Object.entries(cycle.flags)) {
