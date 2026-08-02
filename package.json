@@ -25,6 +25,7 @@
     "live:readiness": "node scripts/live_readiness_report.js",
     "live:final-boss-selfcheck": "node scripts/live_final_boss_selfcheck.js",
     "live:stage5-router-refusal-selfcheck": "node scripts/live_stage5_router_refusal_selfcheck.js",
+    "live:stage5-canary-once": "bash scripts/stage5_live_canary_once.sh",
     "supervisor:prelive": "node scripts/pre_live_supervisor.js",
     "supervisor:prelive:proof": "node scripts/pre_live_supervisor.js proof",
     "safety:all": "npm run check && npm run engine:execution-quality-selfcheck && npm run research:liveness-selfcheck && npm run live:readiness",
