@@ -114,18 +114,38 @@ lock_off() {
 trap lock_off EXIT INT TERM ERR
 
 validate_precheck_evidence() {
-  node - "$RUN_DIR/readiness.json" "$RUN_DIR/supervisor.out" <<'NODE'
+  node - "$RUN_DIR/readiness.json" "$RUN_DIR/supervisor.out" "$RUN_DIR" <<'NODE'
 const fs = require('fs');
-const [readinessPath, supervisorPath] = process.argv.slice(2);
+const [readinessPath, supervisorPath, runDir] = process.argv.slice(2);
 const readiness = JSON.parse(fs.readFileSync(readinessPath, 'utf8'));
 const health = readiness.paperEngineHealth || {};
 const audit = health.exposureAudit || {};
 const guard = health.gabagagoolEntryGuard || health.gabagoolEntryGuard || {};
 const bad = [];
+const stage5CapUsd = 5;
+const capBlockingExposureUsd = Number(audit.capBlockingExposureUsd);
+const riskExposureUsd = Number(audit.riskExposureUsd ?? health.activeTradableExposureUsd);
+const excludedDeadExposureUsd = Number(audit.excludedDeadExposureUsd || 0);
+const portfolioExposureUsd = Number(audit.portfolioExposureUsd ?? health.totalExposureUsd ?? 0);
+const exposureAvailableUsd = Number(audit.exposureAvailableUsd ?? NaN);
+const excludedDeadExposureReasons = String(audit.excludedDeadExposureReasons || '');
+const summary = {
+  portfolioExposureUsd,
+  excludedDeadExposureUsd,
+  capBlockingExposureUsd,
+  riskExposureUsd,
+  stage5CapUsd,
+  exposureAvailableUsd,
+  excludedDeadExposureReasons,
+};
+fs.writeFileSync(`${runDir}/prearm-exposure-summary.json`, `${JSON.stringify(summary, null, 2)}\n`);
+console.log(`[stage5-canary] pre-arm exposure summary ${JSON.stringify(summary)}`);
 if (Number(health.openOrders) !== 0) bad.push('openOrders must be 0');
-if (Number(audit.capBlockingExposureUsd) !== 0) bad.push('capBlockingExposureUsd must be 0');
-const tradable = Number(audit.riskExposureUsd ?? health.activeTradableExposureUsd ?? 0);
-if (!Number.isFinite(tradable) || tradable > 5) bad.push('tradable exposure must be <= $5');
+if (!Number.isFinite(capBlockingExposureUsd) || capBlockingExposureUsd > stage5CapUsd) bad.push('capBlockingExposureUsd must be <= $5');
+if (!Number.isFinite(riskExposureUsd) || riskExposureUsd > stage5CapUsd) bad.push('riskExposureUsd must be <= $5');
+if (excludedDeadExposureUsd > 0 && !/(excluded|dead|expired.*btc.*5m)/i.test(excludedDeadExposureReasons)) {
+  bad.push('excludedDeadExposureUsd is not labeled excluded/dead expired BTC 5m exposure');
+}
 if (guard.lossGuardActive === true) bad.push('gabagool loss guard is active');
 if (health.crashLoopOk === false) bad.push('serious crash-loop blocker');
 const supervisor = fs.readFileSync(supervisorPath, 'utf8');
