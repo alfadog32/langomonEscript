@@ -16,6 +16,39 @@ BASELINE_VERIFIED=0
 ARMING_STARTED=0
 PM2_RESTARTED_FOR_ARM=0
 BASELINE_MISMATCHES=()
+RUN_MONITOR_BASELINES_CAPTURED=0
+RUN_MONITOR_END_BOUNDARY_CAPTURED=0
+RUN_STARTED_AT=''
+ARMED_AT=''
+RUN_MONITOR_ENDED_AT=''
+LOCKED_OFF_AT=''
+CANARY_MARKET_ID=''
+CANDIDATE_SEEN=0
+INTENT_SEEN=0
+ADAPTER_SUBMITTED=0
+ADAPTER_REFUSED=0
+PIPELINE_STALLED=0
+PROCESS_ERROR=0
+CANDIDATE_SEEN_SECONDS=0
+INTENT_SEEN_SECONDS=0
+TERMINAL_REASONS=()
+CANDIDATES_BEFORE=0 INTENTS_BEFORE=0 ROUTER_EVENTS_BEFORE=0 ADAPTER_EVENTS_BEFORE=0 EXECUTION_EVENTS_BEFORE=0
+ENGINE_OUT_LINES_BEFORE=0 ENGINE_ERROR_LINES_BEFORE=0 ROUTER_OUT_LINES_BEFORE=0 ROUTER_ERROR_LINES_BEFORE=0
+CANDIDATES_END=0 INTENTS_END=0 ROUTER_EVENTS_END=0 ADAPTER_EVENTS_END=0 EXECUTION_EVENTS_END=0
+ENGINE_OUT_LINES_END=0 ENGINE_ERROR_LINES_END=0 ROUTER_OUT_LINES_END=0 ROUTER_ERROR_LINES_END=0
+SAFE_BASELINE_RESTORED=false
+SAFE_BASELINE_MISMATCHES=()
+
+CANDIDATES_FILE="$ROOT/auto_live_candidates.ndjson"
+INTENTS_FILE="$ROOT/trade_intents.ndjson"
+# Defaults verified from live_intent_router.js and live_adapter_polymarket.js.
+ROUTER_EVENTS_FILE="$ROOT/live_intent_router_events.ndjson"
+ADAPTER_EVENTS_FILE="$ROOT/live_adapter_events.ndjson"
+EXECUTION_EVENTS_FILE="$ROOT/live_execution_events.ndjson"
+ENGINE_OUT_LOG='/home/lango/.pm2/logs/langomonEscript-out.log'
+ENGINE_ERROR_LOG='/home/lango/.pm2/logs/langomonEscript-error.log'
+ROUTER_OUT_LOG='/home/lango/.pm2/logs/liveIntentRouter-out.log'
+ROUTER_ERROR_LOG='/home/lango/.pm2/logs/liveIntentRouter-error.log'
 
 BASELINE_KEYS=(
   ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY
@@ -120,8 +153,104 @@ baseline_parser_selfcheck() {
   say 'baseline parser selfcheck: ok'
 }
 
+line_count() {
+  local file="$1"
+  [[ -f "$file" ]] && wc -l < "$file" || printf '0\n'
+}
+
+appended_lines() {
+  local file="$1" offset="$2"
+  [[ -f "$file" ]] && tail -n "+$((offset + 1))" "$file" || true
+}
+
+bounded_lines() {
+  local file="$1" start="$2" end="$3"
+  [[ -f "$file" && "$end" -gt "$start" ]] || return 0
+  sed -n "$((start + 1)),$end p" "$file"
+}
+
+capture_run_monitor_end_boundary() {
+  (( RUN_MONITOR_BASELINES_CAPTURED && ! RUN_MONITOR_END_BOUNDARY_CAPTURED )) || return 0
+  RUN_MONITOR_ENDED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  CANDIDATES_END="$(line_count "$CANDIDATES_FILE")"
+  INTENTS_END="$(line_count "$INTENTS_FILE")"
+  ROUTER_EVENTS_END="$(line_count "$ROUTER_EVENTS_FILE")"
+  ADAPTER_EVENTS_END="$(line_count "$ADAPTER_EVENTS_FILE")"
+  EXECUTION_EVENTS_END="$(line_count "$EXECUTION_EVENTS_FILE")"
+  ENGINE_OUT_LINES_END="$(line_count "$ENGINE_OUT_LOG")"
+  ENGINE_ERROR_LINES_END="$(line_count "$ENGINE_ERROR_LOG")"
+  ROUTER_OUT_LINES_END="$(line_count "$ROUTER_OUT_LOG")"
+  ROUTER_ERROR_LINES_END="$(line_count "$ROUTER_ERROR_LOG")"
+  RUN_MONITOR_END_BOUNDARY_CAPTURED=1
+  validate_run_monitor_end_boundary
+}
+
+add_terminal_reason_once() {
+  local reason="$1" existing
+  for existing in "${TERMINAL_REASONS[@]}"; do
+    [[ "$existing" == "$reason" ]] && return 0
+  done
+  TERMINAL_REASONS+=("$reason")
+}
+
+validate_run_monitor_end_boundary() {
+  if (( CANDIDATES_END < CANDIDATES_BEFORE || INTENTS_END < INTENTS_BEFORE || ROUTER_EVENTS_END < ROUTER_EVENTS_BEFORE || ADAPTER_EVENTS_END < ADAPTER_EVENTS_BEFORE || EXECUTION_EVENTS_END < EXECUTION_EVENTS_BEFORE || ENGINE_OUT_LINES_END < ENGINE_OUT_LINES_BEFORE || ENGINE_ERROR_LINES_END < ENGINE_ERROR_LINES_BEFORE || ROUTER_OUT_LINES_END < ROUTER_OUT_LINES_BEFORE || ROUTER_ERROR_LINES_END < ROUTER_ERROR_LINES_BEFORE )); then
+    PROCESS_ERROR=1
+    add_terminal_reason_once LOG_ROTATED_OR_TRUNCATED_AT_END_BOUNDARY
+  fi
+}
+
+nonnegative_delta() {
+  local start="$1" end="$2"
+  (( end >= start )) && printf '%s' "$((end - start))" || printf '0'
+}
+
+derive_run_result() {
+  if (( PROCESS_ERROR )); then printf 'PROCESS_ERROR';
+  elif (( ADAPTER_SUBMITTED )); then printf 'SUBMITTED';
+  elif (( ADAPTER_REFUSED )); then printf 'ADAPTER_REFUSED';
+  elif (( PIPELINE_STALLED )); then printf 'PIPELINE_STALLED';
+  elif (( INTENT_SEEN )); then printf 'INTENT_ONLY';
+  elif (( CANDIDATE_SEEN )); then printf 'CANDIDATE_ONLY';
+  else printf 'NO_CANDIDATE'; fi
+}
+
+run_summary_selfcheck() {
+  local saved_candidate="$CANDIDATE_SEEN" saved_intent="$INTENT_SEEN" saved_submitted="$ADAPTER_SUBMITTED"
+  local saved_refused="$ADAPTER_REFUSED" saved_stalled="$PIPELINE_STALLED" saved_error="$PROCESS_ERROR"
+  CANDIDATE_SEEN=0 INTENT_SEEN=0 ADAPTER_SUBMITTED=0 ADAPTER_REFUSED=0 PIPELINE_STALLED=0 PROCESS_ERROR=0
+  [[ "$(derive_run_result)" == NO_CANDIDATE ]] || die 'run summary selfcheck missed NO_CANDIDATE'
+  CANDIDATE_SEEN=1
+  [[ "$(derive_run_result)" == CANDIDATE_ONLY ]] || die 'run summary selfcheck missed CANDIDATE_ONLY'
+  INTENT_SEEN=1
+  [[ "$(derive_run_result)" == INTENT_ONLY ]] || die 'run summary selfcheck missed INTENT_ONLY'
+  INTENT_SEEN=0 PIPELINE_STALLED=1
+  [[ "$(derive_run_result)" == PIPELINE_STALLED ]] || die 'run summary selfcheck missed PIPELINE_STALLED'
+  PIPELINE_STALLED=0 INTENT_SEEN=1
+  ADAPTER_REFUSED=1
+  [[ "$(derive_run_result)" == ADAPTER_REFUSED ]] || die 'run summary selfcheck missed ADAPTER_REFUSED'
+  ADAPTER_REFUSED=0 ADAPTER_SUBMITTED=1
+  [[ "$(derive_run_result)" == SUBMITTED ]] || die 'run summary selfcheck missed SUBMITTED'
+  PROCESS_ERROR=1
+  [[ "$(derive_run_result)" == PROCESS_ERROR ]] || die 'run summary selfcheck missed PROCESS_ERROR'
+  CANDIDATE_SEEN="$saved_candidate" INTENT_SEEN="$saved_intent" ADAPTER_SUBMITTED="$saved_submitted"
+  ADAPTER_REFUSED="$saved_refused" PIPELINE_STALLED="$saved_stalled" PROCESS_ERROR="$saved_error"
+  CANDIDATES_BEFORE=5 INTENTS_BEFORE=5 ROUTER_EVENTS_BEFORE=5 ADAPTER_EVENTS_BEFORE=5 EXECUTION_EVENTS_BEFORE=5
+  ENGINE_OUT_LINES_BEFORE=5 ENGINE_ERROR_LINES_BEFORE=5 ROUTER_OUT_LINES_BEFORE=5 ROUTER_ERROR_LINES_BEFORE=5
+  CANDIDATES_END=5 INTENTS_END=4 ROUTER_EVENTS_END=5 ADAPTER_EVENTS_END=5 EXECUTION_EVENTS_END=5
+  ENGINE_OUT_LINES_END=5 ENGINE_ERROR_LINES_END=5 ROUTER_OUT_LINES_END=5 ROUTER_ERROR_LINES_END=5
+  PROCESS_ERROR=0 TERMINAL_REASONS=()
+  validate_run_monitor_end_boundary
+  [[ "$PROCESS_ERROR" == 1 && " ${TERMINAL_REASONS[*]} " == *' LOG_ROTATED_OR_TRUNCATED_AT_END_BOUNDARY '* ]] || die 'run summary selfcheck missed end-boundary truncation'
+  say 'run summary state-machine selfcheck: ok'
+}
+
 if [[ "${1:-}" == '--selfcheck-baseline' ]]; then
   baseline_parser_selfcheck
+  exit 0
+fi
+if [[ "${1:-}" == '--selfcheck-run-summary' ]]; then
+  run_summary_selfcheck
   exit 0
 fi
 
@@ -179,21 +308,51 @@ restore_safe_baseline_if_changed() {
   [[ "$before" != "$after" ]]
 }
 
+write_run_summary() {
+  (( RUN_MONITOR_BASELINES_CAPTURED && RUN_MONITOR_END_BOUNDARY_CAPTURED )) || return 0
+  local result candidate_delta intent_delta router_event_delta adapter_event_delta execution_event_delta
+  result="$(derive_run_result)"
+  candidate_delta="$(nonnegative_delta "$CANDIDATES_BEFORE" "$CANDIDATES_END")"
+  intent_delta="$(nonnegative_delta "$INTENTS_BEFORE" "$INTENTS_END")"
+  router_event_delta="$(nonnegative_delta "$ROUTER_EVENTS_BEFORE" "$ROUTER_EVENTS_END")"
+  adapter_event_delta="$(nonnegative_delta "$ADAPTER_EVENTS_BEFORE" "$ADAPTER_EVENTS_END")"
+  execution_event_delta="$(nonnegative_delta "$EXECUTION_EVENTS_BEFORE" "$EXECUTION_EVENTS_END")"
+  node - "$RUN_DIR/run-summary.json" "$RUN_STARTED_AT" "$ARMED_AT" "$RUN_MONITOR_ENDED_AT" "$LOCKED_OFF_AT" "$CANARY_MARKET_ID" \
+    "$candidate_delta" "$intent_delta" "$router_event_delta" "$adapter_event_delta" "$execution_event_delta" \
+    "$CANDIDATE_SEEN" "$INTENT_SEEN" "$ADAPTER_SUBMITTED" "$ADAPTER_REFUSED" "$SAFE_BASELINE_RESTORED" \
+    "${SAFE_BASELINE_MISMATCHES[*]:-}" "$result" "${TERMINAL_REASONS[*]:-}" <<'NODE'
+const fs = require('fs');
+const [file, runStartedAt, armedAt, runMonitorEndedAt, lockedOffAt, marketId, candidateDelta, intentDelta, routerEventDelta, adapterEventDelta, executionEventDelta, candidateSeen, intentSeen, adapterSubmitted, adapterRefused, safeBaselineRestored, baselineMismatches, result, reasons] = process.argv.slice(2);
+fs.writeFileSync(file, `${JSON.stringify({
+  runStartedAt, armedAt, runMonitorEndedAt, lockedOffAt, marketId,
+  candidateDelta: Number(candidateDelta), intentDelta: Number(intentDelta), routerEventDelta: Number(routerEventDelta),
+  adapterEventDelta: Number(adapterEventDelta), executionEventDelta: Number(executionEventDelta),
+  candidateSeen: candidateSeen === '1', intentSeen: intentSeen === '1', adapterSubmitted: adapterSubmitted === '1',
+  adapterRefused: adapterRefused === '1', safeBaselineRestored: safeBaselineRestored === 'true',
+  safeBaselineMismatches: baselineMismatches ? baselineMismatches.split(' ') : [], terminalReasons: reasons ? reasons.split(' ') : [], result,
+}, null, 2)}\n`);
+NODE
+}
+
 post_lockoff_audit() {
-  say 'safe flag grep:'
-  grep -E '^(ENABLE_LIVE_TRADING|LIVE_AUTO_EXECUTE|LIVE_KILL_SWITCH|LIVE_DRY_RUN_ONLY|LIVE_SUBMIT_CONFIRM|LIVE_FINAL_BOSS_READY|LIVE_TRADING_STAGE|LIVE_CANARY_MARKET_ID|MAX_LIVE_ORDER_USD|MAX_LIVE_TOTAL_EXPOSURE_USD|LIVE_DAILY_MAX_LOSS_USD|LIVE_MAX_ORDERS_PER_HOUR|AUTO_LIVE_MIN_CONFIDENCE|LIVE_ROUTER_MODE)=' "$ENV_FILE" || true
-  npm run supervisor:prelive || true
-  say 'recent candidates:'; tail -n 20 auto_live_candidates.ndjson 2>/dev/null || true
-  say 'recent intents:'; tail -n 20 trade_intents.ndjson 2>/dev/null || true
-  say 'recent filtered PM2 logs:'
-  grep -Ein 'AUTO-LIVE CANDIDATE|LIVE-ADAPTER|LIVE INTENT|submitted|refused|AUTO_EXECUTE_DISABLED|LIVE_CANARY_MARKET|MAX_LIVE|ORDER_PLACED|Live Safety|gabagool_loss_guard' \
-    /home/lango/.pm2/logs/langomonEscript* /home/lango/.pm2/logs/liveIntentRouter* /home/lango/.pm2/logs/telegramApprovalBot* 2>/dev/null | tail -n 300 || true
+  (( RUN_MONITOR_BASELINES_CAPTURED && RUN_MONITOR_END_BOUNDARY_CAPTURED )) || return 0
+  say 'armed-window candidates:'; bounded_lines "$CANDIDATES_FILE" "$CANDIDATES_BEFORE" "$CANDIDATES_END"
+  say 'armed-window intents:'; bounded_lines "$INTENTS_FILE" "$INTENTS_BEFORE" "$INTENTS_END"
+  say 'armed-window router events:'; bounded_lines "$ROUTER_EVENTS_FILE" "$ROUTER_EVENTS_BEFORE" "$ROUTER_EVENTS_END"
+  say 'armed-window adapter events:'; bounded_lines "$ADAPTER_EVENTS_FILE" "$ADAPTER_EVENTS_BEFORE" "$ADAPTER_EVENTS_END"
+  say 'armed-window execution events:'; bounded_lines "$EXECUTION_EVENTS_FILE" "$EXECUTION_EVENTS_BEFORE" "$EXECUTION_EVENTS_END"
+  say 'run-scoped engine/router logs:'
+  { bounded_lines "$ENGINE_OUT_LOG" "$ENGINE_OUT_LINES_BEFORE" "$ENGINE_OUT_LINES_END"; bounded_lines "$ENGINE_ERROR_LOG" "$ENGINE_ERROR_LINES_BEFORE" "$ENGINE_ERROR_LINES_END"; bounded_lines "$ROUTER_OUT_LOG" "$ROUTER_OUT_LINES_BEFORE" "$ROUTER_OUT_LINES_END"; bounded_lines "$ROUTER_ERROR_LOG" "$ROUTER_ERROR_LINES_BEFORE" "$ROUTER_ERROR_LINES_END"; } | tail -n 300 || true
+  say 'run summary:'; [[ -f "$RUN_DIR/run-summary.json" ]] && cat "$RUN_DIR/run-summary.json" || true
 }
 
 lock_off() {
   local rc="$?"
   [[ "$LOCKED" == 1 ]] && return "$rc"
   LOCKED=1
+  # Freeze the armed-window boundary before changing .env or restarting PM2.
+  capture_run_monitor_end_boundary
+  (( PROCESS_ERROR )) && rc=1
   set +e
   if (( ARMING_STARTED )); then
     say 'arming began: restoring the Stage 2 safe baseline and restarting PM2'
@@ -211,6 +370,18 @@ lock_off() {
       say '.env already matched the safe baseline; PM2 restart skipped'
     fi
   fi
+  if baseline_diagnostics; then
+    SAFE_BASELINE_RESTORED=true
+    SAFE_BASELINE_MISMATCHES=()
+    say 'safe baseline verification: PASS'
+  else
+    SAFE_BASELINE_RESTORED=false
+    SAFE_BASELINE_MISMATCHES=("${BASELINE_MISMATCHES[@]}")
+    say "ERROR: SAFE BASELINE VERIFICATION FAILED: ${SAFE_BASELINE_MISMATCHES[*]}" >&2
+    rc=1
+  fi
+  LOCKED_OFF_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  write_run_summary
   post_lockoff_audit
   return "$rc"
 }
@@ -285,8 +456,22 @@ npm run supervisor:prelive > "$RUN_DIR/supervisor.out" 2>&1 || true
 validate_precheck_evidence
 
 CANARY_MARKET_ID="$(read_fresh_target)"
+# Capture the complete run boundary before any Stage 5 mutation or PM2 restart.
+RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CANDIDATES_BEFORE="$(line_count "$CANDIDATES_FILE")"
+INTENTS_BEFORE="$(line_count "$INTENTS_FILE")"
+ROUTER_EVENTS_BEFORE="$(line_count "$ROUTER_EVENTS_FILE")"
+ADAPTER_EVENTS_BEFORE="$(line_count "$ADAPTER_EVENTS_FILE")"
+EXECUTION_EVENTS_BEFORE="$(line_count "$EXECUTION_EVENTS_FILE")"
+ENGINE_OUT_LINES_BEFORE="$(line_count "$ENGINE_OUT_LOG")"
+ENGINE_ERROR_LINES_BEFORE="$(line_count "$ENGINE_ERROR_LOG")"
+ROUTER_OUT_LINES_BEFORE="$(line_count "$ROUTER_OUT_LOG")"
+ROUTER_ERROR_LINES_BEFORE="$(line_count "$ROUTER_ERROR_LOG")"
+RUN_MONITOR_BASELINES_CAPTURED=1
+say "captured pre-arm run boundary at $RUN_STARTED_AT for marketId=$CANARY_MARKET_ID"
 say "arming Stage 5 single-market canary for marketId=$CANARY_MARKET_ID"
 ARMING_STARTED=1
+ARMED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 set_env_value ENABLE_LIVE_TRADING true
 set_env_value LIVE_AUTO_EXECUTE true
 set_env_value LIVE_KILL_SWITCH false
@@ -304,20 +489,50 @@ set_env_value LIVE_ROUTER_MODE submit
 PM2_RESTARTED_FOR_ARM=1
 restart_canary_processes
 
-CANDIDATES_BEFORE="$(wc -l < auto_live_candidates.ndjson 2>/dev/null || printf 0)"
-INTENTS_BEFORE="$(wc -l < trade_intents.ndjson 2>/dev/null || printf 0)"
-ENGINE_LINES_BEFORE="$(wc -l < /home/lango/.pm2/logs/langomonEscript-out.log 2>/dev/null || printf 0)"
-ROUTER_LINES_BEFORE="$(wc -l < /home/lango/.pm2/logs/liveIntentRouter-out.log 2>/dev/null || printf 0)"
-ERROR_LINES_BEFORE="$(wc -l < /home/lango/.pm2/logs/langomonEscript-error.log 2>/dev/null || printf 0)"
-ROUTER_ERROR_LINES_BEFORE="$(wc -l < /home/lango/.pm2/logs/liveIntentRouter-error.log 2>/dev/null || printf 0)"
-
 deadline=$((SECONDS + WINDOW_SECONDS))
 while (( SECONDS < deadline )); do
-  if (( $(wc -l < auto_live_candidates.ndjson 2>/dev/null || printf 0) > CANDIDATES_BEFORE )); then die 'new auto_live_candidates.ndjson line'; fi
-  if (( $(wc -l < trade_intents.ndjson 2>/dev/null || printf 0) > INTENTS_BEFORE )); then die 'new trade_intents.ndjson line'; fi
-  if { tail -n "+$((ENGINE_LINES_BEFORE + 1))" /home/lango/.pm2/logs/langomonEscript-out.log 2>/dev/null; tail -n "+$((ROUTER_LINES_BEFORE + 1))" /home/lango/.pm2/logs/liveIntentRouter-out.log 2>/dev/null; } | grep -Eqi 'LIVE-ADAPTER.*(submit|refus)|submitted|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED'; then die 'live adapter/router stop condition'; fi
-  if { tail -n "+$((ERROR_LINES_BEFORE + 1))" /home/lango/.pm2/logs/langomonEscript-error.log 2>/dev/null; tail -n "+$((ROUTER_ERROR_LINES_BEFORE + 1))" /home/lango/.pm2/logs/liveIntentRouter-error.log 2>/dev/null; } | grep -Eqi '.+'; then die 'process error detected'; fi
+  if (( $(line_count "$CANDIDATES_FILE") < CANDIDATES_BEFORE || $(line_count "$INTENTS_FILE") < INTENTS_BEFORE || $(line_count "$ROUTER_EVENTS_FILE") < ROUTER_EVENTS_BEFORE || $(line_count "$ADAPTER_EVENTS_FILE") < ADAPTER_EVENTS_BEFORE || $(line_count "$EXECUTION_EVENTS_FILE") < EXECUTION_EVENTS_BEFORE || $(line_count "$ENGINE_OUT_LOG") < ENGINE_OUT_LINES_BEFORE || $(line_count "$ENGINE_ERROR_LOG") < ENGINE_ERROR_LINES_BEFORE || $(line_count "$ROUTER_OUT_LOG") < ROUTER_OUT_LINES_BEFORE || $(line_count "$ROUTER_ERROR_LOG") < ROUTER_ERROR_LINES_BEFORE )); then
+    PROCESS_ERROR=1; TERMINAL_REASONS+=(LOG_ROTATED_OR_TRUNCATED); die 'LOG_ROTATED_OR_TRUNCATED: monitored source became shorter than its pre-arm offset'
+  fi
+  candidate_delta=$(( $(line_count "$CANDIDATES_FILE") - CANDIDATES_BEFORE ))
+  intent_delta=$(( $(line_count "$INTENTS_FILE") - INTENTS_BEFORE ))
+  if (( candidate_delta > 0 && ! CANDIDATE_SEEN )); then
+    CANDIDATE_SEEN=1; CANDIDATE_SEEN_SECONDS=$SECONDS; say 'candidate observed; awaiting intent or terminal adapter result'
+  fi
+  if (( intent_delta > 0 && ! INTENT_SEEN )); then
+    INTENT_SEEN=1; INTENT_SEEN_SECONDS=$SECONDS; say 'intent observed; awaiting terminal adapter result'
+  fi
+  router_events_new="$(appended_lines "$ROUTER_EVENTS_FILE" "$ROUTER_EVENTS_BEFORE")"
+  adapter_events_new="$(appended_lines "$ADAPTER_EVENTS_FILE" "$ADAPTER_EVENTS_BEFORE")"
+  execution_events_new="$(appended_lines "$EXECUTION_EVENTS_FILE" "$EXECUTION_EVENTS_BEFORE")"
+  tagged_live_logs="$(printf '%s\n%s\n' \
+    "$(appended_lines "$ENGINE_OUT_LOG" "$ENGINE_OUT_LINES_BEFORE")" \
+    "$(appended_lines "$ROUTER_OUT_LOG" "$ROUTER_OUT_LINES_BEFORE")")"
+  structured_events="$(printf '%s\n%s\n%s\n' \
+    "$router_events_new" \
+    "$adapter_events_new" \
+    "$execution_events_new")"
+  if grep -Eqi 'LIVE_ROUTER_ADAPTER_RESULT.*"adapter_decision"[[:space:]]*:[[:space:]]*"SUBMITTED"|LIVE_ORDER_SUBMITTED.*"decision"[[:space:]]*:[[:space:]]*"SUBMITTED"' <<< "$structured_events" || grep -Eqi '(LIVE-ADAPTER|\[live-router\]).*(submitted|LIVE_ORDER_SUBMITTED)' <<< "$tagged_live_logs"; then
+    ADAPTER_SUBMITTED=1; TERMINAL_REASONS+=(STRUCTURED_OR_TAGGED_LIVE_SUBMISSION); die 'terminal adapter submission observed'
+  fi
+  if grep -Eqi 'LIVE_ROUTER_ADAPTER_RESULT.*"adapter_decision"[[:space:]]*:[[:space:]]*"REFUSED"|LIVE_(SUBMISSION|ADAPTER_EVALUATION)_REFUSED|LIVE_ADAPTER_EVALUATION.*"decision"[[:space:]]*:[[:space:]]*"REFUSED"|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED|AUTO_EXECUTE_DISABLED' <<< "$structured_events" || grep -Eqi '(LIVE-ADAPTER|\[live-router\]).*(refus|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED|AUTO_EXECUTE_DISABLED)' <<< "$tagged_live_logs"; then
+    ADAPTER_REFUSED=1; TERMINAL_REASONS+=(STRUCTURED_OR_TAGGED_LIVE_REFUSAL); die 'terminal adapter refusal or safety block observed'
+  fi
+  if { appended_lines "$ENGINE_ERROR_LOG" "$ENGINE_ERROR_LINES_BEFORE"; appended_lines "$ROUTER_ERROR_LOG" "$ROUTER_ERROR_LINES_BEFORE"; } | grep -Eqi '.+'; then
+    PROCESS_ERROR=1; TERMINAL_REASONS+=(PROCESS_ERROR); die 'process error detected'
+  fi
+  if (( CANDIDATE_SEEN && ! INTENT_SEEN && SECONDS - CANDIDATE_SEEN_SECONDS >= 20 )); then
+    PIPELINE_STALLED=1; TERMINAL_REASONS+=(PIPELINE_STALLED_AFTER_CANDIDATE); die 'PIPELINE_STALLED: candidate did not reach intent or terminal adapter result within 20 seconds'
+  fi
+  if (( INTENT_SEEN && SECONDS - INTENT_SEEN_SECONDS >= 20 )); then
+    PIPELINE_STALLED=1; TERMINAL_REASONS+=(PIPELINE_STALLED_AFTER_INTENT); die 'PIPELINE_STALLED: intent did not reach terminal adapter result within 20 seconds'
+  fi
   sleep 2
 done
 
-say "completed bounded ${WINDOW_SECONDS}-second armed window without a stop condition"
+if (( CANDIDATE_SEEN )); then
+  TERMINAL_REASONS+=(WINDOW_EXPIRED_WITH_PIPELINE_ACTIVITY)
+else
+  TERMINAL_REASONS+=(NO_CANDIDATE)
+fi
+say "completed bounded ${WINDOW_SECONDS}-second armed window with result=$(derive_run_result)"
