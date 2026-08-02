@@ -12,44 +12,118 @@ RUN_DIR="$ROOT/runtime_backups/stage5_live_canary_$(date -u +%Y%m%dT%H%M%SZ)_$$"
 BACKUP_FILE="$RUN_DIR/.env.before_stage5_canary"
 WINDOW_SECONDS=180
 LOCKED=0
+BASELINE_VERIFIED=0
+ARMING_STARTED=0
+PM2_RESTARTED_FOR_ARM=0
+BASELINE_MISMATCHES=()
+
+BASELINE_KEYS=(
+  ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY
+  LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID
+  MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD
+  LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE LIVE_ROUTER_MODE
+)
+BASELINE_EXPECTED=(
+  false false true true false false 2 '' 1 1 1 1 0.67 dry-run
+)
 
 mkdir -p "$RUN_DIR"
 
 say() { printf '[stage5-canary] %s\n' "$*"; }
 die() { say "ERROR: $*" >&2; exit 1; }
 
-env_value() {
+matching_assignment_count() {
+  local key="$1"
+  awk -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" { count += 1 }
+    END { print count + 0 }
+  ' "$ENV_FILE"
+}
+
+first_assignment_raw_value() {
   local key="$1"
   awk -v key="$key" '
     $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-      sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print; exit
+      sub(/^[^=]*=/, ""); print; exit
     }
   ' "$ENV_FILE"
 }
 
-require_env_value() {
-  local key="$1" expected="$2" actual
-  actual="$(env_value "$key")"
-  [[ "$actual" == "$expected" ]] || return 1
+trim_value() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+baseline_diagnostics() {
+  local i key expected count raw trimmed problem
+  BASELINE_MISMATCHES=()
+  if [[ ! -f "$ENV_FILE" ]]; then
+    say "baseline .env is missing: $ENV_FILE"
+    BASELINE_MISMATCHES+=(.env_missing)
+    return 1
+  fi
+  for i in "${!BASELINE_KEYS[@]}"; do
+    key="${BASELINE_KEYS[$i]}"
+    expected="${BASELINE_EXPECTED[$i]}"
+    count="$(matching_assignment_count "$key")"
+    raw="$(first_assignment_raw_value "$key")"
+    trimmed="$(trim_value "$raw")"
+    problem='ok'
+    if [[ "$count" == 0 ]]; then
+      problem='missing'
+    elif [[ "$count" != 1 ]]; then
+      problem='duplicate'
+    elif [[ "$raw" == '"'* || "$raw" == "'"* ]]; then
+      problem='quoted'
+    elif [[ "$raw" != "$trimmed" ]]; then
+      problem='whitespace-different'
+    elif [[ "$trimmed" != "$expected" ]]; then
+      problem='incorrect'
+    fi
+    printf '[stage5-canary] baseline key=%s expected=%q actual=%q assignments=%s status=%s\n' \
+      "$key" "$expected" "$raw" "$count" "$problem"
+    [[ "$problem" == ok ]] || BASELINE_MISMATCHES+=("$key:$problem")
+  done
+  ((${#BASELINE_MISMATCHES[@]} == 0))
 }
 
 require_safe_baseline() {
-  [[ -f "$ENV_FILE" ]] || die 'LOCK LIVE OFF FIRST'
-  require_env_value ENABLE_LIVE_TRADING false &&
-  require_env_value LIVE_AUTO_EXECUTE false &&
-  require_env_value LIVE_KILL_SWITCH true &&
-  require_env_value LIVE_DRY_RUN_ONLY true &&
-  require_env_value LIVE_SUBMIT_CONFIRM false &&
-  require_env_value LIVE_FINAL_BOSS_READY false &&
-  require_env_value LIVE_TRADING_STAGE 2 &&
-  require_env_value LIVE_CANARY_MARKET_ID '' &&
-  require_env_value MAX_LIVE_ORDER_USD 1 &&
-  require_env_value MAX_LIVE_TOTAL_EXPOSURE_USD 1 &&
-  require_env_value LIVE_DAILY_MAX_LOSS_USD 1 &&
-  require_env_value LIVE_MAX_ORDERS_PER_HOUR 1 &&
-  require_env_value AUTO_LIVE_MIN_CONFIDENCE 0.67 &&
-  require_env_value LIVE_ROUTER_MODE dry-run || die 'LOCK LIVE OFF FIRST'
+  if ! baseline_diagnostics; then
+    die "LOCK LIVE OFF FIRST: baseline mismatches: ${BASELINE_MISMATCHES[*]}"
+  fi
+  BASELINE_VERIFIED=1
 }
+
+baseline_parser_selfcheck() {
+  local fixture previous_env
+  fixture="$(mktemp /tmp/stage5-baseline-selfcheck.XXXXXX)"
+  previous_env="$ENV_FILE"
+  printf '%s\n' \
+    'ENABLE_LIVE_TRADING=false' 'ENABLE_LIVE_TRADING=false' \
+    'LIVE_AUTO_EXECUTE=false' 'LIVE_KILL_SWITCH=true' 'LIVE_DRY_RUN_ONLY=true' \
+    'LIVE_SUBMIT_CONFIRM=false' 'LIVE_FINAL_BOSS_READY=false' 'LIVE_TRADING_STAGE=2' \
+    'LIVE_CANARY_MARKET_ID=' 'MAX_LIVE_ORDER_USD=1' 'MAX_LIVE_TOTAL_EXPOSURE_USD=1' \
+    'LIVE_DAILY_MAX_LOSS_USD=1' 'LIVE_MAX_ORDERS_PER_HOUR=1' \
+    'AUTO_LIVE_MIN_CONFIDENCE=0.67' 'LIVE_ROUTER_MODE="dry-run"' > "$fixture"
+  ENV_FILE="$fixture"
+  if baseline_diagnostics; then
+    rm -f "$fixture"
+    ENV_FILE="$previous_env"
+    die 'baseline parser selfcheck expected duplicate/quoted values to fail'
+  fi
+  [[ " ${BASELINE_MISMATCHES[*]} " == *' ENABLE_LIVE_TRADING:duplicate '* ]] || die 'baseline parser selfcheck missed duplicate'
+  [[ " ${BASELINE_MISMATCHES[*]} " == *' LIVE_ROUTER_MODE:quoted '* ]] || die 'baseline parser selfcheck missed quoted value'
+  rm -f "$fixture"
+  ENV_FILE="$previous_env"
+  say 'baseline parser selfcheck: ok'
+}
+
+if [[ "${1:-}" == '--selfcheck-baseline' ]]; then
+  baseline_parser_selfcheck
+  exit 0
+fi
 
 set_env_value() {
   local key="$1" value="$2" tmp="$ENV_FILE.stage5-canary.$$.tmp"
@@ -89,6 +163,22 @@ restart_canary_processes() {
   pm2 restart telegramApprovalBot --update-env
 }
 
+env_checksum() {
+  if [[ -f "$ENV_FILE" ]]; then
+    cksum "$ENV_FILE"
+  else
+    printf 'MISSING\n'
+  fi
+}
+
+restore_safe_baseline_if_changed() {
+  local before after
+  before="$(env_checksum)"
+  set_safe_stage2_baseline
+  after="$(env_checksum)"
+  [[ "$before" != "$after" ]]
+}
+
 post_lockoff_audit() {
   say 'safe flag grep:'
   grep -E '^(ENABLE_LIVE_TRADING|LIVE_AUTO_EXECUTE|LIVE_KILL_SWITCH|LIVE_DRY_RUN_ONLY|LIVE_SUBMIT_CONFIRM|LIVE_FINAL_BOSS_READY|LIVE_TRADING_STAGE|LIVE_CANARY_MARKET_ID|MAX_LIVE_ORDER_USD|MAX_LIVE_TOTAL_EXPOSURE_USD|LIVE_DAILY_MAX_LOSS_USD|LIVE_MAX_ORDERS_PER_HOUR|AUTO_LIVE_MIN_CONFIDENCE|LIVE_ROUTER_MODE)=' "$ENV_FILE" || true
@@ -104,10 +194,23 @@ lock_off() {
   local rc="$?"
   [[ "$LOCKED" == 1 ]] && return "$rc"
   LOCKED=1
-  say 'locking off and restoring the Stage 2 safe baseline'
   set +e
-  [[ -f "$ENV_FILE" ]] && set_safe_stage2_baseline
-  restart_canary_processes
+  if (( ARMING_STARTED )); then
+    say 'arming began: restoring the Stage 2 safe baseline and restarting PM2'
+    (( PM2_RESTARTED_FOR_ARM )) && say 'PM2 had already been restarted for the armed configuration'
+    restore_safe_baseline_if_changed
+    restart_canary_processes
+  elif (( BASELINE_VERIFIED )); then
+    say 'pre-arm failure: baseline was verified; leaving .env and PM2 unchanged'
+  else
+    say 'baseline was not verified: restoring the Stage 2 safe baseline only if changed'
+    if restore_safe_baseline_if_changed; then
+      say '.env changed during safe-baseline restoration; restarting PM2'
+      restart_canary_processes
+    else
+      say '.env already matched the safe baseline; PM2 restart skipped'
+    fi
+  fi
   post_lockoff_audit
   return "$rc"
 }
@@ -183,6 +286,7 @@ validate_precheck_evidence
 
 CANARY_MARKET_ID="$(read_fresh_target)"
 say "arming Stage 5 single-market canary for marketId=$CANARY_MARKET_ID"
+ARMING_STARTED=1
 set_env_value ENABLE_LIVE_TRADING true
 set_env_value LIVE_AUTO_EXECUTE true
 set_env_value LIVE_KILL_SWITCH false
@@ -197,6 +301,7 @@ set_env_value LIVE_DAILY_MAX_LOSS_USD 5
 set_env_value LIVE_MAX_ORDERS_PER_HOUR 1
 set_env_value AUTO_LIVE_MIN_CONFIDENCE 0.47
 set_env_value LIVE_ROUTER_MODE submit
+PM2_RESTARTED_FOR_ARM=1
 restart_canary_processes
 
 CANDIDATES_BEFORE="$(wc -l < auto_live_candidates.ndjson 2>/dev/null || printf 0)"
