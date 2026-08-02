@@ -91,12 +91,12 @@ restart_canary_processes() {
 
 post_lockoff_audit() {
   say 'safe flag grep:'
-  rg -n '^(ENABLE_LIVE_TRADING|LIVE_AUTO_EXECUTE|LIVE_KILL_SWITCH|LIVE_DRY_RUN_ONLY|LIVE_SUBMIT_CONFIRM|LIVE_FINAL_BOSS_READY|LIVE_TRADING_STAGE|LIVE_CANARY_MARKET_ID|MAX_LIVE_ORDER_USD|MAX_LIVE_TOTAL_EXPOSURE_USD|LIVE_DAILY_MAX_LOSS_USD|LIVE_MAX_ORDERS_PER_HOUR|AUTO_LIVE_MIN_CONFIDENCE|LIVE_ROUTER_MODE)=' "$ENV_FILE" || true
+  grep -E '^(ENABLE_LIVE_TRADING|LIVE_AUTO_EXECUTE|LIVE_KILL_SWITCH|LIVE_DRY_RUN_ONLY|LIVE_SUBMIT_CONFIRM|LIVE_FINAL_BOSS_READY|LIVE_TRADING_STAGE|LIVE_CANARY_MARKET_ID|MAX_LIVE_ORDER_USD|MAX_LIVE_TOTAL_EXPOSURE_USD|LIVE_DAILY_MAX_LOSS_USD|LIVE_MAX_ORDERS_PER_HOUR|AUTO_LIVE_MIN_CONFIDENCE|LIVE_ROUTER_MODE)=' "$ENV_FILE" || true
   npm run supervisor:prelive || true
   say 'recent candidates:'; tail -n 20 auto_live_candidates.ndjson 2>/dev/null || true
   say 'recent intents:'; tail -n 20 trade_intents.ndjson 2>/dev/null || true
   say 'recent filtered PM2 logs:'
-  rg -n -i 'AUTO-LIVE CANDIDATE|LIVE-ADAPTER|LIVE INTENT|submitted|refused|AUTO_EXECUTE_DISABLED|LIVE_CANARY_MARKET|MAX_LIVE|ORDER_PLACED|Live Safety|gabagool_loss_guard' \
+  grep -Ein 'AUTO-LIVE CANDIDATE|LIVE-ADAPTER|LIVE INTENT|submitted|refused|AUTO_EXECUTE_DISABLED|LIVE_CANARY_MARKET|MAX_LIVE|ORDER_PLACED|Live Safety|gabagool_loss_guard' \
     /home/lango/.pm2/logs/langomonEscript* /home/lango/.pm2/logs/liveIntentRouter* /home/lango/.pm2/logs/telegramApprovalBot* 2>/dev/null | tail -n 300 || true
 }
 
@@ -155,7 +155,7 @@ say "saved pre-arm .env backup at $BACKUP_FILE"
 npm run check
 npm run live:stage5-router-refusal-selfcheck
 npm run live:final-boss-selfcheck | tee "$RUN_DIR/final-boss.out"
-rg -qx 'live_final_boss_selfcheck: ok' "$RUN_DIR/final-boss.out" || die 'final-boss selfcheck did not pass'
+grep -qx 'live_final_boss_selfcheck: ok' "$RUN_DIR/final-boss.out" || die 'final-boss selfcheck did not pass'
 npm run live:readiness | tee "$RUN_DIR/readiness.raw" || true
 awk '/^[[:space:]]*\{/{printing=1} printing{print}' "$RUN_DIR/readiness.raw" > "$RUN_DIR/readiness.json"
 npm run supervisor:prelive > "$RUN_DIR/supervisor.out" 2>&1 || true
@@ -190,8 +190,8 @@ deadline=$((SECONDS + WINDOW_SECONDS))
 while (( SECONDS < deadline )); do
   if (( $(wc -l < auto_live_candidates.ndjson 2>/dev/null || printf 0) > CANDIDATES_BEFORE )); then die 'new auto_live_candidates.ndjson line'; fi
   if (( $(wc -l < trade_intents.ndjson 2>/dev/null || printf 0) > INTENTS_BEFORE )); then die 'new trade_intents.ndjson line'; fi
-  if { tail -n "+$((ENGINE_LINES_BEFORE + 1))" /home/lango/.pm2/logs/langomonEscript-out.log 2>/dev/null; tail -n "+$((ROUTER_LINES_BEFORE + 1))" /home/lango/.pm2/logs/liveIntentRouter-out.log 2>/dev/null; } | rg -qi 'LIVE-ADAPTER.*(submit|refus)|submitted|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED'; then die 'live adapter/router stop condition'; fi
-  if { tail -n "+$((ERROR_LINES_BEFORE + 1))" /home/lango/.pm2/logs/langomonEscript-error.log 2>/dev/null; tail -n "+$((ROUTER_ERROR_LINES_BEFORE + 1))" /home/lango/.pm2/logs/liveIntentRouter-error.log 2>/dev/null; } | rg -qi '.+'; then die 'process error detected'; fi
+  if { tail -n "+$((ENGINE_LINES_BEFORE + 1))" /home/lango/.pm2/logs/langomonEscript-out.log 2>/dev/null; tail -n "+$((ROUTER_LINES_BEFORE + 1))" /home/lango/.pm2/logs/liveIntentRouter-out.log 2>/dev/null; } | grep -Eqi 'LIVE-ADAPTER.*(submit|refus)|submitted|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED'; then die 'live adapter/router stop condition'; fi
+  if { tail -n "+$((ERROR_LINES_BEFORE + 1))" /home/lango/.pm2/logs/langomonEscript-error.log 2>/dev/null; tail -n "+$((ROUTER_ERROR_LINES_BEFORE + 1))" /home/lango/.pm2/logs/liveIntentRouter-error.log 2>/dev/null; } | grep -Eqi '.+'; then die 'process error detected'; fi
   sleep 2
 done
 
