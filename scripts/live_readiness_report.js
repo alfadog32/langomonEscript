@@ -10,6 +10,8 @@ const {
   probeHostReachable,
   probeRpcReachable,
   secretFileStatus,
+  resolvePolymarketFunderAddress,
+  resolvePolymarketBuilderCode,
   REQUIRED_LIVE_SECRET_ENV,
   REQUIRED_FUNDER_ENV,
 } = require('../live_adapter_polymarket');
@@ -56,6 +58,13 @@ function localEnvFileReadEnabled() {
 
 function normalizeBaseUrl(value) {
   return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function maskValue(value, head = 6, tail = 4) {
+  const s = String(value || '').trim();
+  if (!s) return null;
+  if (s.length <= head + tail + 3) return s;
+  return `${s.slice(0, head)}...${s.slice(-tail)}`;
 }
 
 function dashboardHealthCommand() {
@@ -588,9 +597,11 @@ async function main() {
   // -----------------------------
   const secrets = secretFileStatus(liveConfig);
   const missingSecretEnvNames = REQUIRED_LIVE_SECRET_ENV.filter((name) => !process.env[name]);
-  const funderEnvDetected = REQUIRED_FUNDER_ENV.find((name) => process.env[name]) || null;
+  const funderResolution = resolvePolymarketFunderAddress(process.env);
+  const funderEnvDetected = funderResolution.source;
   const signatureTypeRaw = process.env.POLYMARKET_SIGNATURE_TYPE;
   const signatureType = signatureTypeRaw ? Number(signatureTypeRaw) : null;
+  const builderCodeResolution = resolvePolymarketBuilderCode(process.env);
   const polygonRpcUrl = process.env.POLYMARKET_RPC_URL || process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
 
   const clobProbe = await probeHostReachable(liveConfig.clobHost, { healthPath: '/', timeoutMs: 3000 });
@@ -610,6 +621,15 @@ async function main() {
   }
   if (signatureType !== 3) {
     reasons.push(`POLYMARKET_SIGNATURE_TYPE expected 3, got ${signatureTypeRaw || 'unset'}`);
+  }
+  if (signatureType === 3 && funderResolution.errors.length > 0) {
+    reasons.push(`type-3 funder invalid: ${funderResolution.errors.join(',')}`);
+  }
+  if (signatureType === 3 && funderResolution.warnings.includes('TYPE_3_PROXY_IGNORED')) {
+    reasons.push('type-3 proxy wallet differs from deposit/funder and must not override it');
+  }
+  if (!builderCodeResolution.valid) {
+    reasons.push(`POLY_BUILDER_CODE invalid: ${builderCodeResolution.errors.join(',')}`);
   }
   if (!clobProbe.reachable) reasons.push(`CLOB host unreachable (${clobProbe.error})`);
   if (!rpcProbe.reachable) reasons.push(`Polygon RPC unreachable (${rpcProbe.error})`);
@@ -714,9 +734,14 @@ async function main() {
       missingSecretEnvNames,
       acceptedFunderEnvNames: REQUIRED_FUNDER_ENV,
       funderEnvDetected,
+      funderAddressMasked: maskValue(funderResolution.funderAddress),
+      funderWarnings: funderResolution.warnings,
+      funderErrors: funderResolution.errors,
       signatureTypeEnvName: 'POLYMARKET_SIGNATURE_TYPE',
       signatureTypePresent: signatureTypeRaw !== undefined,
       signatureTypeIsThree: signatureType === 3,
+      builderCodePresent: builderCodeResolution.present,
+      builderCodeLooksValid: builderCodeResolution.valid,
       polygonRpcConfigured: Boolean(polygonRpcUrl),
       clobHost: liveConfig.clobHost,
       clobReachable: clobProbe.reachable,

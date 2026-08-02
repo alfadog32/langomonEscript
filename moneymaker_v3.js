@@ -3047,6 +3047,18 @@ class PaperPortfolio {
     this.resetInMemoryState('constructor_boot');
   }
 
+  resolvedStateFilePath() {
+    return path.resolve(process.cwd(), String(this.config.stateFile || 'moneymaker_v3_state.json'));
+  }
+
+  pendingBurnInResetStateFilePath() {
+    return `${this.resolvedStateFilePath()}.burnin-reset-pending.json`;
+  }
+
+  stateBackupDirPath() {
+    return path.join(path.dirname(this.resolvedStateFilePath()), 'state_backups');
+  }
+
   recommendedFreshBurnInStateFile(explicitProfileUsd = null) {
     return deriveBurnInStateBasename(this.config, explicitProfileUsd);
   }
@@ -3095,6 +3107,8 @@ class PaperPortfolio {
       paperFills: 0,
     };
     this.burnInState = this.createBurnInState(reason, now);
+    this.paperTokenTradeability = new Map();
+    this.lastStateSaveSkipLog = { key: '', ts: 0 };
   }
 
   markBurnInFailedByDrawdown({
@@ -3141,13 +3155,135 @@ class PaperPortfolio {
     };
   }
 
+  writeJsonFileAtomic(filePath, data) {
+    const resolved = path.resolve(process.cwd(), String(filePath || ''));
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    const tempPath = path.join(
+      path.dirname(resolved),
+      `.${path.basename(resolved)}.tmp-${process.pid}-${Date.now()}`
+    );
+    fs.writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+    fs.renameSync(tempPath, resolved);
+    return resolved;
+  }
+
+  readJsonFileSafe(filePath) {
+    const resolved = path.resolve(process.cwd(), String(filePath || ''));
+    if (!resolved || !fs.existsSync(resolved)) return null;
+    try {
+      const raw = fs.readFileSync(resolved, 'utf8');
+      const data = JSON.parse(raw);
+      return data && typeof data === 'object' ? data : null;
+    } catch (e) {
+      warn(`State read failed for ${resolved}: ${e.message}`);
+      return null;
+    }
+  }
+
+  burnInResetEpochMs(state = null) {
+    const burnInState = state && typeof state === 'object' ? state.burnInState : this.burnInState;
+    const parsed = Date.parse(String(burnInState?.lastResetAt || ''));
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  persistedStateSummary(data = null) {
+    const source = data && typeof data === 'object' ? data : this.buildPersistedState();
+    const positions = source.positions && typeof source.positions === 'object' ? source.positions : {};
+    const costBasis = source.costBasis && typeof source.costBasis === 'object' ? source.costBasis : {};
+    const latestMarks = source.latestMarks && typeof source.latestMarks === 'object' ? source.latestMarks : {};
+    const openOrders = source.openOrders && typeof source.openOrders === 'object' ? source.openOrders : {};
+    let positionKeys = 0;
+    let totalExposureUsd = 0;
+    for (const [tokenId, rawQty] of Object.entries(positions)) {
+      const qty = Number(rawQty);
+      if (!(qty > 0)) continue;
+      positionKeys += 1;
+      const mark = Number(latestMarks[tokenId]);
+      const cost = Number(costBasis[tokenId]);
+      const px = Number.isFinite(mark) && mark > 0
+        ? mark
+        : (Number.isFinite(cost) && cost > 0 ? cost : 0);
+      totalExposureUsd += qty * px;
+    }
+    return {
+      positionKeys,
+      totalExposureUsd: Number(totalExposureUsd.toFixed(6)),
+      openOrdersCount: Object.keys(openOrders).length,
+      activePaperOrdersCount: Object.keys(openOrders).length,
+      fillsCount: Array.isArray(source.fills) ? source.fills.length : 0,
+      executionEventsCount: Array.isArray(source.executionEvents) ? source.executionEvents.length : 0,
+      latestMarksCount: Object.keys(latestMarks).length,
+      positionMarketsCount: source.positionMarkets && typeof source.positionMarkets === 'object'
+        ? Object.keys(source.positionMarkets).length
+        : 0,
+      cash: Number(source.cash || 0),
+      startingCash: Number(source.startingCash || 0),
+      lifecycleStatus: String(source.burnInState?.lifecycleStatus || ''),
+      lastResetAt: String(source.burnInState?.lastResetAt || ''),
+    };
+  }
+
+  backupExistingStateFile(reason = 'burnin_reset', now = Date.now()) {
+    const stateFile = this.resolvedStateFilePath();
+    if (!fs.existsSync(stateFile)) return null;
+    const stat = fs.statSync(stateFile);
+    if (!(stat.size > 0)) return null;
+    const backupDir = this.stateBackupDirPath();
+    fs.mkdirSync(backupDir, { recursive: true });
+    const ext = path.extname(stateFile) || '.json';
+    const base = path.basename(stateFile, ext);
+    const timestamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    const backupPath = path.join(backupDir, `${base}.${reason}.${timestamp}${ext}`);
+    fs.copyFileSync(stateFile, backupPath);
+    return backupPath;
+  }
+
+  readPersistedStateFile() {
+    return this.readJsonFileSafe(this.resolvedStateFilePath());
+  }
+
+  readPendingBurnInResetStateFile() {
+    const filePath = this.pendingBurnInResetStateFilePath();
+    const data = this.readJsonFileSafe(filePath);
+    if (!data) return null;
+    return { filePath, data };
+  }
+
+  clearPendingBurnInResetStateFile() {
+    const filePath = this.pendingBurnInResetStateFilePath();
+    if (!fs.existsSync(filePath)) return false;
+    fs.unlinkSync(filePath);
+    return true;
+  }
+
+  shouldSkipStateSaveForNewerReset(nextData = null) {
+    const currentState = this.readPersistedStateFile();
+    if (!currentState) return { skip: false };
+    const currentResetMs = this.burnInResetEpochMs(currentState);
+    const nextResetMs = this.burnInResetEpochMs(nextData);
+    if (!(currentResetMs > 0) || !(nextResetMs > 0) || currentResetMs <= nextResetMs) {
+      return { skip: false };
+    }
+    return {
+      skip: true,
+      currentResetMs,
+      nextResetMs,
+      currentSummary: this.persistedStateSummary(currentState),
+      nextSummary: this.persistedStateSummary(nextData),
+    };
+  }
+
   writeFreshBurnInStateFile(reason = 'paper_burnin_reset_mode') {
     const now = Date.now();
+    const backupPath = this.backupExistingStateFile('before_burnin_reset', now);
     this.resetInMemoryState(reason, now);
     const data = this.buildPersistedState();
-    fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
+    this.writeJsonFileAtomic(this.resolvedStateFilePath(), data);
+    this.writeJsonFileAtomic(this.pendingBurnInResetStateFilePath(), data);
     return {
       stateFile: this.config.stateFile,
+      backupPath,
+      pendingResetStateFile: this.pendingBurnInResetStateFilePath(),
       initialCash: Number(this.config.initialCash || 0),
       lifecycleStatus: data.burnInState.lifecycleStatus,
       recommendedFreshStateFile: data.burnInState.recommendedFreshStateFile,
@@ -4889,9 +5025,76 @@ class PaperPortfolio {
 
     try {
       const data = this.buildPersistedState();
-      fs.writeFileSync(this.config.stateFile, JSON.stringify(data, null, 2));
+      const skip = this.shouldSkipStateSaveForNewerReset(data);
+      if (skip.skip) {
+        const key = `${skip.currentResetMs}:${skip.nextResetMs}`;
+        const now = Date.now();
+        if (this.lastStateSaveSkipLog.key !== key || (now - Number(this.lastStateSaveSkipLog.ts || 0)) >= 30_000) {
+          this.lastStateSaveSkipLog = { key, ts: now };
+          warn(
+            `[STATE SAVE SKIPPED] reason=newer_burnin_reset_on_disk stateFile=${path.basename(this.resolvedStateFilePath())} ` +
+            `onDiskResetAt=${new Date(skip.currentResetMs).toISOString()} inMemoryResetAt=${new Date(skip.nextResetMs).toISOString()} ` +
+            `onDiskPositionKeys=${skip.currentSummary?.positionKeys || 0} inMemoryPositionKeys=${skip.nextSummary?.positionKeys || 0} ` +
+            `onDiskExposureUsd=${fmtMoney(skip.currentSummary?.totalExposureUsd || 0)} ` +
+            `inMemoryExposureUsd=${fmtMoney(skip.nextSummary?.totalExposureUsd || 0)}`
+          );
+        }
+        return { ok: false, skipped: true, reason: 'newer_burnin_reset_on_disk' };
+      }
+      this.writeJsonFileAtomic(this.resolvedStateFilePath(), data);
+      if (fs.existsSync(this.pendingBurnInResetStateFilePath())) {
+        this.clearPendingBurnInResetStateFile();
+      }
+      return { ok: true, skipped: false };
     } catch (e) {
       warn(`State save failed: ${e.message}`);
+      return { ok: false, skipped: false, error: e.message };
+    }
+  }
+
+  hydratePersistedState(data = {}) {
+    this.cash = Number.isFinite(Number(data.cash)) ? Number(data.cash) : this.cash;
+    this.startingCash = Number.isFinite(Number(data.startingCash)) ? Number(data.startingCash) : this.startingCash;
+    this.peakEquity = Number.isFinite(Number(data.peakEquity)) ? Number(data.peakEquity) : this.peakEquity;
+    this.closedPnl = Number.isFinite(Number(data.closedPnl)) ? Number(data.closedPnl) : this.closedPnl;
+    this.deadExposureCashReserveOutstandingUsd = Number.isFinite(Number(data.deadExposureCashReserveOutstandingUsd))
+      ? Number(data.deadExposureCashReserveOutstandingUsd)
+      : this.deadExposureCashReserveOutstandingUsd;
+    this.deadExposureCashReserveCreditsUsd = Number.isFinite(Number(data.deadExposureCashReserveCreditsUsd))
+      ? Number(data.deadExposureCashReserveCreditsUsd)
+      : this.deadExposureCashReserveCreditsUsd;
+    this.deadExposureCashReserveRepaymentsUsd = Number.isFinite(Number(data.deadExposureCashReserveRepaymentsUsd))
+      ? Number(data.deadExposureCashReserveRepaymentsUsd)
+      : this.deadExposureCashReserveRepaymentsUsd;
+
+    this.positions = new Map(Object.entries(data.positions || {}).map(([k, v]) => [k, Number(v)]));
+    this.positionMarkets = new Map(Object.entries(data.positionMarkets || {}).map(([k, v]) => [k, String(v)]));
+    this.costBasis = new Map(Object.entries(data.costBasis || {}).map(([k, v]) => [k, Number(v)]));
+    this.latestMarks = new Map(Object.entries(data.latestMarks || {}).map(([k, v]) => [k, Number(v)]));
+    this.openOrders = new Map(Object.entries(data.openOrders || {}).map(([k, v]) => [k, v]));
+    this.strategyPnl = new Map(Object.entries(data.strategyPnl || {}).map(([k, v]) => [k, Number(v)]));
+    this.ghostStats = data.ghostStats || this.ghostStats;
+    this.fills = Array.isArray(data.fills) ? data.fills : [];
+    this.executionTotals = {
+      ...this.executionTotals,
+      ...(data.executionTotals || {}),
+    };
+    this.executionEvents = Array.isArray(data.executionEvents) ? data.executionEvents : [];
+    this.burnInState = data.burnInState && typeof data.burnInState === 'object'
+      ? {
+        ...this.createBurnInState('restored_state'),
+        ...data.burnInState,
+        stateFile: path.basename(String(this.config.stateFile || '')),
+        recommendedFreshStateFile: data.burnInState.recommendedFreshStateFile || this.recommendedFreshBurnInStateFile(),
+        resetModeApplied: this.config.paperBurnInResetMode === true,
+      }
+      : this.createBurnInState('restored_state');
+    for (const fill of this.fills) {
+      const tokenId = String(fill?.tokenId || '');
+      const marketId = String(fill?.marketId || '');
+      if (tokenId && marketId && !this.positionMarkets.has(tokenId)) {
+        this.positionMarkets.set(tokenId, marketId);
+      }
     }
   }
 
@@ -4910,51 +5113,27 @@ class PaperPortfolio {
         );
         return;
       }
-      if (!fs.existsSync(this.config.stateFile)) return;
+      let data = null;
+      const pendingResetState = this.readPendingBurnInResetStateFile();
+      if (pendingResetState?.data) {
+        data = pendingResetState.data;
+        this.writeJsonFileAtomic(this.resolvedStateFilePath(), data);
+        this.clearPendingBurnInResetStateFile();
+        info(
+          `[BURN-IN RESET PENDING APPLIED] stateFile=${path.basename(this.resolvedStateFilePath())} ` +
+          `pendingResetStateFile=${path.basename(pendingResetState.filePath)} ` +
+          `lifecycleStatus=${cleanLogValue(data?.burnInState?.lifecycleStatus)} ` +
+          `lastResetAt=${cleanLogValue(data?.burnInState?.lastResetAt)}`
+        );
+      } else {
+        data = this.readPersistedStateFile();
+      }
+      if (!data) return;
 
-      const data = JSON.parse(fs.readFileSync(this.config.stateFile, 'utf8'));
+      this.hydratePersistedState(data);
 
-      this.cash = Number.isFinite(Number(data.cash)) ? Number(data.cash) : this.cash;
-      this.startingCash = Number.isFinite(Number(data.startingCash)) ? Number(data.startingCash) : this.startingCash;
-      this.peakEquity = Number.isFinite(Number(data.peakEquity)) ? Number(data.peakEquity) : this.peakEquity;
-      this.closedPnl = Number.isFinite(Number(data.closedPnl)) ? Number(data.closedPnl) : this.closedPnl;
-      this.deadExposureCashReserveOutstandingUsd = Number.isFinite(Number(data.deadExposureCashReserveOutstandingUsd))
-        ? Number(data.deadExposureCashReserveOutstandingUsd)
-        : this.deadExposureCashReserveOutstandingUsd;
-      this.deadExposureCashReserveCreditsUsd = Number.isFinite(Number(data.deadExposureCashReserveCreditsUsd))
-        ? Number(data.deadExposureCashReserveCreditsUsd)
-        : this.deadExposureCashReserveCreditsUsd;
-      this.deadExposureCashReserveRepaymentsUsd = Number.isFinite(Number(data.deadExposureCashReserveRepaymentsUsd))
-        ? Number(data.deadExposureCashReserveRepaymentsUsd)
-        : this.deadExposureCashReserveRepaymentsUsd;
-
-      this.positions = new Map(Object.entries(data.positions || {}).map(([k, v]) => [k, Number(v)]));
-      this.positionMarkets = new Map(Object.entries(data.positionMarkets || {}).map(([k, v]) => [k, String(v)]));
-      this.costBasis = new Map(Object.entries(data.costBasis || {}).map(([k, v]) => [k, Number(v)]));
-      this.latestMarks = new Map(Object.entries(data.latestMarks || {}).map(([k, v]) => [k, Number(v)]));
-      this.strategyPnl = new Map(Object.entries(data.strategyPnl || {}).map(([k, v]) => [k, Number(v)]));
-      this.ghostStats = data.ghostStats || this.ghostStats;
-      this.fills = Array.isArray(data.fills) ? data.fills : [];
-      this.executionTotals = {
-        ...this.executionTotals,
-        ...(data.executionTotals || {}),
-      };
-      this.executionEvents = Array.isArray(data.executionEvents) ? data.executionEvents : [];
-      this.burnInState = data.burnInState && typeof data.burnInState === 'object'
-        ? {
-          ...this.createBurnInState('restored_state'),
-          ...data.burnInState,
-          stateFile: path.basename(String(this.config.stateFile || '')),
-          recommendedFreshStateFile: data.burnInState.recommendedFreshStateFile || this.recommendedFreshBurnInStateFile(),
-          resetModeApplied: this.config.paperBurnInResetMode === true,
-        }
-        : this.createBurnInState('restored_state');
-      for (const fill of this.fills) {
-        const tokenId = String(fill?.tokenId || '');
-        const marketId = String(fill?.marketId || '');
-        if (tokenId && marketId && !this.positionMarkets.has(tokenId)) {
-          this.positionMarkets.set(tokenId, marketId);
-        }
+      if (!this.burnInState?.lifecycleStatus) {
+        this.burnInState = this.createBurnInState('restored_state');
       }
 
       info(`Loaded state from ${this.config.stateFile}. Equity: $${this.equity().toFixed(2)}`);
@@ -5004,6 +5183,7 @@ class RiskEngine {
     this.lastBlockReason = null;
     this.lastBlockDetails = null;
     this.lastBtcBucketFullLog = new Map();
+    this.lastExpiredExposureExcludedLog = new Map();
   }
 
   minSignalEdgeForSignal(signal) {
@@ -5024,12 +5204,32 @@ class RiskEngine {
     }, context, now);
   }
 
+  logExpiredPaperExposureExcluded({ tokenId, marketSlug, valueUsd, tradeabilityStatus, cleanupState }) {
+    const exposureUsd = Number(valueUsd || 0);
+    if (!(exposureUsd > 0)) return;
+    const slug = String(marketSlug || 'unknown');
+    const key = `${String(tokenId || '')}:${slug}`;
+    const now = Date.now();
+    const lastLoggedAt = this.lastExpiredExposureExcludedLog.get(key) || 0;
+    if (now - lastLoggedAt < 5 * 60_000) return;
+    this.lastExpiredExposureExcludedLog.set(key, now);
+    info(
+      `[GABAGOOL PAPER EXPIRED EXPOSURE EXCLUDED] token=${shortId(tokenId)} ` +
+      `marketSlug=${slug} valueUsd=${fmtMoney(exposureUsd)} ` +
+      `tradeability=${tradeabilityStatus || 'unknown'} ` +
+      `secondsIntoWindow=${cleanLogValue(cleanupState?.secondsIntoWindow)} ` +
+      `lastEvidenceAgeMs=${cleanLogValue(cleanupState?.lastEvidenceAgeMs)}`
+    );
+  }
+
   classifyExposureBuckets({
     positionEntries = [],
     btcOracleTokenIds = new Set(),
+    btcOraclePositionContextByToken = new Map(),
     tradeability = new Map(),
     minOrderUsd = Math.max(0.01, Number(this.config.minOrderUsd || 0)),
     now = Date.now(),
+    logExpiredExclusions = false,
   } = {}) {
     const totals = {
       activeTradableExposureUsd: 0,
@@ -5076,9 +5276,22 @@ class RiskEngine {
       const isBtcOraclePosition = btcOracleTokenIds.has(tokenId);
       const tokenTradeability = tradeability.get(tokenId) || null;
       const tradeabilityStatus = String(tokenTradeability?.status || '');
-      const context = isBtcOraclePosition
-        ? this.gabagoolPositionContext(tokenId, entry?.marketId)
+      const ledgerContext = isBtcOraclePosition
+        ? (btcOraclePositionContextByToken.get(tokenId) || null)
         : null;
+      let context = isBtcOraclePosition
+        ? this.gabagoolPositionContext(tokenId, ledgerContext?.marketId || entry?.marketId)
+        : null;
+      if (context && ledgerContext?.marketSlug) {
+        const fallbackSlugSource = !context.marketSlug || ['position_market_id', 'token_fallback', 'unknown'].includes(String(context.marketSlugSource || ''));
+        if (fallbackSlugSource) {
+          context = {
+            ...context,
+            marketSlug: String(ledgerContext.marketSlug),
+            marketSlugSource: 'strategy_ledger',
+          };
+        }
+      }
       const cleanupState = isBtcOraclePosition
         ? this.gabagoolExposureCleanupState(context, now)
         : null;
@@ -5153,6 +5366,15 @@ class RiskEngine {
           excludedDeadReason,
           Number(excludedDeadReasonExposure.get(excludedDeadReason) || 0) + valueUsd
         );
+        if (logExpiredExclusions === true && excludedDeadReason === 'expired_btc_5m_window') {
+          this.logExpiredPaperExposureExcluded({
+            tokenId,
+            marketSlug: context?.marketSlug || ledgerContext?.marketSlug || entry?.marketId || null,
+            valueUsd,
+            tradeabilityStatus,
+            cleanupState,
+          });
+        }
       }
     }
 
@@ -5194,6 +5416,20 @@ class RiskEngine {
         ? btcOracleLedger.perTokenExposure.map((entry) => String(entry?.tokenId || '')).filter(Boolean)
         : []
     );
+    const btcOraclePositionContextByToken = new Map(
+      Array.isArray(btcOracleLedger.perTokenExposure)
+        ? btcOracleLedger.perTokenExposure
+          .map((entry) => ([
+            String(entry?.tokenId || ''),
+            {
+              tokenId: String(entry?.tokenId || ''),
+              marketId: String(entry?.marketId || ''),
+              marketSlug: String(entry?.marketSlug || ''),
+            },
+          ]))
+          .filter(([tokenId]) => Boolean(tokenId))
+        : []
+    );
     const positionEntries = this.portfolio.positionExposureEntries(markPrices);
     const tradeability = this.portfolio.paperTokenTradeability instanceof Map
       ? this.portfolio.paperTokenTradeability
@@ -5202,9 +5438,11 @@ class RiskEngine {
     const bucketSummary = this.classifyExposureBuckets({
       positionEntries,
       btcOracleTokenIds,
+      btcOraclePositionContextByToken,
       tradeability,
       minOrderUsd,
       now,
+      logExpiredExclusions: this.config.enableLiveTrading !== true,
     });
     const paperEntryExposureExclusionActive = this.config.enableLiveTrading !== true;
     const paperEntryExposureExclusionUsd = paperEntryExposureExclusionActive
@@ -5215,7 +5453,10 @@ class RiskEngine {
       : 0;
     const paperEntryStandardBucketExposureExclusionUsd = 0;
     const rawTotalExposureUsd = Number(portfolioExposure.totalExposureUsd || 0);
-    const riskTotalExposureUsd = Math.max(0, rawTotalExposureUsd - paperEntryExposureExclusionUsd);
+    const riskTotalExposureUsd = Math.max(
+      0,
+      Number(bucketSummary.capBlockingPositionExposureUsd || 0) + Number(portfolioExposure.openOrderExposureUsd || 0)
+    );
     const candidateSizeUsd = Number(signal?.sizeUsd);
     const buyDeltaUsd = signal?.side === 'buy' && Number.isFinite(candidateSizeUsd) ? candidateSizeUsd : 0;
     return {
@@ -7617,6 +7858,119 @@ class BotEngine {
     };
   }
 
+  gabagoolPaperExposurePositionState(position = {}, now = Date.now()) {
+    const context = this.gabagoolPositionContext(position.tokenId, position.marketId);
+    const tradeability = this.portfolio.paperTokenTradeability instanceof Map
+      ? (this.portfolio.paperTokenTradeability.get(String(position.tokenId || '')) || null)
+      : null;
+    const tradeabilityStatus = String(tradeability?.status || '');
+    const cleanupState = this.gabagoolExposureCleanupState(context, now);
+    const totalExposureUsd = Math.max(0, Number(position.totalExposureUsd || position.positionExposureUsd || 0));
+    const excludedDeadReason = tradeabilityStatus === 'no_orderbook_404'
+      ? 'confirmed_no_orderbook_404'
+      : cleanupState?.staleMarket === true
+        ? 'expired_btc_5m_window'
+        : null;
+    let capBlockingBucket = 'activeTradableExposureUsd';
+    if (
+      cleanupState?.staleEvidence === true &&
+      (tradeabilityStatus === 'stale_token_cooldown' || tradeabilityStatus === 'no_bid')
+    ) {
+      capBlockingBucket = 'resolutionPendingExposureUsd';
+    } else if (tradeabilityStatus === 'stale_token_cooldown' || tradeabilityStatus === 'no_bid') {
+      capBlockingBucket = 'staleNoBidExposureUsd';
+    }
+    return {
+      position,
+      context,
+      tradeability,
+      tradeabilityStatus,
+      cleanupState,
+      totalExposureUsd,
+      excludedDeadReason,
+      excludedFromCapBlocking: Boolean(excludedDeadReason),
+      capBlockingBucket,
+    };
+  }
+
+  gabagoolPaperExposureCapView(options = {}) {
+    const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+    const markPrices = options.markPrices instanceof Map ? options.markPrices : this.cache.markPrices();
+    const ledger = options.ledger || this.gabagoolLedger(markPrices, now);
+    const riskExposure = options.riskExposure || this.risk.exposureBreakdown(null, { markPrices });
+    const classifiedPositions = (ledger.perTokenExposure || [])
+      .filter((item) => Number(item.qty || 0) > 0)
+      .map((position) => this.gabagoolPaperExposurePositionState(position, now));
+    const capBlockingPositions = [];
+    let activeTradableExposureUsd = 0;
+    let staleNoBidExposureUsd = 0;
+    let resolutionPendingExposureUsd = 0;
+    let expiredBtc5mExposureUsd = 0;
+    let confirmedNoOrderbook404ExposureUsd = 0;
+
+    for (const state of classifiedPositions) {
+      if (!(state.totalExposureUsd > 0)) continue;
+      if (state.excludedDeadReason === 'expired_btc_5m_window') {
+        expiredBtc5mExposureUsd += state.totalExposureUsd;
+        continue;
+      }
+      if (state.excludedDeadReason === 'confirmed_no_orderbook_404') {
+        confirmedNoOrderbook404ExposureUsd += state.totalExposureUsd;
+        continue;
+      }
+      if (state.capBlockingBucket === 'staleNoBidExposureUsd') {
+        staleNoBidExposureUsd += state.totalExposureUsd;
+      } else if (state.capBlockingBucket === 'resolutionPendingExposureUsd') {
+        resolutionPendingExposureUsd += state.totalExposureUsd;
+      } else {
+        activeTradableExposureUsd += state.totalExposureUsd;
+      }
+      capBlockingPositions.push(state);
+    }
+
+    const excludedDeadExposureUsd = expiredBtc5mExposureUsd + confirmedNoOrderbook404ExposureUsd;
+    const rawPortfolioExposureUsd = Math.max(
+      Number(ledger.totalExposureUsd || 0),
+      Number(riskExposure.rawTotalExposureUsd || 0)
+    );
+    const capBlockingExposureUsdAfterExclusions = Math.max(0, (
+      Number(riskExposure.nonBtcPositionExposureUsd || 0) +
+      Number(riskExposure.portfolioOpenOrderExposureUsd || 0) +
+      activeTradableExposureUsd +
+      staleNoBidExposureUsd +
+      resolutionPendingExposureUsd
+    ));
+    const maxTotalExposureUsd = Math.max(0, Number(this.config.maxTotalExposureUsd || 0));
+    const rawExcessExposureUsd = maxTotalExposureUsd > 0
+      ? Math.max(0, rawPortfolioExposureUsd - maxTotalExposureUsd)
+      : 0;
+    const excessExposureUsdAfterExclusions = maxTotalExposureUsd > 0
+      ? Math.max(0, capBlockingExposureUsdAfterExclusions - maxTotalExposureUsd)
+      : 0;
+    const bypassedBecauseOnlyExpiredDeadExposure = rawExcessExposureUsd > 1e-9 &&
+      excessExposureUsdAfterExclusions <= 1e-9 &&
+      excludedDeadExposureUsd > 1e-9 &&
+      activeTradableExposureUsd <= 1e-9 &&
+      staleNoBidExposureUsd <= 1e-9 &&
+      resolutionPendingExposureUsd <= 1e-9;
+
+    return {
+      classifiedPositions,
+      capBlockingPositions,
+      rawPortfolioExposureUsd,
+      activeTradableExposureUsd,
+      staleNoBidExposureUsd,
+      resolutionPendingExposureUsd,
+      expiredBtc5mExposureUsd,
+      confirmedNoOrderbook404ExposureUsd,
+      excludedDeadExposureUsd,
+      capBlockingExposureUsdAfterExclusions,
+      rawExcessExposureUsd,
+      excessExposureUsdAfterExclusions,
+      bypassedBecauseOnlyExpiredDeadExposure,
+    };
+  }
+
   gabagoolProfitBufferBypassAllowed(signal = null) {
     return (
       this.gabagoolExplicitLossExitAllowed(signal) ||
@@ -7969,33 +8323,38 @@ class BotEngine {
   async buildGabagoolExposureCapExitScan({ model, books = new Map(), now = Date.now() } = {}) {
     const markPrices = this.cache.markPrices();
     const ledger = this.gabagoolLedger(markPrices, now);
-    const riskExposure = this.risk.exposureBreakdown();
+    const riskExposure = this.risk.exposureBreakdown(null, { markPrices });
+    const exposureCapView = this.gabagoolPaperExposureCapView({
+      markPrices,
+      ledger,
+      riskExposure,
+      now,
+    });
     const maxTotalExposureUsd = Math.max(0, Number(this.config.maxTotalExposureUsd || 0));
-    const portfolioExposureUsd = Math.max(
-      Number(ledger.totalExposureUsd || 0),
-      Number(riskExposure.rawTotalExposureUsd || 0)
-    );
-    const capBlockingExposureUsd = Math.max(
-      0,
-      Number(riskExposure.capBlockingExposureUsd || riskExposure.riskTotalExposureUsd || 0)
-    );
-    const excludedDeadExposureUsd = Math.max(0, Number(riskExposure.excludedDeadExposureUsd || 0));
+    const rawPortfolioExposureUsd = Math.max(0, Number(exposureCapView.rawPortfolioExposureUsd || 0));
+    const capBlockingExposureUsdAfterExclusions = Math.max(0, Number(exposureCapView.capBlockingExposureUsdAfterExclusions || 0));
+    const excludedDeadExposureUsd = Math.max(0, Number(exposureCapView.excludedDeadExposureUsd || 0));
+    const activeTradableExposureUsd = Math.max(0, Number(exposureCapView.activeTradableExposureUsd || 0));
     const excessExposureUsd = maxTotalExposureUsd > 0
-      ? Math.max(0, capBlockingExposureUsd - maxTotalExposureUsd)
+      ? Math.max(0, capBlockingExposureUsdAfterExclusions - maxTotalExposureUsd)
       : 0;
-    const positions = (ledger.perTokenExposure || [])
-      .filter((item) => Number(item.qty || 0) > 0)
+    const positions = exposureCapView.capBlockingPositions
+      .slice()
       .sort((a, b) => Number(b.totalExposureUsd || 0) - Number(a.totalExposureUsd || 0));
-    const largestExposurePositions = positions.slice(0, 5).map((item) => ({
-      tokenId: String(item.tokenId || ''),
-      marketSlug: String(item.marketSlug || ''),
-      outcome: item.outcome || this.gabagoolPositionContext(item.tokenId, item.marketId).outcome || 'Unknown',
-      totalExposureUsd: Number(item.totalExposureUsd || 0),
-      positionExposureUsd: Number(item.positionExposureUsd || 0),
-      openOrderExposureUsd: Number(item.openOrderExposureUsd || 0),
-      avgEntryPrice: Number.isFinite(Number(item.avgEntryPrice)) ? Number(item.avgEntryPrice) : null,
-      mark: Number.isFinite(Number(item.mark)) ? Number(item.mark) : null,
-      qty: Number(item.qty || 0),
+    const largestExposurePositions = exposureCapView.classifiedPositions
+      .slice()
+      .sort((a, b) => Number(b.totalExposureUsd || 0) - Number(a.totalExposureUsd || 0))
+      .slice(0, 5)
+      .map((state) => ({
+      tokenId: String(state.position?.tokenId || ''),
+      marketSlug: String(state.context?.marketSlug || state.position?.marketSlug || ''),
+      outcome: state.context?.outcome || state.position?.outcome || 'Unknown',
+      totalExposureUsd: Number(state.position?.totalExposureUsd || state.position?.positionExposureUsd || 0),
+      positionExposureUsd: Number(state.position?.positionExposureUsd || 0),
+      openOrderExposureUsd: Number(state.position?.openOrderExposureUsd || 0),
+      avgEntryPrice: Number.isFinite(Number(state.position?.avgEntryPrice)) ? Number(state.position.avgEntryPrice) : null,
+      mark: Number.isFinite(Number(state.position?.mark)) ? Number(state.position.mark) : null,
+      qty: Number(state.position?.qty || 0),
     }));
     const scan = {
       active: excessExposureUsd > 1e-9 && positions.length > 0,
@@ -8007,15 +8366,19 @@ class BotEngine {
       candidates: [],
       noExitReason: null,
       blockedReasons: new Map(),
-      totalExposureUsd: capBlockingExposureUsd,
-      capBlockingExposureUsd,
-      portfolioExposureUsd,
+      totalExposureUsd: capBlockingExposureUsdAfterExclusions,
+      capBlockingExposureUsd: capBlockingExposureUsdAfterExclusions,
+      portfolioExposureUsd: rawPortfolioExposureUsd,
+      rawPortfolioExposureUsd,
       excludedDeadExposureUsd,
       excludedDeadExposureReasonSummary: riskExposure.excludedDeadExposureReasonSummary || 'none',
+      capBlockingExposureUsdAfterExclusions,
+      activeTradableExposureUsd,
       maxTotalExposureUsd,
       excessExposureUsd,
       largestExposurePositions,
       unfreezeReasonLast: null,
+      stallGateBypassedBecauseOnlyExpiredDeadExposure: exposureCapView.bypassedBecauseOnlyExpiredDeadExposure === true,
     };
     if (!scan.active) return scan;
 
@@ -8042,10 +8405,11 @@ class BotEngine {
       return 'no_exit_bid_available';
     };
 
-    for (const position of positions) {
+    for (const positionState of positions) {
+      const position = positionState.position;
       scan.positionsScanned += 1;
-      const context = this.gabagoolPositionContext(position.tokenId, position.marketId);
-      const cleanupState = this.gabagoolExposureCleanupState(context, now);
+      const context = positionState.context;
+      const cleanupState = positionState.cleanupState;
       const asset = this.buildGabagoolSyntheticAssetFromContext(context);
       const book = await this.getGabagoolBook(position.tokenId, books);
       const availableSellQty = this.portfolio.availablePositionQty(position.tokenId);
@@ -8066,10 +8430,14 @@ class BotEngine {
         });
         continue;
       }
-      const tradeability = this.portfolio.paperTokenTradeability instanceof Map
-        ? this.portfolio.paperTokenTradeability.get(String(position.tokenId || ''))
-        : null;
+      let tradeability = positionState.tradeability;
+      if (!tradeability && this.portfolio.paperTokenTradeability instanceof Map) {
+        tradeability = this.portfolio.paperTokenTradeability.get(String(position.tokenId || '')) || null;
+      }
       if (!book) {
+        if (this.portfolio.paperTokenTradeability instanceof Map) {
+          tradeability = this.portfolio.paperTokenTradeability.get(String(position.tokenId || '')) || tradeability;
+        }
         const tradeabilityStatus = String(tradeability?.status || '');
         const blockedReason = classifyNoExitBidReason(tradeabilityStatus, cleanupState);
         recordExposureCapBlocked(blockedReason, {
@@ -8270,7 +8638,7 @@ class BotEngine {
         positionsScanned: scan.positionsScanned,
         positionsClosable: scan.positionsClosable,
         exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
-        riskTotalExposureUsd: capBlockingExposureUsd,
+        riskTotalExposureUsd: capBlockingExposureUsdAfterExclusions,
         maxTotalExposureUsd,
       });
       remainingExcessUsd = Math.max(0, remainingExcessUsd - candidateSizeUsd);
@@ -8285,10 +8653,13 @@ class BotEngine {
       positionsScanned: scan.positionsScanned,
       positionsClosable: scan.positionsClosable,
       exitMode: scan.exitMode,
-      riskTotalExposureUsd: capBlockingExposureUsd,
+      riskTotalExposureUsd: capBlockingExposureUsdAfterExclusions,
       maxTotalExposureUsd,
       exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
-      capBlockingExposureUsd,
+      capBlockingExposureUsd: capBlockingExposureUsdAfterExclusions,
+      rawPortfolioExposureUsd,
+      capBlockingExposureUsdAfterExclusions,
+      activeTradableExposureUsd,
       excludedDeadExposureUsd,
       blockedReasonSummary: [...scan.blockedReasons.entries()]
         .sort((a, b) => b[1] - a[1])
@@ -10315,6 +10686,7 @@ class BotEngine {
           exposureCapWaitingForExit: true,
           exitUnfreezeReason: exposureCapExitScan.unfreezeReasonLast,
           largestExposurePositions: exposureCapExitScan.largestExposurePositions,
+          stallGateBypassedBecauseOnlyExpiredDeadExposure: exposureCapExitScan.stallGateBypassedBecauseOnlyExpiredDeadExposure === true,
         });
       }
       return {
@@ -10334,11 +10706,15 @@ class BotEngine {
         totalExposureUsd: useExposureCapExitMode ? exposureCapExitScan.totalExposureUsd : null,
         capBlockingExposureUsd: useExposureCapExitMode ? exposureCapExitScan.capBlockingExposureUsd : null,
         portfolioExposureUsd: useExposureCapExitMode ? exposureCapExitScan.portfolioExposureUsd : null,
+        rawPortfolioExposureUsd: useExposureCapExitMode ? exposureCapExitScan.rawPortfolioExposureUsd : null,
+        capBlockingExposureUsdAfterExclusions: useExposureCapExitMode ? exposureCapExitScan.capBlockingExposureUsdAfterExclusions : null,
+        activeTradableExposureUsd: useExposureCapExitMode ? exposureCapExitScan.activeTradableExposureUsd : null,
         excludedDeadExposureUsd: useExposureCapExitMode ? exposureCapExitScan.excludedDeadExposureUsd : null,
         excludedDeadExposureReasonSummary: useExposureCapExitMode ? exposureCapExitScan.excludedDeadExposureReasonSummary : 'none',
         capTriggerReason: useExposureCapExitMode ? exposureCapExitScan.capTriggerReason : null,
         maxTotalExposureUsd: useExposureCapExitMode ? exposureCapExitScan.maxTotalExposureUsd : null,
         excessExposureUsd: useExposureCapExitMode ? exposureCapExitScan.excessExposureUsd : null,
+        stallGateBypassedBecauseOnlyExpiredDeadExposure: useExposureCapExitMode ? exposureCapExitScan.stallGateBypassedBecauseOnlyExpiredDeadExposure === true : false,
       };
     };
     const maybeLogLossGuardIdle = (exitAttemptSummary, rawSignal = null) => {
@@ -10367,8 +10743,11 @@ class BotEngine {
       warn(
         `[GABAGOOL EXPOSURE STALL] reason=exposure_cap_waiting_for_exit token=${shortId(tokenForLog)} ` +
         `marketSlug=${marketSlugForLog} totalExposureUsd=${fmtMoney(exitAttemptSummary.totalExposureUsd)} ` +
+        `rawPortfolioExposureUsd=${fmtMoney(exitAttemptSummary.rawPortfolioExposureUsd)} ` +
         `portfolioExposureUsd=${fmtMoney(exitAttemptSummary.portfolioExposureUsd)} ` +
         `capBlockingExposureUsd=${fmtMoney(exitAttemptSummary.capBlockingExposureUsd)} ` +
+        `capBlockingExposureUsdAfterExclusions=${fmtMoney(exitAttemptSummary.capBlockingExposureUsdAfterExclusions)} ` +
+        `activeTradableExposureUsd=${fmtMoney(exitAttemptSummary.activeTradableExposureUsd)} ` +
         `excludedDeadExposureUsd=${fmtMoney(exitAttemptSummary.excludedDeadExposureUsd)} ` +
         `maxTotalExposureUsd=${fmtMoney(exitAttemptSummary.maxTotalExposureUsd)} excessExposureUsd=${fmtMoney(exitAttemptSummary.excessExposureUsd)} ` +
         `positionsScanned=${exitAttemptSummary.positionsScanned} positionsClosable=${exitAttemptSummary.positionsClosable} ` +
@@ -10379,7 +10758,8 @@ class BotEngine {
         `dominantBlockedReason=${exitAttemptSummary.dominantBlockedReason || 'none'} ` +
         `blockedReasonSummary=${exitAttemptSummary.blockedReasonSummary || 'none'} ` +
         `excludedDeadExposureReasons=${exitAttemptSummary.excludedDeadExposureReasonSummary || 'none'} ` +
-        `exitUnfreezeReason=${exitAttemptSummary.exitUnfreezeReason || 'none'}`
+        `exitUnfreezeReason=${exitAttemptSummary.exitUnfreezeReason || 'none'} ` +
+        `stallGateBypassedBecauseOnlyExpiredDeadExposure=${exitAttemptSummary.stallGateBypassedBecauseOnlyExpiredDeadExposure === true ? 'true' : 'false'}`
       );
     };
     const maybeLogActiveExitIdle = (exitAttemptSummary, rawSignal = null) => {
@@ -10764,7 +11144,15 @@ class BotEngine {
           maybeLogActiveExitIdle(exitAttemptSummary, rawSignal);
         } else {
           const exposureBreakdown = this.risk.exposureBreakdown(rawSignal);
-          if (exposureBreakdown.wouldTotalExposureUsd > this.config.maxTotalExposureUsd) {
+          const exposureCapView = this.gabagoolPaperExposureCapView({
+            markPrices: this.cache.markPrices(),
+            riskExposure: exposureBreakdown,
+            now: Date.now(),
+          });
+          if (
+            exposureBreakdown.wouldTotalExposureUsd > this.config.maxTotalExposureUsd &&
+            exposureCapView.bypassedBecauseOnlyExpiredDeadExposure !== true
+          ) {
             const exitAttemptSummary = attemptGabagoolExits();
             this.lastGabagoolBlockedReason = 'exposure_cap_waiting_for_exit';
             this.lastGabagoolRiskBlockReason = 'max_total_exposure';
@@ -10789,6 +11177,20 @@ class BotEngine {
             );
             maybeLogActiveExitIdle(exitAttemptSummary, rawSignal);
           } else {
+            if (
+              exposureBreakdown.wouldTotalExposureUsd > this.config.maxTotalExposureUsd &&
+              exposureCapView.bypassedBecauseOnlyExpiredDeadExposure === true
+            ) {
+              info(
+                `[GABAGOOL EXPOSURE CAP BYPASS] token=${shortId(rawSignal.tokenId)} ` +
+                `marketSlug=${rawSignal.metadata?.marketSlug || 'unknown'} ` +
+                `rawPortfolioExposureUsd=${fmtMoney(exposureCapView.rawPortfolioExposureUsd)} ` +
+                `excludedDeadExposureUsd=${fmtMoney(exposureCapView.excludedDeadExposureUsd)} ` +
+                `capBlockingExposureUsdAfterExclusions=${fmtMoney(exposureCapView.capBlockingExposureUsdAfterExclusions)} ` +
+                `activeTradableExposureUsd=${fmtMoney(exposureCapView.activeTradableExposureUsd)} ` +
+                `bypass=true reason=only_expired_dead_btc_5m_exposure_remains`
+              );
+            }
             this.emitGabagoolUpdate('candidate_ready', {
               strategy: rawSignal.strategy,
               marketSlug: entryPlanResult.plan.marketSlug,
@@ -10970,6 +11372,12 @@ class BotEngine {
     const gabagoolClosedLossUsd = Math.max(0, -Number(ledger.closedPnl || 0));
     const lossGuard = this.gabagoolLossGuardState(markPrices, now);
     const gabagoolEntriesPaused = lossGuard.paused;
+    const exposureCapView = this.gabagoolPaperExposureCapView({
+      markPrices,
+      ledger,
+      riskExposure,
+      now,
+    });
     const roundTripsLastHour = (ledger.roundTrips || []).filter((trip) => Number(trip.exitTs || 0) >= hourAgo);
     const gabagoolAvgRoundTripPnl = roundTripsLastHour.length > 0
       ? roundTripsLastHour.reduce((sum, trip) => sum + Number(trip.realizedPnl || 0), 0) / roundTripsLastHour.length
@@ -11169,14 +11577,18 @@ class BotEngine {
         audit: {
           riskExposureUsd,
           portfolioExposureUsd,
+          rawPortfolioExposureUsd: Number(exposureCapView.rawPortfolioExposureUsd || 0),
           btcOracleExposureUsd,
           exposureMismatchUsd,
           exposureMismatchReason,
           maxTotalExposureUsd: Number(this.config.maxTotalExposureUsd || 0),
           exposureAvailableUsd: Number(riskExposure.exposureAvailableUsd || 0),
-          capBlockingExposureUsd: Number(riskExposure.capBlockingExposureUsd || 0),
-          excludedDeadExposureUsd: Number(riskExposure.excludedDeadExposureUsd || 0),
+          capBlockingExposureUsd: Number(exposureCapView.capBlockingExposureUsdAfterExclusions || 0),
+          capBlockingExposureUsdAfterExclusions: Number(exposureCapView.capBlockingExposureUsdAfterExclusions || 0),
+          activeTradableExposureUsd: Number(exposureCapView.activeTradableExposureUsd || 0),
+          excludedDeadExposureUsd: Number(exposureCapView.excludedDeadExposureUsd || 0),
           excludedDeadExposureReasonSummary: excludedDeadExposureReasonSummary,
+          stallGateBypassedBecauseOnlyExpiredDeadExposure: exposureCapView.bypassedBecauseOnlyExpiredDeadExposure === true,
         },
       },
       tradeQuality: {
@@ -14644,12 +15056,50 @@ async function main() {
       ok: true,
       command: 'burnin-reset-state',
       stateFile: result.stateFile,
+      backupPath: result.backupPath ? path.basename(result.backupPath) : null,
+      pendingResetStateFile: result.pendingResetStateFile ? path.basename(result.pendingResetStateFile) : null,
       lifecycleStatus: result.lifecycleStatus,
       initialCash: result.initialCash,
       recommendedFreshStateFile: result.recommendedFreshStateFile,
       liveTradingEnabled: result.liveTradingEnabled,
       liveKillSwitch: result.liveKillSwitch,
       liveDryRunOnly: result.liveDryRunOnly,
+    }, null, 2));
+    return;
+  }
+  if (command === 'burnin-state-summary') {
+    const portfolio = new PaperPortfolio(CONFIG);
+    const pendingReset = portfolio.readPendingBurnInResetStateFile();
+    if (pendingReset?.data) {
+      portfolio.hydratePersistedState(pendingReset.data);
+    } else {
+      portfolio.loadState();
+    }
+    const markPrices = portfolio.markPricesSnapshot();
+    const risk = new RiskEngine(CONFIG, portfolio);
+    const exposure = risk.exposureBreakdown(null, { markPrices });
+    const health = portfolio.executionHealth(Date.now());
+    console.log(JSON.stringify({
+      ok: true,
+      command: 'burnin-state-summary',
+      stateFile: path.basename(portfolio.resolvedStateFilePath()),
+      source: pendingReset?.data ? 'pending_burnin_reset' : 'state_file',
+      pendingResetStateFile: pendingReset?.filePath ? path.basename(pendingReset.filePath) : null,
+      lifecycleStatus: portfolio.burnInState?.lifecycleStatus || null,
+      initialCash: Number(portfolio.startingCash || 0),
+      cash: Number(portfolio.cash || 0),
+      positionKeys: [...portfolio.positions.entries()].filter(([, qty]) => Number(qty) > 0).length,
+      totalExposureUsd: Number(portfolio.totalExposureUsd(markPrices) || 0),
+      portfolioExposureUsd: Number(exposure.rawTotalExposureUsd || 0),
+      capBlockingExposureUsd: Number(exposure.capBlockingExposureUsd || 0),
+      excludedDeadExposureUsd: Number(exposure.excludedDeadExposureUsd || 0),
+      activeTradableExposureUsd: Number(exposure.activeTradableExposureUsd || 0),
+      openOrdersCount: Number(portfolio.openOrders.size || 0),
+      activePaperOrdersCount: Number(health.activePaperOrders || 0),
+      latestMarksCount: Number(portfolio.latestMarks.size || 0),
+      positionMarketsCount: Number(portfolio.positionMarkets.size || 0),
+      fillsCount: Array.isArray(portfolio.fills) ? portfolio.fills.length : 0,
+      executionEventsCount: Array.isArray(portfolio.executionEvents) ? portfolio.executionEvents.length : 0,
     }, null, 2));
     return;
   }

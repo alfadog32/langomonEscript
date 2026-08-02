@@ -5,7 +5,11 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const { LiveAdapter } = require('../live_adapter_polymarket');
+const {
+  LiveAdapter,
+  resolvePolymarketFunderAddress,
+  resolvePolymarketBuilderCode,
+} = require('../live_adapter_polymarket');
 
 function tempPath(name, ext = 'env') {
   return path.join('/tmp', `${name}-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.${ext}`);
@@ -22,9 +26,11 @@ function writeTempSecrets() {
     'POLYMARKET_API_KEY=dummy-api-key',
     'POLYMARKET_API_SECRET=dummy-api-secret',
     'POLYMARKET_API_PASSPHRASE=dummy-api-passphrase',
+    'DEPOSIT_WALLET_ADDRESS=0x1111111111111111111111111111111111111111',
     'POLYMARKET_PROXY_WALLET_ADDRESS=0x1111111111111111111111111111111111111111',
     'POLYMARKET_FUNDER_ADDRESS=0x1111111111111111111111111111111111111111',
     'POLYMARKET_SIGNATURE_TYPE=3',
+    'POLY_BUILDER_CODE=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     'POLYMARKET_CHAIN_ID=137',
   ].join('\n'));
   return filePath;
@@ -137,6 +143,59 @@ async function main() {
     const decision = adapter.live.secretAccessDecision('submit');
     assert.strictEqual(decision.ok, false, 'missing secrets must block live submit');
     assert(decision.reasons.includes('LIVE_SECRETS_FILE_MISSING'), 'missing secrets reason should be reported');
+  });
+
+  withEnv({
+    POLYMARKET_SIGNATURE_TYPE: '3',
+    DEPOSIT_WALLET_ADDRESS: '0x1111111111111111111111111111111111111111',
+    POLYMARKET_FUNDER_ADDRESS: '0x1111111111111111111111111111111111111111',
+    POLYMARKET_PROXY_WALLET_ADDRESS: '0x2222222222222222222222222222222222222222',
+  }, () => {
+    const resolution = resolvePolymarketFunderAddress(process.env);
+    assert.strictEqual(resolution.source, 'DEPOSIT_WALLET_ADDRESS', 'type-3 funder must prefer deposit wallet');
+    assert.strictEqual(
+      String(resolution.funderAddress || '').toLowerCase(),
+      '0x1111111111111111111111111111111111111111',
+      'type-3 funder must resolve to deposit/funder address'
+    );
+    assert(resolution.warnings.includes('TYPE_3_PROXY_IGNORED'), 'type-3 proxy override must be ignored');
+  });
+
+  withEnv({
+    POLYMARKET_SIGNATURE_TYPE: '3',
+    DEPOSIT_WALLET_ADDRESS: '0x1111111111111111111111111111111111111111',
+    POLYMARKET_FUNDER_ADDRESS: '0x3333333333333333333333333333333333333333',
+    POLYMARKET_PROXY_WALLET_ADDRESS: '0x2222222222222222222222222222222222222222',
+  }, () => {
+    const resolution = resolvePolymarketFunderAddress(process.env);
+    assert(resolution.errors.includes('TYPE_3_FUNDER_DEPOSIT_MISMATCH'), 'type-3 deposit/funder mismatch must fail closed');
+  });
+
+  withEnv({
+    POLYMARKET_SIGNATURE_TYPE: '3',
+    DEPOSIT_WALLET_ADDRESS: undefined,
+    POLYMARKET_FUNDER_ADDRESS: undefined,
+    POLYMARKET_PROXY_WALLET_ADDRESS: '0x2222222222222222222222222222222222222222',
+  }, () => {
+    const resolution = resolvePolymarketFunderAddress(process.env);
+    assert(resolution.errors.includes('TYPE_3_FUNDER_MISSING'), 'type-3 missing funder/deposit must fail closed');
+  });
+
+  withEnv({
+    POLY_BUILDER_CODE: '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  }, () => {
+    const resolution = resolvePolymarketBuilderCode(process.env);
+    assert.strictEqual(resolution.present, true, 'builder code should be detected when set');
+    assert.strictEqual(resolution.valid, true, 'hex builder code should validate');
+  });
+
+  withEnv({
+    POLY_BUILDER_CODE: 'builder-code-invalid',
+  }, () => {
+    const resolution = resolvePolymarketBuilderCode(process.env);
+    assert.strictEqual(resolution.present, true, 'invalid builder code should still count as present');
+    assert.strictEqual(resolution.valid, false, 'non-hex builder code must fail validation');
+    assert(resolution.errors.includes('POLY_BUILDER_CODE_INVALID_HEX'), 'invalid builder code reason must be reported');
   });
 
   await withEnv({ ...baseEnv, LIVE_KILL_SWITCH: 'true' }, async () => {

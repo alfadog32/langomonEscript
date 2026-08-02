@@ -182,6 +182,84 @@ function redactWallet(value) {
   return value ? shortId(value, 6, 4) : null;
 }
 
+function resolvePolymarketSignatureType(rawValue = process.env.POLYMARKET_SIGNATURE_TYPE) {
+  const parsed = Number(rawValue);
+  return Number.isFinite(parsed) ? parsed : 3;
+}
+
+function resolvePolymarketBuilderCode(env = process.env) {
+  const rawValue = firstString(env.POLY_BUILDER_CODE);
+  if (!rawValue) {
+    return {
+      builderCode: null,
+      present: false,
+      valid: true,
+      errors: [],
+    };
+  }
+  const valid = /^0x[0-9a-fA-F]+$/.test(rawValue);
+  return {
+    builderCode: valid ? rawValue : null,
+    present: true,
+    valid,
+    errors: valid ? [] : ['POLY_BUILDER_CODE_INVALID_HEX'],
+  };
+}
+
+function resolvePolymarketFunderAddress(env = process.env) {
+  const signatureType = resolvePolymarketSignatureType(env.POLYMARKET_SIGNATURE_TYPE);
+  const depositAddress = firstString(env.DEPOSIT_WALLET_ADDRESS) || null;
+  const configuredFunderAddress = firstString(env.POLYMARKET_FUNDER_ADDRESS) || null;
+  const proxyWalletAddress = firstString(env.POLYMARKET_PROXY_WALLET_ADDRESS) || null;
+  const depositNorm = normalizeAddress(depositAddress);
+  const funderNorm = normalizeAddress(configuredFunderAddress);
+  const proxyNorm = normalizeAddress(proxyWalletAddress);
+  const warnings = [];
+  const errors = [];
+  let funderAddress = null;
+  let source = null;
+
+  if (signatureType === 3) {
+    if (!depositNorm && !funderNorm) {
+      errors.push('TYPE_3_FUNDER_MISSING');
+    } else if (depositNorm && funderNorm && depositNorm !== funderNorm) {
+      errors.push('TYPE_3_FUNDER_DEPOSIT_MISMATCH');
+    } else if (depositNorm) {
+      funderAddress = depositAddress;
+      source = 'DEPOSIT_WALLET_ADDRESS';
+    } else if (funderNorm) {
+      funderAddress = configuredFunderAddress;
+      source = 'POLYMARKET_FUNDER_ADDRESS';
+    }
+
+    if (proxyNorm && normalizeAddress(funderAddress) && proxyNorm !== normalizeAddress(funderAddress)) {
+      warnings.push('TYPE_3_PROXY_IGNORED');
+    }
+  } else {
+    funderAddress = proxyWalletAddress || configuredFunderAddress || depositAddress || null;
+    source = proxyWalletAddress
+      ? 'POLYMARKET_PROXY_WALLET_ADDRESS'
+      : configuredFunderAddress
+        ? 'POLYMARKET_FUNDER_ADDRESS'
+        : depositAddress
+          ? 'DEPOSIT_WALLET_ADDRESS'
+          : null;
+    if (proxyNorm && funderNorm && proxyNorm !== funderNorm) warnings.push('NON_TYPE3_PROXY_DIFFERS_FROM_FUNDER');
+    if (proxyNorm && depositNorm && proxyNorm !== depositNorm) warnings.push('NON_TYPE3_PROXY_DIFFERS_FROM_DEPOSIT');
+  }
+
+  return {
+    signatureType,
+    funderAddress,
+    source,
+    depositAddress,
+    configuredFunderAddress,
+    proxyWalletAddress,
+    warnings,
+    errors,
+  };
+}
+
 function missingEnv(names) {
   return names.filter((name) => !process.env[name]);
 }
@@ -904,6 +982,8 @@ class PolymarketLiveClient {
     this.signerAddress = null;
     this.privateKeyAccessed = false;
     this.clientPurpose = null;
+    this.funderResolution = resolvePolymarketFunderAddress();
+    this.builderCodeResolution = resolvePolymarketBuilderCode();
   }
 
   canSubmitLive() {
@@ -982,8 +1062,13 @@ class PolymarketLiveClient {
     if (!privateKey) throw new Error('POLYMARKET_PRIVATE_KEY missing in live secrets');
     this.privateKeyAccessed = true;
 
-    const funderAddress = process.env.POLYMARKET_PROXY_WALLET_ADDRESS || process.env.POLYMARKET_FUNDER_ADDRESS || process.env.DEPOSIT_WALLET_ADDRESS;
-    const signatureType = Number(process.env.POLYMARKET_SIGNATURE_TYPE || 3);
+    const funderResolution = resolvePolymarketFunderAddress(process.env);
+    if (funderResolution.errors.length > 0) {
+      throw new Error(`Polymarket funder resolution failed: ${funderResolution.errors.join(',')}`);
+    }
+    const builderCodeResolution = resolvePolymarketBuilderCode(process.env);
+    const funderAddress = funderResolution.funderAddress;
+    const signatureType = funderResolution.signatureType;
 
     const sdk = await import('@polymarket/clob-client-v2');
     const { createWalletClient, http } = await import('viem');
@@ -993,6 +1078,8 @@ class PolymarketLiveClient {
     const signer = createWalletClient({ account, transport: http(this.config.polygonRpcUrl) });
     this.signerAddress = account.address;
     this.walletAddress = funderAddress || account.address;
+    this.funderResolution = funderResolution;
+    this.builderCodeResolution = builderCodeResolution;
 
     const l1Client = new sdk.ClobClient({
       host: this.config.clobHost,
@@ -1000,6 +1087,7 @@ class PolymarketLiveClient {
       signer,
       signatureType,
       funderAddress,
+      builderConfig: builderCodeResolution.builderCode ? { builderCode: builderCodeResolution.builderCode } : undefined,
       throwOnError: true,
     });
 
@@ -1020,11 +1108,20 @@ class PolymarketLiveClient {
       creds,
       signatureType,
       funderAddress,
+      builderConfig: builderCodeResolution.builderCode ? { builderCode: builderCodeResolution.builderCode } : undefined,
       throwOnError: true,
     });
     this.sdk = sdk;
     this.clientPurpose = purpose;
     return this.client;
+  }
+
+  assertBuilderCodeReady() {
+    const resolution = this.builderCodeResolution || resolvePolymarketBuilderCode(process.env);
+    this.builderCodeResolution = resolution;
+    if (resolution.present && !resolution.valid) {
+      throw new Error(`Builder attribution unavailable: ${resolution.errors.join(',')}`);
+    }
   }
 
   async authCheck() {
@@ -1047,8 +1144,12 @@ class PolymarketLiveClient {
       event.apiCredentialsReady = Boolean(process.env.POLYMARKET_API_KEY && process.env.POLYMARKET_API_SECRET && process.env.POLYMARKET_API_PASSPHRASE) || Boolean(this.client);
       event.walletAddress = redactWallet(this.walletAddress);
       event.signerAddress = redactWallet(this.signerAddress);
-      event.funderAddress = redactWallet(process.env.POLYMARKET_PROXY_WALLET_ADDRESS || process.env.POLYMARKET_FUNDER_ADDRESS || process.env.DEPOSIT_WALLET_ADDRESS);
-      event.signatureType = Number(process.env.POLYMARKET_SIGNATURE_TYPE || 3);
+      event.funderAddress = redactWallet(this.funderResolution?.funderAddress);
+      event.funderEnvUsed = this.funderResolution?.source || null;
+      event.funderWarnings = this.funderResolution?.warnings || [];
+      event.signatureType = this.funderResolution?.signatureType || resolvePolymarketSignatureType();
+      event.builderCodePresent = Boolean(this.builderCodeResolution?.present);
+      event.builderCodeLooksValid = Boolean(this.builderCodeResolution?.valid);
     } catch (e) {
       event.errors.push(safeError(e));
       event.missingEnv = missingEnv(REQUIRED_LIVE_SECRET_ENV);
@@ -1059,6 +1160,7 @@ class PolymarketLiveClient {
 
   async signOrderOnly(intent, meta, purpose = 'signing-test') {
     const client = await this.init(purpose);
+    this.assertBuilderCodeReady();
     const sdk = this.sdk;
     const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
     const userOrder = {
@@ -1067,6 +1169,7 @@ class PolymarketLiveClient {
       size: Number(intent.sizeShares),
       side,
     };
+    if (this.builderCodeResolution?.builderCode) userOrder.builderCode = this.builderCodeResolution.builderCode;
     const startedAt = Date.now();
     const signedOrder = await client.createOrder(userOrder, {
       tickSize: String(meta.tickSize),
@@ -1087,6 +1190,7 @@ class PolymarketLiveClient {
    */
   async signOrderLocalOnly(intent, meta, purpose = 'signing-test') {
     const client = await this.init(purpose);
+    this.assertBuilderCodeReady();
     const sdk = this.sdk;
     const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
     const userOrder = {
@@ -1095,6 +1199,7 @@ class PolymarketLiveClient {
       size: Number(intent.sizeShares),
       side,
     };
+    if (this.builderCodeResolution?.builderCode) userOrder.builderCode = this.builderCodeResolution.builderCode;
     const tickSize = String(meta.tickSize || '0.01');
     const negRisk = Boolean(meta.negRisk);
     // Force exchange version 2 for the modern Polymarket exchange. Local-only
@@ -1157,6 +1262,10 @@ class PolymarketLiveClient {
       event.privateKeyAccessed = this.privateKeyAccessed;
       event.walletAddress = redactWallet(this.walletAddress);
       event.signerAddress = redactWallet(this.signerAddress);
+      event.funderAddress = redactWallet(this.funderResolution?.funderAddress);
+      event.funderEnvUsed = this.funderResolution?.source || null;
+      event.builderCodePresent = Boolean(this.builderCodeResolution?.present);
+      event.builderCodeLooksValid = Boolean(this.builderCodeResolution?.valid);
       event.orderConstructionLatencyMs = signed.orderConstructionLatencyMs;
       event.localOnly = true;
       event.signingProofPassed = true;
@@ -1633,7 +1742,7 @@ class LiveAdapter {
         type: 'LIVE_RECONCILE_REFUSED',
         decision: 'REFUSED',
         reasons: allowed.reasons,
-        walletAddress: redactWallet(process.env.POLYMARKET_PROXY_WALLET_ADDRESS || process.env.POLYMARKET_FUNDER_ADDRESS || process.env.DEPOSIT_WALLET_ADDRESS),
+        walletAddress: redactWallet(resolvePolymarketFunderAddress(process.env).funderAddress),
         usdcBalance: null,
         gasBalance: null,
         openOrdersCount: 0,
@@ -1705,8 +1814,13 @@ class LiveAdapter {
       requiredSecretEnvNames: REQUIRED_LIVE_SECRET_ENV,
       acceptedFunderEnvNames: REQUIRED_FUNDER_ENV,
       signatureTypeEnvName: 'POLYMARKET_SIGNATURE_TYPE',
-      signatureType: Number(process.env.POLYMARKET_SIGNATURE_TYPE || 3),
-      funderEnvDetected: REQUIRED_FUNDER_ENV.find((name) => process.env[name]) || null,
+      signatureType: resolvePolymarketSignatureType(process.env.POLYMARKET_SIGNATURE_TYPE),
+      funderEnvDetected: resolvePolymarketFunderAddress(process.env).source,
+      funderAddress: redactWallet(resolvePolymarketFunderAddress(process.env).funderAddress),
+      funderWarnings: resolvePolymarketFunderAddress(process.env).warnings,
+      funderErrors: resolvePolymarketFunderAddress(process.env).errors,
+      builderCodePresent: resolvePolymarketBuilderCode(process.env).present,
+      builderCodeLooksValid: resolvePolymarketBuilderCode(process.env).valid,
       clobHost: cfg.clobHost,
       polygonRpcConfigured: Boolean(cfg.polygonRpcUrl),
       readyForMicroLive: false,
@@ -1918,11 +2032,23 @@ class LiveAdapter {
       requiredSecretEnvNames: REQUIRED_LIVE_SECRET_ENV,
       acceptedFunderEnvNames: REQUIRED_FUNDER_ENV,
       signatureTypeEnvName: 'POLYMARKET_SIGNATURE_TYPE',
+      funderEnvDetected: resolvePolymarketFunderAddress(process.env).source,
+      funderAddress: redactWallet(resolvePolymarketFunderAddress(process.env).funderAddress),
+      funderWarnings: resolvePolymarketFunderAddress(process.env).warnings,
+      funderErrors: resolvePolymarketFunderAddress(process.env).errors,
+      builderCodePresent: resolvePolymarketBuilderCode(process.env).present,
+      builderCodeLooksValid: resolvePolymarketBuilderCode(process.env).valid,
       finalBossGate: {
         configuredReadyFlag: cfg.liveFinalBossReady,
         configuredStage: cfg.liveTradingStage,
         submitAllowedAtStage: stageProfile.submitAllowed,
         canSubmitLive: this.live.canSubmitLive(),
+        funderAddress: redactWallet(resolvePolymarketFunderAddress(process.env).funderAddress),
+        funderEnvUsed: resolvePolymarketFunderAddress(process.env).source,
+        funderWarnings: resolvePolymarketFunderAddress(process.env).warnings,
+        funderErrors: resolvePolymarketFunderAddress(process.env).errors,
+        builderCodePresent: resolvePolymarketBuilderCode(process.env).present,
+        builderCodeLooksValid: resolvePolymarketBuilderCode(process.env).valid,
       },
       submitted: false,
       signed: false,
@@ -2102,6 +2228,9 @@ module.exports = {
   classifySigningError,
   secretFileStatus,
   resolveLiveStageProfile,
+  resolvePolymarketSignatureType,
+  resolvePolymarketFunderAddress,
+  resolvePolymarketBuilderCode,
   REQUIRED_LIVE_SECRET_ENV,
   REQUIRED_FUNDER_ENV,
 };

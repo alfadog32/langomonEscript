@@ -1799,6 +1799,17 @@ async function run() {
   {
     const tempDir = fs.mkdtempSync(path.join('/tmp', 'paper-burnin-reset-'));
     const stateFile = path.join(tempDir, 'moneymaker_v3_state_post_patch_burnin_59.json');
+    fs.writeFileSync(stateFile, JSON.stringify({
+      cash: 41,
+      startingCash: 59,
+      positions: { 'old-token': 3 },
+      costBasis: { 'old-token': 2 },
+      executionEvents: [{ ts: Date.now() - 5_000, type: 'fill' }],
+      burnInState: {
+        lifecycleStatus: 'dirty',
+        lastResetAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    }, null, 2));
     const portfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
       saveState: true,
       stateFile,
@@ -1814,6 +1825,61 @@ async function run() {
     assert.strictEqual(state.closedPnl, 0, 'burn-in reset state should clear prior closed PnL');
     assert.strictEqual(state.executionEvents.length, 0, 'burn-in reset state should clear prior execution history');
     assert.strictEqual(state.burnInState.lifecycleStatus, 'clean_burnin_running', 'burn-in reset state should be marked clean');
+    assert(fs.existsSync(reset.pendingResetStateFile), 'burn-in reset state should stage a pending reset handoff file');
+    assert(reset.backupPath, 'burn-in reset should preserve a backup before writing the fresh state');
+  }
+
+  {
+    const tempDir = fs.mkdtempSync(path.join('/tmp', 'paper-burnin-race-'));
+    const stateFile = path.join(tempDir, 'moneymaker_v3_state_live_canary_59.json');
+    const stalePortfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile,
+      initialCash: 59,
+    }));
+    stalePortfolio.positions.set('stale-token', 4);
+    stalePortfolio.costBasis.set('stale-token', 2);
+    stalePortfolio.positionMarkets.set('stale-token', 'market-1');
+    stalePortfolio.latestMarks.set('stale-token', 2);
+    stalePortfolio.executionEvents.push({ ts: Date.now(), type: 'fill' });
+    stalePortfolio.saveState();
+
+    const resetPortfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile,
+      initialCash: 59,
+    }));
+    const reset = resetPortfolio.writeFreshBurnInStateFile('selfcheck_reset_race');
+    const beforeRestartState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert.strictEqual(Object.keys(beforeRestartState.positions || {}).length, 0, 'fresh reset file should clear positions immediately');
+    assert(fs.existsSync(reset.pendingResetStateFile), 'pending reset handoff file should exist before restart');
+
+    fs.writeFileSync(stateFile, JSON.stringify({
+      cash: 67,
+      startingCash: 59,
+      positions: { 'stale-token': 4 },
+      costBasis: { 'stale-token': 2 },
+      latestMarks: { 'stale-token': 2 },
+      positionMarkets: { 'stale-token': 'market-1' },
+      executionEvents: [{ ts: Date.now(), type: 'fill' }],
+      burnInState: {
+        lifecycleStatus: 'clean_burnin_running',
+        lastResetAt: new Date(Date.now() - 30_000).toISOString(),
+      },
+    }, null, 2));
+    const clobberedState = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    assert.strictEqual(Object.keys(clobberedState.positions || {}).length, 1, 'an old process can still clobber the active file before restart');
+
+    const restartedPortfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile,
+      initialCash: 59,
+    }));
+    restartedPortfolio.loadState();
+    assert.strictEqual(restartedPortfolio.positions.size, 0, 'restart should re-apply the pending burn-in reset and clear stale positions');
+    assert.strictEqual(restartedPortfolio.executionEvents.length, 0, 'restart should clear stale execution history');
+    assert.strictEqual(restartedPortfolio.fills.length, 0, 'restart should clear stale fills');
+    assert(!fs.existsSync(reset.pendingResetStateFile), 'pending reset handoff file should be consumed on restart');
   }
 
   {
