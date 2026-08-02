@@ -38,6 +38,16 @@ CANDIDATES_END=0 INTENTS_END=0 ROUTER_EVENTS_END=0 ADAPTER_EVENTS_END=0 EXECUTIO
 ENGINE_OUT_LINES_END=0 ENGINE_ERROR_LINES_END=0 ROUTER_OUT_LINES_END=0 ROUTER_ERROR_LINES_END=0
 SAFE_BASELINE_RESTORED=false
 SAFE_BASELINE_MISMATCHES=()
+ARMED_RUNTIME_VERIFIED=false
+ARMED_RUNTIME_MISMATCHES=()
+ROUTER_MODE_OBSERVED_DURING_ARM=''
+ENGINE_PM2_ENV_VERIFIED=false
+ROUTER_PM2_ENV_VERIFIED=false
+SAFE_RUNTIME_VERIFIED=false
+SAFE_RUNTIME_MISMATCHES=()
+ROUTER_MODE_OBSERVED_AFTER_LOCKOFF=''
+ENGINE_OUT_LINES_AT_ARM_RESTART=0
+ENGINE_OUT_LINES_AT_SAFE_RESTART=0
 
 CANDIDATES_FILE="$ROOT/auto_live_candidates.ndjson"
 INTENTS_FILE="$ROOT/trade_intents.ndjson"
@@ -49,6 +59,7 @@ ENGINE_OUT_LOG='/home/lango/.pm2/logs/langomonEscript-out.log'
 ENGINE_ERROR_LOG='/home/lango/.pm2/logs/langomonEscript-error.log'
 ROUTER_OUT_LOG='/home/lango/.pm2/logs/liveIntentRouter-out.log'
 ROUTER_ERROR_LOG='/home/lango/.pm2/logs/liveIntentRouter-error.log'
+SECRETS_FILE="$ROOT/.env.live.secrets"
 
 BASELINE_KEYS=(
   ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY
@@ -207,6 +218,7 @@ nonnegative_delta() {
 
 derive_run_result() {
   if (( PROCESS_ERROR )); then printf 'PROCESS_ERROR';
+  elif (( ARMING_STARTED )) && [[ "$ARMED_RUNTIME_VERIFIED" != true ]]; then printf 'PROCESS_ERROR';
   elif (( ADAPTER_SUBMITTED )); then printf 'SUBMITTED';
   elif (( ADAPTER_REFUSED )); then printf 'ADAPTER_REFUSED';
   elif (( PIPELINE_STALLED )); then printf 'PIPELINE_STALLED';
@@ -243,6 +255,35 @@ run_summary_selfcheck() {
   validate_run_monitor_end_boundary
   [[ "$PROCESS_ERROR" == 1 && " ${TERMINAL_REASONS[*]} " == *' LOG_ROTATED_OR_TRUNCATED_AT_END_BOUNDARY '* ]] || die 'run summary selfcheck missed end-boundary truncation'
   say 'run summary state-machine selfcheck: ok'
+}
+
+runtime_environment_selfcheck() {
+  local dir previous_env previous_secrets previous_fixture
+  dir="$(mktemp -d /tmp/stage5-runtime-env-selfcheck.XXXXXX)"
+  previous_env="$ENV_FILE"; previous_secrets="$SECRETS_FILE"; previous_fixture="${PM2_JLIST_FIXTURE:-}"
+  ENV_FILE="$dir/runtime.env"; SECRETS_FILE="$dir/runtime.secrets"
+  printf '%s\n' 'ENABLE_LIVE_TRADING=true' 'LIVE_AUTO_EXECUTE=true' 'LIVE_KILL_SWITCH=false' 'LIVE_DRY_RUN_ONLY=false' 'LIVE_SUBMIT_CONFIRM=true' 'LIVE_FINAL_BOSS_READY=true' 'LIVE_TRADING_STAGE=5' 'LIVE_CANARY_MARKET_ID=fixture-market' 'MAX_LIVE_ORDER_USD=5' 'MAX_LIVE_TOTAL_EXPOSURE_USD=5' 'LIVE_DAILY_MAX_LOSS_USD=5' 'LIVE_MAX_ORDERS_PER_HOUR=1' 'AUTO_LIVE_MIN_CONFIDENCE=0.47' 'LIVE_ROUTER_MODE=submit' > "$ENV_FILE"
+  printf '%s\n' 'TEST_SECRET_SENTINEL=fixture-only-not-printed' > "$SECRETS_FILE"
+  load_runtime_environment && verify_shell_profile armed fixture-market || die 'runtime environment selfcheck missed armed load'
+  node -e 'const fs=require("fs"); const env={ENABLE_LIVE_TRADING:"true",LIVE_AUTO_EXECUTE:"true",LIVE_KILL_SWITCH:"false",LIVE_DRY_RUN_ONLY:"false",LIVE_SUBMIT_CONFIRM:"true",LIVE_FINAL_BOSS_READY:"true",LIVE_TRADING_STAGE:"5",LIVE_CANARY_MARKET_ID:"fixture-market",MAX_LIVE_ORDER_USD:"5",MAX_LIVE_TOTAL_EXPOSURE_USD:"5",LIVE_DAILY_MAX_LOSS_USD:"5",LIVE_MAX_ORDERS_PER_HOUR:"1",AUTO_LIVE_MIN_CONFIDENCE:"0.47",LIVE_ROUTER_MODE:"submit"}; fs.writeFileSync(process.argv[1],JSON.stringify(["liveIntentRouter","langomonEscript"].map(name=>({name,pm2_env:{status:"online",env}}))))' "$dir/pm2.json"
+  PM2_JLIST_FIXTURE="$dir/pm2.json"
+  pm2_profile_matches liveIntentRouter armed fixture-market true && pm2_profile_matches langomonEscript armed fixture-market true || die 'runtime environment selfcheck missed armed PM2 profile'
+  printf '%s\n' 'ENABLE_LIVE_TRADING=false' 'LIVE_AUTO_EXECUTE=false' 'LIVE_KILL_SWITCH=true' 'LIVE_DRY_RUN_ONLY=true' 'LIVE_SUBMIT_CONFIRM=false' 'LIVE_FINAL_BOSS_READY=false' 'LIVE_TRADING_STAGE=2' 'LIVE_CANARY_MARKET_ID=' 'MAX_LIVE_ORDER_USD=1' 'MAX_LIVE_TOTAL_EXPOSURE_USD=1' 'LIVE_DAILY_MAX_LOSS_USD=1' 'LIVE_MAX_ORDERS_PER_HOUR=1' 'AUTO_LIVE_MIN_CONFIDENCE=0.67' 'LIVE_ROUTER_MODE=dry-run' > "$ENV_FILE"
+  load_runtime_environment && verify_shell_profile safe '' || die 'runtime environment selfcheck missed safe replacement'
+  node -e 'const fs=require("fs"); const env={ENABLE_LIVE_TRADING:"false",LIVE_AUTO_EXECUTE:"false",LIVE_KILL_SWITCH:"true",LIVE_DRY_RUN_ONLY:"true",LIVE_SUBMIT_CONFIRM:"false",LIVE_FINAL_BOSS_READY:"false",LIVE_TRADING_STAGE:"2",LIVE_CANARY_MARKET_ID:"",MAX_LIVE_ORDER_USD:"1",MAX_LIVE_TOTAL_EXPOSURE_USD:"1",LIVE_DAILY_MAX_LOSS_USD:"1",LIVE_MAX_ORDERS_PER_HOUR:"1",AUTO_LIVE_MIN_CONFIDENCE:"0.67",LIVE_ROUTER_MODE:"dry-run"}; fs.writeFileSync(process.argv[1],JSON.stringify(["liveIntentRouter","langomonEscript"].map(name=>({name,pm2_env:{status:"online",env}}))))' "$dir/pm2.json"
+  pm2_profile_matches liveIntentRouter safe '' true && pm2_profile_matches langomonEscript safe '' true || die 'runtime environment selfcheck missed safe PM2 profile'
+  node -e 'const fs=require("fs"),p=process.argv[1],x=JSON.parse(fs.readFileSync(p)); x[0].pm2_env.env.MAX_LIVE_ORDER_USD="9"; fs.writeFileSync(p,JSON.stringify(x))' "$dir/pm2.json"
+  if pm2_profile_matches liveIntentRouter safe '' true; then die 'runtime environment selfcheck missed MAX_LIVE_ORDER_USD mismatch'; fi
+  [[ " ${SAFE_RUNTIME_MISMATCHES[*]} " == *' liveIntentRouter:MAX_LIVE_ORDER_USD '* ]] || die 'runtime environment selfcheck missed non-secret mismatch name'
+  node -e 'const fs=require("fs"),p=process.argv[1],x=JSON.parse(fs.readFileSync(p)); x[0].pm2_env.env.MAX_LIVE_ORDER_USD="1"; x[0].pm2_env.env.AUTO_LIVE_MIN_CONFIDENCE="0.9"; fs.writeFileSync(p,JSON.stringify(x))' "$dir/pm2.json"
+  if pm2_profile_matches liveIntentRouter safe '' true; then die 'runtime environment selfcheck missed AUTO_LIVE_MIN_CONFIDENCE mismatch'; fi
+  node -e 'const fs=require("fs"),p=process.argv[1],x=JSON.parse(fs.readFileSync(p)); x[0].pm2_env.env.AUTO_LIVE_MIN_CONFIDENCE="0.67"; x[0].pm2_env.env.LIVE_ROUTER_MODE="submit"; fs.writeFileSync(p,JSON.stringify(x))' "$dir/pm2.json"
+  if pm2_profile_matches liveIntentRouter safe '' true; then die 'runtime environment selfcheck missed LIVE_ROUTER_MODE mismatch'; fi
+  node -e 'const fs=require("fs"),p=process.argv[1],x=JSON.parse(fs.readFileSync(p)); x[0].pm2_env.env.LIVE_ROUTER_MODE="dry-run"; x[0].pm2_env.status="stopped"; fs.writeFileSync(p,JSON.stringify(x))' "$dir/pm2.json"
+  if pm2_profile_matches liveIntentRouter safe '' true; then die 'runtime environment selfcheck missed offline status'; fi
+  rm -rf "$dir"
+  ENV_FILE="$previous_env"; SECRETS_FILE="$previous_secrets"; PM2_JLIST_FIXTURE="$previous_fixture"
+  say 'runtime environment propagation selfcheck: ok'
 }
 
 if [[ "${1:-}" == '--selfcheck-baseline' ]]; then
@@ -286,6 +327,102 @@ set_safe_stage2_baseline() {
   set_env_value LIVE_ROUTER_MODE dry-run
 }
 
+load_runtime_environment() {
+  [[ -r "$ENV_FILE" && -r "$SECRETS_FILE" ]] || return 1
+  set -a
+  # Intentionally no tracing or environment output: this only prepares PM2.
+  . "$ENV_FILE"
+  . "$SECRETS_FILE"
+  set +a
+}
+
+verify_shell_profile() {
+  local profile="$1" market="$2" key expected i
+  local -a keys values
+  if [[ "$profile" == armed ]]; then
+    keys=(ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE LIVE_ROUTER_MODE)
+    values=(true true false false true true 5 "$market" 5 5 5 1 0.47 submit)
+  else
+    keys=(ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE LIVE_ROUTER_MODE)
+    values=(false false true true false false 2 '' 1 1 1 1 0.67 dry-run)
+  fi
+  for i in "${!keys[@]}"; do
+    key="${keys[$i]}"
+    expected="${values[$i]}"
+    [[ "${!key:-}" == "$expected" ]] || return 1
+  done
+}
+
+pm2_jlist() {
+  if [[ -n "${PM2_JLIST_FIXTURE:-}" ]]; then
+    node -e 'process.stdout.write(require("fs").readFileSync(process.argv[1]))' "$PM2_JLIST_FIXTURE"
+  else
+    pm2 jlist
+  fi
+}
+
+record_runtime_mismatches() {
+  local profile="$1" details="$2" entry existing
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    if [[ "$profile" == armed ]]; then
+      for existing in "${ARMED_RUNTIME_MISMATCHES[@]}"; do [[ "$existing" == "$entry" ]] && continue 2; done
+      ARMED_RUNTIME_MISMATCHES+=("$entry")
+    else
+      for existing in "${SAFE_RUNTIME_MISMATCHES[@]}"; do [[ "$existing" == "$entry" ]] && continue 2; done
+      SAFE_RUNTIME_MISMATCHES+=("$entry")
+    fi
+  done <<< "$details"
+}
+
+pm2_profile_matches() {
+  local process_name="$1" profile="$2" market="$3" include_router_mode="$4"
+  local details
+  if details="$(pm2_jlist | node -e '
+const fs = require("fs");
+const [name, profile, market, includeRouterMode] = process.argv.slice(1);
+const items = JSON.parse(fs.readFileSync(0, "utf8"));
+const item = items.find((x) => x.name === name);
+const env = item?.pm2_env?.env || {};
+const expected = profile === "armed"
+  ? { ENABLE_LIVE_TRADING: "true", LIVE_AUTO_EXECUTE: "true", LIVE_KILL_SWITCH: "false", LIVE_DRY_RUN_ONLY: "false", LIVE_SUBMIT_CONFIRM: "true", LIVE_FINAL_BOSS_READY: "true", LIVE_TRADING_STAGE: "5", LIVE_CANARY_MARKET_ID: market, MAX_LIVE_ORDER_USD: "5", MAX_LIVE_TOTAL_EXPOSURE_USD: "5", LIVE_DAILY_MAX_LOSS_USD: "5", LIVE_MAX_ORDERS_PER_HOUR: "1", AUTO_LIVE_MIN_CONFIDENCE: "0.47", LIVE_ROUTER_MODE: "submit" }
+  : { ENABLE_LIVE_TRADING: "false", LIVE_AUTO_EXECUTE: "false", LIVE_KILL_SWITCH: "true", LIVE_DRY_RUN_ONLY: "true", LIVE_SUBMIT_CONFIRM: "false", LIVE_FINAL_BOSS_READY: "false", LIVE_TRADING_STAGE: "2", LIVE_CANARY_MARKET_ID: "", MAX_LIVE_ORDER_USD: "1", MAX_LIVE_TOTAL_EXPOSURE_USD: "1", LIVE_DAILY_MAX_LOSS_USD: "1", LIVE_MAX_ORDERS_PER_HOUR: "1", AUTO_LIVE_MIN_CONFIDENCE: "0.67", LIVE_ROUTER_MODE: "dry-run" };
+const bad = Object.keys(expected).filter((key) => String(env[key] ?? "") !== expected[key]);
+if (!item) { console.log(`${name}:missing`); process.exit(1); }
+if (item.pm2_env?.status !== "online") bad.unshift("status");
+if (bad.length) { for (const key of bad) console.log(`${name}:${key}`); process.exit(1); }
+' \
+  "$process_name" "$profile" "$market" "$include_router_mode")"; then
+    return 0
+  fi
+  record_runtime_mismatches "$profile" "$details"
+  return 1
+}
+
+wait_for_runtime_profile() {
+  local profile="$1" market="$2" router_offset="$3" engine_offset="$4" deadline mode='' engine_safety=''
+  deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    mode="$(appended_lines "$ROUTER_EVENTS_FILE" "$router_offset" | sed -n 's/.*"type":"LIVE_ROUTER_STARTED".*"mode":"\([^"]*\)".*/\1/p' | tail -n 1)"
+    if [[ "$profile" == armed ]]; then ROUTER_MODE_OBSERVED_DURING_ARM="$mode"; else ROUTER_MODE_OBSERVED_AFTER_LOCKOFF="$mode"; fi
+    engine_safety="$(appended_lines "$ENGINE_OUT_LOG" "$engine_offset" | grep 'Live Safety:' | tail -n 1 || true)"
+    if [[ -n "$engine_safety" && "$profile" == armed ]] && ! grep -q 'ENABLE_LIVE_TRADING=true LIVE_AUTO_EXECUTE=true LIVE_KILL_SWITCH=false LIVE_DRY_RUN_ONLY=false LIVE_SUBMIT_CONFIRM=true' <<< "$engine_safety"; then
+      sleep 1; continue
+    fi
+    if [[ "$mode" == "$([[ "$profile" == armed ]] && printf submit || printf dry-run)" ]] && pm2_profile_matches liveIntentRouter "$profile" "$market" true && pm2_profile_matches langomonEscript "$profile" "$market" true; then
+      [[ "$profile" == armed ]] && { ARMED_RUNTIME_VERIFIED=true; ROUTER_PM2_ENV_VERIFIED=true; ENGINE_PM2_ENV_VERIFIED=true; } || SAFE_RUNTIME_VERIFIED=true
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+if [[ "${1:-}" == '--selfcheck-runtime-environment' ]]; then
+  runtime_environment_selfcheck
+  exit 0
+fi
+
 restart_canary_processes() {
   pm2 restart langomonEscript --update-env
   pm2 restart liveIntentRouter --update-env
@@ -320,16 +457,22 @@ write_run_summary() {
   node - "$RUN_DIR/run-summary.json" "$RUN_STARTED_AT" "$ARMED_AT" "$RUN_MONITOR_ENDED_AT" "$LOCKED_OFF_AT" "$CANARY_MARKET_ID" \
     "$candidate_delta" "$intent_delta" "$router_event_delta" "$adapter_event_delta" "$execution_event_delta" \
     "$CANDIDATE_SEEN" "$INTENT_SEEN" "$ADAPTER_SUBMITTED" "$ADAPTER_REFUSED" "$SAFE_BASELINE_RESTORED" \
-    "${SAFE_BASELINE_MISMATCHES[*]:-}" "$result" "${TERMINAL_REASONS[*]:-}" <<'NODE'
+    "${SAFE_BASELINE_MISMATCHES[*]:-}" "$ARMED_RUNTIME_VERIFIED" "${ARMED_RUNTIME_MISMATCHES[*]:-}" \
+    "$ROUTER_MODE_OBSERVED_DURING_ARM" "$ENGINE_PM2_ENV_VERIFIED" "$ROUTER_PM2_ENV_VERIFIED" \
+    "$SAFE_RUNTIME_VERIFIED" "${SAFE_RUNTIME_MISMATCHES[*]:-}" "$ROUTER_MODE_OBSERVED_AFTER_LOCKOFF" "$result" "${TERMINAL_REASONS[*]:-}" <<'NODE'
 const fs = require('fs');
-const [file, runStartedAt, armedAt, runMonitorEndedAt, lockedOffAt, marketId, candidateDelta, intentDelta, routerEventDelta, adapterEventDelta, executionEventDelta, candidateSeen, intentSeen, adapterSubmitted, adapterRefused, safeBaselineRestored, baselineMismatches, result, reasons] = process.argv.slice(2);
+const [file, runStartedAt, armedAt, runMonitorEndedAt, lockedOffAt, marketId, candidateDelta, intentDelta, routerEventDelta, adapterEventDelta, executionEventDelta, candidateSeen, intentSeen, adapterSubmitted, adapterRefused, safeBaselineRestored, baselineMismatches, armedRuntimeVerified, armedRuntimeMismatches, routerModeObservedDuringArm, enginePm2EnvVerified, routerPm2EnvVerified, safeRuntimeVerified, safeRuntimeMismatches, routerModeObservedAfterLockoff, result, reasons] = process.argv.slice(2);
 fs.writeFileSync(file, `${JSON.stringify({
   runStartedAt, armedAt, runMonitorEndedAt, lockedOffAt, marketId,
   candidateDelta: Number(candidateDelta), intentDelta: Number(intentDelta), routerEventDelta: Number(routerEventDelta),
   adapterEventDelta: Number(adapterEventDelta), executionEventDelta: Number(executionEventDelta),
   candidateSeen: candidateSeen === '1', intentSeen: intentSeen === '1', adapterSubmitted: adapterSubmitted === '1',
   adapterRefused: adapterRefused === '1', safeBaselineRestored: safeBaselineRestored === 'true',
-  safeBaselineMismatches: baselineMismatches ? baselineMismatches.split(' ') : [], terminalReasons: reasons ? reasons.split(' ') : [], result,
+  safeBaselineMismatches: baselineMismatches ? baselineMismatches.split(' ') : [],
+  armedRuntimeVerified: armedRuntimeVerified === 'true', armedRuntimeMismatches: armedRuntimeMismatches ? armedRuntimeMismatches.split(' ') : [],
+  routerModeObservedDuringArm, enginePm2EnvVerified: enginePm2EnvVerified === 'true', routerPm2EnvVerified: routerPm2EnvVerified === 'true',
+  safeRuntimeVerified: safeRuntimeVerified === 'true', safeRuntimeMismatches: safeRuntimeMismatches ? safeRuntimeMismatches.split(' ') : [],
+  routerModeObservedAfterLockoff, terminalReasons: reasons ? reasons.split(' ') : [], result,
 }, null, 2)}\n`);
 NODE
 }
@@ -358,14 +501,30 @@ lock_off() {
     say 'arming began: restoring the Stage 2 safe baseline and restarting PM2'
     (( PM2_RESTARTED_FOR_ARM )) && say 'PM2 had already been restarted for the armed configuration'
     restore_safe_baseline_if_changed
-    restart_canary_processes
+    if load_runtime_environment && verify_shell_profile safe ''; then
+      ENGINE_OUT_LINES_AT_SAFE_RESTART="$(line_count "$ENGINE_OUT_LOG")"
+      restart_canary_processes
+      if ! wait_for_runtime_profile safe '' "$ROUTER_EVENTS_END" "$ENGINE_OUT_LINES_AT_SAFE_RESTART"; then
+        SAFE_RUNTIME_MISMATCHES+=(router_startup_or_pm2_environment)
+        rc=1
+      fi
+    else
+      SAFE_RUNTIME_MISMATCHES=(safe_shell_environment_or_secrets_unavailable)
+      rc=1
+    fi
   elif (( BASELINE_VERIFIED )); then
     say 'pre-arm failure: baseline was verified; leaving .env and PM2 unchanged'
   else
     say 'baseline was not verified: restoring the Stage 2 safe baseline only if changed'
     if restore_safe_baseline_if_changed; then
       say '.env changed during safe-baseline restoration; restarting PM2'
-      restart_canary_processes
+      if load_runtime_environment && verify_shell_profile safe ''; then
+        ENGINE_OUT_LINES_AT_SAFE_RESTART="$(line_count "$ENGINE_OUT_LOG")"
+        restart_canary_processes
+        wait_for_runtime_profile safe '' "$ROUTER_EVENTS_END" "$ENGINE_OUT_LINES_AT_SAFE_RESTART" || { SAFE_RUNTIME_MISMATCHES+=(router_startup_or_pm2_environment); rc=1; }
+      else
+        SAFE_RUNTIME_MISMATCHES=(safe_shell_environment_or_secrets_unavailable); rc=1
+      fi
     else
       say '.env already matched the safe baseline; PM2 restart skipped'
     fi
@@ -486,8 +645,17 @@ set_env_value LIVE_DAILY_MAX_LOSS_USD 5
 set_env_value LIVE_MAX_ORDERS_PER_HOUR 1
 set_env_value AUTO_LIVE_MIN_CONFIDENCE 0.47
 set_env_value LIVE_ROUTER_MODE submit
+load_runtime_environment || die 'required runtime environment file is not readable'
+verify_shell_profile armed "$CANARY_MARKET_ID" || die 'armed shell environment does not match requested Stage 5 profile'
 PM2_RESTARTED_FOR_ARM=1
+ENGINE_OUT_LINES_AT_ARM_RESTART="$(line_count "$ENGINE_OUT_LOG")"
 restart_canary_processes
+if ! wait_for_runtime_profile armed "$CANARY_MARKET_ID" "$ROUTER_EVENTS_BEFORE" "$ENGINE_OUT_LINES_AT_ARM_RESTART"; then
+  PROCESS_ERROR=1
+  add_terminal_reason_once ARM_RUNTIME_CONFIG_MISMATCH
+  ARMED_RUNTIME_MISMATCHES=(router_startup_or_pm2_environment)
+  die 'ARM_RUNTIME_CONFIG_MISMATCH: PM2 did not receive the Stage 5 runtime environment'
+fi
 
 deadline=$((SECONDS + WINDOW_SECONDS))
 while (( SECONDS < deadline )); do
