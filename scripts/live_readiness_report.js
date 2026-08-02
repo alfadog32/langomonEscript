@@ -668,7 +668,7 @@ async function main() {
   if (!rpcProbe.reachable) reasons.push(`Polygon RPC unreachable (${rpcProbe.error})`);
   if (!liveConfig.liveFinalBossReady) reasons.push('LIVE_FINAL_BOSS_READY=false');
   if (!Number.isFinite(liveConfig.liveTradingStage) || liveConfig.liveTradingStage < 1) {
-    reasons.push(`LIVE_TRADING_STAGE=${liveConfig.liveTradingStage} (Stage 1+ required for micro-live readiness gate)`);
+    reasons.push(`LIVE_TRADING_STAGE=${liveConfig.liveTradingStage} (Stage 1+ required for live readiness gate)`);
   }
   // Stage 1 signing-proof status is NOT executed here automatically because it
   // would require LIVE_SIGNING_TEST_ALLOW=true and readable secrets. Operator
@@ -762,6 +762,18 @@ async function main() {
       configuredReadyFlag: liveConfig.liveFinalBossReady,
       configuredStage: liveConfig.liveTradingStage,
       configuredStageProfile: liveConfig.liveStageProfile || null,
+      effectiveMaxLiveOrderUsd: Number(liveConfig.liveStageProfile?.maxLiveOrderUsd ?? liveConfig.maxLiveOrderUsd ?? 0),
+      effectiveMaxLiveTotalExposureUsd: Number(liveConfig.liveStageProfile?.maxLiveTotalExposureUsd ?? liveConfig.maxLiveTotalExposureUsd ?? 0),
+      effectiveLiveDailyMaxLossUsd: Number(liveConfig.liveStageProfile?.liveDailyMaxLossUsd ?? liveConfig.liveDailyMaxLossUsd ?? 0),
+      effectiveMaxOrdersPerHour: Number(liveConfig.liveStageProfile?.maxOrdersPerHour ?? liveConfig.liveMaxOrdersPerHour ?? 0),
+      singleMarketOnly: Boolean(liveConfig.liveStageProfile?.singleMarketOnly),
+      singleMarketId: liveConfig.liveStageProfile?.singleMarketId || null,
+      autoLiveMinConfidence: Number(CONFIG.autoLiveMinConfidence || 0),
+      minimumOrderSizeSharesBaseline: 5,
+      minimumViableCanaryOrderSupported: Number(liveConfig.liveStageProfile?.maxLiveOrderUsd ?? liveConfig.maxLiveOrderUsd ?? 0) >= 5,
+      minimumViableCanaryNote: Number(liveConfig.liveStageProfile?.maxLiveOrderUsd ?? liveConfig.maxLiveOrderUsd ?? 0) >= 5
+        ? 'effective single-order cap can satisfy the CLOB 5-share minimum for binary prices up to $0.99'
+        : 'effective single-order cap is below the guaranteed CLOB 5-share minimum for higher-priced binaries',
       submitAllowedAtStage: Boolean(liveConfig.liveStageProfile?.submitAllowed),
       canSubmitLive: liveConfig.enableLiveTrading
         && liveConfig.liveAutoExecute

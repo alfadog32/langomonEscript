@@ -447,6 +447,16 @@ function runCycle() {
       gabagoolMaxClosedLossUsd,
       gabagoolLossGuardCooldownRemainingMs: numberOrNull(gabagoolGuard.cooldownRemainingMs),
       gabagoolLossGuardRecoveryActive: gabagoolGuard.recoveryActive === true,
+      liveTradingStage: numberOrNull(liveFinalBoss.configuredStage),
+      liveTradingStageName: liveFinalBoss.configuredStageProfile?.name || null,
+      effectiveMaxLiveOrderUsd: numberOrNull(liveFinalBoss.effectiveMaxLiveOrderUsd),
+      effectiveMaxLiveTotalExposureUsd: numberOrNull(liveFinalBoss.effectiveMaxLiveTotalExposureUsd),
+      effectiveLiveDailyMaxLossUsd: numberOrNull(liveFinalBoss.effectiveLiveDailyMaxLossUsd),
+      effectiveMaxOrdersPerHour: numberOrNull(liveFinalBoss.effectiveMaxOrdersPerHour),
+      singleMarketOnly: liveFinalBoss.singleMarketOnly === true,
+      singleMarketId: liveFinalBoss.singleMarketId || null,
+      autoLiveMinConfidence: numberOrNull(liveFinalBoss.autoLiveMinConfidence),
+      minimumViableCanaryOrderSupported: liveFinalBoss.minimumViableCanaryOrderSupported === true,
     },
     flags: flagInspection.flags,
     secrets,
@@ -668,6 +678,14 @@ function runSingleInspection() {
   console.log(`  burnInLifecycleStatus: ${cycle.metrics.burnInLifecycleStatus}`);
   console.log(`  stateProfileStatus: ${cycle.metrics.stateProfileStatus}`);
   console.log(`  openOrders: ${cycle.metrics.openOrders}`);
+  console.log(`  liveTradingStage: ${cycle.metrics.liveTradingStage} (${cycle.metrics.liveTradingStageName || 'unknown'})`);
+  console.log(`  effectiveMaxLiveOrderUsd: ${cycle.metrics.effectiveMaxLiveOrderUsd}`);
+  console.log(`  effectiveMaxLiveTotalExposureUsd: ${cycle.metrics.effectiveMaxLiveTotalExposureUsd}`);
+  console.log(`  effectiveLiveDailyMaxLossUsd: ${cycle.metrics.effectiveLiveDailyMaxLossUsd}`);
+  console.log(`  effectiveMaxOrdersPerHour: ${cycle.metrics.effectiveMaxOrdersPerHour}`);
+  console.log(`  singleMarketOnly: ${cycle.metrics.singleMarketOnly} (marketId=${cycle.metrics.singleMarketId || 'unset'})`);
+  console.log(`  autoLiveMinConfidence: ${cycle.metrics.autoLiveMinConfidence}`);
+  console.log(`  minimumViableCanaryOrderSupported: ${cycle.metrics.minimumViableCanaryOrderSupported}`);
   console.log(`  gabagoolEntriesPaused: ${cycle.metrics.gabagoolEntriesPaused} (reason=${cycle.metrics.gabagoolEntryPauseReason})`);
   console.log(`  gabagoolClosedLossUsd: ${cycle.metrics.gabagoolClosedLossUsd} (max ${cycle.metrics.gabagoolMaxClosedLossUsd}, cooldownRemainingMs=${cycle.metrics.gabagoolLossGuardCooldownRemainingMs}, recoveryActive=${cycle.metrics.gabagoolLossGuardRecoveryActive})`);
 

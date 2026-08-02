@@ -324,6 +324,17 @@ const LIVE_STAGE_PROFILES = Object.freeze({
     maxOrdersPerHour: null,
     singleMarketOnly: false,
   },
+  5: {
+    stage: 5,
+    name: 'min_viable_canary',
+    description: 'Stage 5: minimum viable manual canary, max $5, one market only, one order per hour',
+    submitAllowed: true,
+    maxLiveOrderUsd: 5,
+    maxLiveTotalExposureUsd: 5,
+    liveDailyMaxLossUsd: 5,
+    maxOrdersPerHour: 1,
+    singleMarketOnly: true,
+  },
 });
 
 const REQUIRED_LIVE_SECRET_ENV = Object.freeze([
@@ -340,7 +351,7 @@ const REQUIRED_FUNDER_ENV = Object.freeze([
 ]);
 
 function resolveLiveStageProfile(configLike = {}) {
-  const requestedStage = Math.max(0, Math.min(4, toInt(configLike.liveTradingStage, 0)));
+  const requestedStage = Math.max(0, Math.min(5, toInt(configLike.liveTradingStage, 0)));
   const base = LIVE_STAGE_PROFILES[requestedStage] || LIVE_STAGE_PROFILES[0];
   return {
     ...base,
@@ -593,7 +604,7 @@ function readConfig(baseDir = process.cwd()) {
     liveDryRunOnly: toBool(process.env.LIVE_DRY_RUN_ONLY, true),
     liveSubmitConfirm: toBool(process.env.LIVE_SUBMIT_CONFIRM, false),
     liveFinalBossReady: toBool(process.env.LIVE_FINAL_BOSS_READY, false),
-    liveTradingStage: Math.max(0, Math.min(4, toInt(process.env.LIVE_TRADING_STAGE, 0))),
+    liveTradingStage: Math.max(0, Math.min(5, toInt(process.env.LIVE_TRADING_STAGE, 0))),
     liveAuthCheckAllow: toBool(process.env.LIVE_AUTH_CHECK_ALLOW, false),
     liveSigningTestAllow: toBool(process.env.LIVE_SIGNING_TEST_ALLOW, false),
     liveReconcileAllow: toBool(process.env.LIVE_RECONCILE_ALLOW, false),
@@ -622,7 +633,7 @@ function readConfig(baseDir = process.cwd()) {
     liveMaxDecisionLatencyMs: toNum(process.env.LIVE_MAX_DECISION_LATENCY_MS, 2_000),
     liveMaxOrderBuildLatencyMs: toNum(process.env.LIVE_MAX_ORDER_BUILD_LATENCY_MS, 2_000),
     liveMaxSubmitDryRunLatencyMs: toNum(process.env.LIVE_MAX_SUBMIT_DRY_RUN_LATENCY_MS, 2_500),
-    liveMaxOrdersPerHour: toInt(process.env.MAX_LIVE_ORDERS_PER_HOUR, 25),
+    liveMaxOrdersPerHour: toInt(process.env.LIVE_MAX_ORDERS_PER_HOUR, 25),
     liveMinBurnInReports: toNum(process.env.LIVE_BURN_IN_MIN_REPORTS, 3),
     liveMinBurnInClosedPnlUsd: toNum(process.env.LIVE_BURN_IN_MIN_CLOSED_PNL_USD, 0),
     liveMaxBurnInDrawdownPct: toNum(process.env.LIVE_BURN_IN_MAX_DRAWDOWN_PCT, 3),

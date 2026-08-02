@@ -49,6 +49,7 @@ try {
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { resolveLiveStageProfile } = require('./live_adapter_polymarket');
 const {
   DEFAULT_PROXY_WALLET,
   DEFAULT_USERNAME,
@@ -389,6 +390,12 @@ const CONFIG = {
   liveKillSwitch: envBool('LIVE_KILL_SWITCH', true),
   liveDryRunOnly: envBool('LIVE_DRY_RUN_ONLY', true),
   liveSubmitConfirm: envBool('LIVE_SUBMIT_CONFIRM', false),
+  liveTradingStage: envInt('LIVE_TRADING_STAGE', 0),
+  maxLiveOrderUsd: envNum('MAX_LIVE_ORDER_USD', 1),
+  maxLiveTotalExposureUsd: envNum('MAX_LIVE_TOTAL_EXPOSURE_USD', 10),
+  liveDailyMaxLossUsd: envNum('LIVE_DAILY_MAX_LOSS_USD', 3),
+  liveMaxOrdersPerHour: envInt('LIVE_MAX_ORDERS_PER_HOUR', 25),
+  liveCanaryMarketId: envStr('LIVE_CANARY_MARKET_ID', ''),
   gabagoolUsername: envStr('GABAGOOL_USERNAME', DEFAULT_USERNAME),
   gabagoolProxyWallet: envStr('GABAGOOL_PROXY_WALLET', DEFAULT_PROXY_WALLET),
   gabagoolBehaviorModelPath: envStr('GABAGOOL_BEHAVIOR_MODEL_PATH', './gabagool22_btc_behavior_model.json'),
@@ -491,6 +498,36 @@ function envList(name, fallback = []) {
     .split(',')
     .map((x) => x.trim())
     .filter(Boolean);
+}
+
+function autoLiveCandidateStageProfile(config = CONFIG) {
+  return resolveLiveStageProfile({
+    liveTradingStage: Number(config.liveTradingStage || 0),
+    maxLiveOrderUsd: Number(config.maxLiveOrderUsd || 0),
+    maxLiveTotalExposureUsd: Number(config.maxLiveTotalExposureUsd || 0),
+    liveDailyMaxLossUsd: Number(config.liveDailyMaxLossUsd || 0),
+    liveMaxOrdersPerHour: Number(config.liveMaxOrdersPerHour || 0),
+    liveCanaryMarketId: config.liveCanaryMarketId || '',
+  });
+}
+
+function autoLiveCandidateEffectiveCaps(config = CONFIG) {
+  const stageProfile = autoLiveCandidateStageProfile(config);
+  const configuredMaxOrderUsd = Math.max(0, Number(config.maxLiveOrderUsd || 0));
+  const configuredMaxTotalExposureUsd = Math.max(0, Number(config.maxLiveTotalExposureUsd || 0));
+  const usesStageCaps = stageProfile.submitAllowed === true;
+  const stageMaxOrderUsd = Number(stageProfile.maxLiveOrderUsd);
+  const stageMaxTotalExposureUsd = Number(stageProfile.maxLiveTotalExposureUsd);
+  return {
+    stageProfile,
+    usesStageCaps,
+    maxOrderUsd: usesStageCaps && Number.isFinite(stageMaxOrderUsd) && stageMaxOrderUsd > 0
+      ? stageMaxOrderUsd
+      : configuredMaxOrderUsd,
+    maxTotalExposureUsd: usesStageCaps && Number.isFinite(stageMaxTotalExposureUsd) && stageMaxTotalExposureUsd > 0
+      ? stageMaxTotalExposureUsd
+      : configuredMaxTotalExposureUsd,
+  };
 }
 
 // =========================
@@ -14320,14 +14357,16 @@ class BotEngine {
       return false;
     }
 
-    // Stage 2 canary exposure cap check
-    const maxOrderUsd = Number(process.env.MAX_LIVE_ORDER_USD) || 1;
-    const maxTotalExposureUsd = Number(process.env.MAX_LIVE_TOTAL_EXPOSURE_USD) || 1;
+    const autoLiveCaps = autoLiveCandidateEffectiveCaps(this.config);
+    const maxOrderUsd = Number(autoLiveCaps.maxOrderUsd || 0);
+    const maxTotalExposureUsd = Number(autoLiveCaps.maxTotalExposureUsd || 0);
+    const liveStageProfile = autoLiveCaps.stageProfile || { stage: 0, name: 'unknown' };
     const currentLiveExposureUsd = Number(this.currentLiveExposureUsd || 0);
     if (sizeUsd > maxOrderUsd) {
       info(
         `[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=canary_max_order_exceeded ` +
-        `sizeUsd=$${sizeUsd.toFixed(2)} maxOrderUsd=$${maxOrderUsd.toFixed(2)} [${strategy}]`
+        `sizeUsd=$${sizeUsd.toFixed(2)} maxOrderUsd=$${maxOrderUsd.toFixed(2)} ` +
+        `liveStage=${cleanLogValue(liveStageProfile.stage)} liveStageName=${cleanLogValue(liveStageProfile.name)} [${strategy}]`
       );
       return false;
     }
@@ -14335,7 +14374,8 @@ class BotEngine {
       info(
         `[AUTO-LIVE CANDIDATE SKIP] ${side} ${shortId(signal.tokenId)} reason=canary_exposure_cap_exceeded ` +
         `currentExposure=$${currentLiveExposureUsd.toFixed(2)} sizeUsd=$${sizeUsd.toFixed(2)} ` +
-        `maxTotalExposureUsd=$${maxTotalExposureUsd.toFixed(2)} [${strategy}]`
+        `maxTotalExposureUsd=$${maxTotalExposureUsd.toFixed(2)} ` +
+        `liveStage=${cleanLogValue(liveStageProfile.stage)} liveStageName=${cleanLogValue(liveStageProfile.name)} [${strategy}]`
       );
       return false;
     }
@@ -14396,6 +14436,14 @@ class BotEngine {
         marketQuestion,
         outcome,
         expectedEdge,
+        liveStageProfile: {
+          stage: liveStageProfile.stage,
+          name: liveStageProfile.name,
+          maxLiveOrderUsd: maxOrderUsd,
+          maxLiveTotalExposureUsd: maxTotalExposureUsd,
+          singleMarketOnly: liveStageProfile.singleMarketOnly === true,
+          singleMarketId: liveStageProfile.singleMarketId || null,
+        },
         riskApproved: true,
         risk_approved: true,
         consensus,
@@ -14407,7 +14455,8 @@ class BotEngine {
       `[AUTO-LIVE CANDIDATE WRITTEN] ${side} ${shortId(signal.tokenId)} @ ${fmtPrice(price)} ` +
       `sizeUsd=$${sizeUsd.toFixed(2)} sizeShares=${cleanLogValue(sizeShares)} minOrderSize=${cleanLogValue(minOrderSize)} ` +
       `expectedEdge=${cleanLogValue(expectedEdge)} confidence=${cleanLogValue(signal.confidence)} ` +
-      `riskApproved=true bookAgeMs=${bookAgeMs} [${strategy}]`
+      `riskApproved=true bookAgeMs=${bookAgeMs} liveStage=${cleanLogValue(liveStageProfile.stage)} ` +
+      `liveStageName=${cleanLogValue(liveStageProfile.name)} maxOrderUsd=$${maxOrderUsd.toFixed(2)} [${strategy}]`
     );
     return true;
   }

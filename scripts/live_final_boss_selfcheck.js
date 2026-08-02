@@ -7,6 +7,7 @@ const path = require('path');
 
 const {
   LiveAdapter,
+  resolveLiveStageProfile,
   resolvePolymarketFunderAddress,
   resolvePolymarketBuilderCode,
 } = require('../live_adapter_polymarket');
@@ -289,6 +290,56 @@ async function main() {
     assert.strictEqual(result.rpcReachable, true, 'rpcReachable must be true when signing proof passed');
     assert(Number.isFinite(result.orderConstructionLatencyMs), 'orderConstructionLatencyMs must be reported');
   });
+
+  {
+    const stage2 = resolveLiveStageProfile({
+      liveTradingStage: 2,
+      maxLiveOrderUsd: 5,
+      maxLiveTotalExposureUsd: 5,
+      liveDailyMaxLossUsd: 5,
+      liveMaxOrdersPerHour: 1,
+    });
+    assert.strictEqual(stage2.name, 'canary_live', 'stage 2 profile name should remain canary_live');
+    assert.strictEqual(stage2.maxLiveOrderUsd, 1, 'stage 2 must stay hard-capped at $1');
+    assert.strictEqual(stage2.maxLiveTotalExposureUsd, 1, 'stage 2 must stay hard-capped at $1 total exposure');
+    assert.strictEqual(stage2.liveDailyMaxLossUsd, 1, 'stage 2 must stay hard-capped at $1 daily loss');
+  }
+
+  {
+    const stage3 = resolveLiveStageProfile({
+      liveTradingStage: 3,
+      maxLiveOrderUsd: 5,
+      maxLiveTotalExposureUsd: 5,
+      liveDailyMaxLossUsd: 5,
+      liveMaxOrdersPerHour: 1,
+      liveCanaryMarketId: 'stage3-market',
+    });
+    assert.strictEqual(stage3.name, 'micro_live', 'stage 3 should remain the existing micro_live profile');
+    assert.strictEqual(stage3.maxLiveOrderUsd, 2, 'stage 3 should remain capped at $2');
+    assert.strictEqual(stage3.maxLiveTotalExposureUsd, 2, 'stage 3 should remain capped at $2 total exposure');
+    assert.strictEqual(stage3.liveDailyMaxLossUsd, 5, 'stage 3 should retain its $5 daily max loss');
+    assert.strictEqual(stage3.maxOrdersPerHour, 6, 'stage 3 should retain its broader order/hour limit');
+    assert.strictEqual(stage3.singleMarketOnly, false, 'stage 3 should remain multi-market');
+    assert.strictEqual(stage3.singleMarketId, 'stage3-market', 'stage 3 may still carry an optional market id without enforcing it');
+  }
+
+  {
+    const stage5 = resolveLiveStageProfile({
+      liveTradingStage: 5,
+      maxLiveOrderUsd: 5,
+      maxLiveTotalExposureUsd: 5,
+      liveDailyMaxLossUsd: 5,
+      liveMaxOrdersPerHour: 1,
+      liveCanaryMarketId: 'stage5-market',
+    });
+    assert.strictEqual(stage5.name, 'min_viable_canary', 'stage 5 should be the explicit minimum viable canary profile');
+    assert.strictEqual(stage5.maxLiveOrderUsd, 5, 'stage 5 should allow a $5 single order cap when explicitly configured');
+    assert.strictEqual(stage5.maxLiveTotalExposureUsd, 5, 'stage 5 should allow a $5 total exposure cap when explicitly configured');
+    assert.strictEqual(stage5.liveDailyMaxLossUsd, 5, 'stage 5 should allow a $5 daily max loss cap when explicitly configured');
+    assert.strictEqual(stage5.maxOrdersPerHour, 1, 'stage 5 should remain one order per hour');
+    assert.strictEqual(stage5.singleMarketOnly, true, 'stage 5 should remain single-market-only');
+    assert.strictEqual(stage5.singleMarketId, 'stage5-market', 'stage 5 should carry the explicit canary market id');
+  }
 
   console.log('live_final_boss_selfcheck: ok');
 }
