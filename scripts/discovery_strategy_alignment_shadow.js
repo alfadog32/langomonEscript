@@ -133,8 +133,7 @@ async function fetchEvents(config) {
     const url = new URL('/events', config.gammaBaseUrl);
     url.searchParams.set('active', 'true');
     url.searchParams.set('closed', 'false');
-    // The production branch inherited an older spelling; the already-proven
-    // public API spelling is used here so this audit can observe a cycle.
+    // Keep the public shadow on the same proven Gamma contract as production.
     url.searchParams.set('order', 'volume24hr');
     url.searchParams.set('ascending', 'false');
     url.searchParams.set('limit', String(config.eventLimit));
@@ -442,6 +441,15 @@ async function main() {
         (asset.discoveryStrategies || []).join('+') || 'none'
       ),
     },
+    strategyAwareSelected: strategyAware.selected.map((asset) => ({
+      assetKey: asset.assetKey,
+      market: asset.market,
+      tokenId: asset.tokenId,
+      outcome: asset.outcome,
+      discoveryStrategies: asset.discoveryStrategies || [],
+      score: Number(asset.score.toFixed(4)),
+      book: asset.book,
+    })),
     baselineSelected: baseline.map((asset) => ({
       marketId: asset.market.marketId,
       tokenId: asset.tokenId,
