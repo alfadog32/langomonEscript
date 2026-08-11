@@ -23,6 +23,7 @@ function makeConfig(overrides = {}) {
     enableWhaleTracking: false,
     paperConfidenceProfile: 'conservative',
     spreadHunterMinConfidencePaper: 0.35,
+    standardPaperMinConfidence: 0.58,
     minConfidence: 0.45,
     minSignalEdge: 0.01,
     minOrderUsd: 1,
@@ -139,7 +140,7 @@ function run() {
     assert.strictEqual(ctx.risk.lastBlockReason, 'confidence_below_min');
     assert.strictEqual(ctx.risk.lastBlockDetails.minConfidence, 0.45);
     assert.strictEqual(ctx.risk.lastBlockDetails.confidenceProfile, 'conservative');
-    assert.strictEqual(ctx.risk.lastBlockDetails.thresholdSource, 'MIN_CONFIDENCE');
+    assert.strictEqual(ctx.risk.lastBlockDetails.thresholdSource, 'STANDARD_PAPER_MIN_CONFIDENCE');
   }
 
   {
@@ -147,11 +148,11 @@ function run() {
     const { evaluated, risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38, expectedEdge: 0.02 }));
     assert(evaluated, 'capital_velocity scenario should pass consensus before risk');
     const threshold = ctx.risk.confidenceThreshold(evaluated);
-    assert.strictEqual(threshold.minConfidence, 0.35);
+    assert.strictEqual(threshold.minConfidence, 0.45);
     assert.strictEqual(threshold.confidenceProfile, 'capital_velocity');
-    assert.strictEqual(threshold.thresholdSource, 'SPREADHUNTER_MIN_CONFIDENCE_PAPER');
-    assert(risked, 'capital_velocity allows safe positive-edge SpreadHunter at confidence 0.38 with threshold 0.35');
-    assert.strictEqual(ctx.risk.lastBlockReason, null);
+    assert.strictEqual(threshold.thresholdSource, 'STANDARD_PAPER_MIN_CONFIDENCE');
+    assert.strictEqual(risked, null, 'mixed-mode standard paper floor remains authoritative for SpreadHunter');
+    assert.strictEqual(ctx.risk.lastBlockReason, 'confidence_below_min');
   }
 
   {
@@ -161,8 +162,8 @@ function run() {
       expectedEdge: 0.02,
       metadata: { consensus: { route: { authorized: true, mode: 'MAKER', state: 'STABLE' } } },
     }), makeAsset(), makeBook());
-    assert.strictEqual(bot.risk.lastBlockReason, null, 'runtime trySignal path should not block eligible capital_velocity SpreadHunter');
-    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'runtime trySignal path should place the paper order');
+    assert.strictEqual(bot.risk.lastBlockReason, 'confidence_below_min', 'runtime path should enforce the mixed-mode standard paper floor');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0, 'runtime path must not place below the mixed-mode standard floor');
   }
 
   {
@@ -174,8 +175,25 @@ function run() {
     }), makeAsset(), makeBook());
     assert.strictEqual(bot.risk.lastBlockReason, 'confidence_below_min', 'runtime trySignal path should keep conservative MIN_CONFIDENCE');
     assert.strictEqual(bot.risk.lastBlockDetails.minConfidence, 0.45);
-    assert.strictEqual(bot.risk.lastBlockDetails.thresholdSource, 'MIN_CONFIDENCE');
+    assert.strictEqual(bot.risk.lastBlockDetails.thresholdSource, 'STANDARD_PAPER_MIN_CONFIDENCE');
     assert.strictEqual(bot.portfolio.openOrders.size, 0, 'blocked runtime trySignal path must not place a paper order');
+  }
+
+  {
+    const ctx = makeContext({
+      paperConfidenceProfile: 'capital_velocity',
+      minConfidence: 0.70,
+      standardPaperMinConfidence: 0.58,
+      spreadHunterMinConfidencePaper: 0.70,
+    });
+    const signal = makeSignal({
+      confidence: 0.685594,
+      metadata: { consensus: { route: { authorized: true, mode: 'MAKER', state: 'STABLE' } } },
+    });
+    const threshold = ctx.risk.confidenceThreshold(signal);
+    assert.strictEqual(threshold.minConfidence, 0.58, 'runtime policy reproduction must use the standard paper floor');
+    assert.strictEqual(threshold.thresholdSource, 'STANDARD_PAPER_MIN_CONFIDENCE');
+    assert(ctx.risk.evaluate(signal), 'the observed 0.685594 candidate legitimately passes the authoritative 0.58 floor');
   }
 
   {
@@ -213,7 +231,7 @@ function run() {
       maxMarketExposureUsd: 1_000,
       maxPositionUsdPerAsset: 1_000,
     });
-    const { evaluated, risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38, sizeUsd: 10 }));
+    const { evaluated, risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.46, sizeUsd: 10 }));
     assert(evaluated, 'exposure-cap scenario should pass consensus before risk');
     assert.strictEqual(risked, null, 'exposure cap still blocks after confidence override');
     assert.strictEqual(ctx.risk.lastBlockReason, 'max_total_exposure');
@@ -222,7 +240,7 @@ function run() {
   {
     const ctx = makeContext({ paperConfidenceProfile: 'capital_velocity' });
     const execution = new PaperExecutionEngine(ctx.config, ctx.portfolio, { getBook: () => makeBook() }, ctx.diagnostics);
-    const { risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.38 }));
+    const { risked } = evaluateRiskAfterConsensus(ctx, makeSignal({ confidence: 0.46 }));
     assert(risked, 'duplicate scenario should produce a placeable signal first');
     assert.strictEqual(execution.place(risked, makeBook()), true, 'first duplicate scenario order should place');
     assert.strictEqual(execution.place(risked, makeBook()), false, 'duplicate still skips');

@@ -652,6 +652,11 @@ async function run() {
       sophieBootstrapAdmissionEnabled: false,
       paperMakerOptimizerEnabled: false,
       paperMakerNudgeEnabled: false,
+      paperActionBurnInEnabled: true,
+      paperActionBurnInMaxBankrollUsd: 1_000,
+      paperActionBurnInTargetOrdersPer15m: 3,
+      paperActionBurnInTargetFillsPer15m: 0,
+      paperActionBurnInMaxOpenOrders: 0,
     });
     const asset = makeAsset('probation-admit-token');
     const signal = makeProbationSignal({ tokenId: asset.tokenId });
@@ -673,6 +678,11 @@ async function run() {
       sophieBootstrapAdmissionEnabled: false,
       paperMakerOptimizerEnabled: false,
       paperMakerNudgeEnabled: false,
+      paperActionBurnInEnabled: true,
+      paperActionBurnInMaxBankrollUsd: 1_000,
+      paperActionBurnInTargetOrdersPer15m: 3,
+      paperActionBurnInTargetFillsPer15m: 0,
+      paperActionBurnInMaxOpenOrders: 0,
     });
     const asset = makeAsset('probation-repeat-bypass-token');
     const signal = makeProbationSignal({ tokenId: asset.tokenId });
@@ -696,9 +706,14 @@ async function run() {
       spreadHunterGhostSizeMultiplier: 0.49,
       paperMakerOptimizerEnabled: false,
       paperMakerNudgeEnabled: false,
+      paperActionBurnInEnabled: true,
+      paperActionBurnInMaxBankrollUsd: 1_000,
+      paperActionBurnInTargetOrdersPer15m: 3,
+      paperActionBurnInTargetFillsPer15m: 0,
+      paperActionBurnInMaxOpenOrders: 0,
     });
     bot.portfolio.ghostStats.total = 100;
-    bot.portfolio.ghostStats.favorable = 8;
+    bot.portfolio.ghostStats.favorable = 14;
     const strategy = bot.strategies.find((entry) => entry.name === 'SpreadHunter');
     const asset = makeAsset('probation-generate-token');
     asset.market.volume24h = 10_000;
@@ -706,7 +721,7 @@ async function run() {
       asset,
       makeBook({ bestBid: 0.45, bestAsk: 0.55, midpoint: 0.50, spread: 0.10 })
     );
-    assert.strictEqual(signals.length, 1, 'ghost throttle drought should still emit one probation candidate');
+    assert.strictEqual(signals.length, 1, 'near-threshold ghost drought should emit one probation candidate');
     assert.strictEqual(Number(signals[0].sizeUsd), 1, 'probation size should be the tiny paper minimum');
     assert.strictEqual(signals[0].metadata.paperProbation.active, true, 'generated candidate should carry paper probation metadata');
   }
@@ -780,6 +795,138 @@ async function run() {
     assert.strictEqual(bot.lastDustExitSuppressed, null, 'protective paper exits now bypass the legacy dust-suppression path');
     assert.strictEqual(bot.portfolio.openOrders.size, 1, 'small protective exits should still rest as open orders before any fill logic runs');
     assert(bot.portfolio.position(asset.tokenId) > 0, 'dust must not be force-sold');
+  }
+
+  {
+    // Real post-settlement characteristics: SpreadHunter entries were closed
+    // by StopLossExit.  A strategy-filtered retained-fill ledger must not keep
+    // the entry lots open after the authoritative position reaches zero.
+    const bot = makeBot();
+    const tokenA = '60978468768843846411182281593646930836404394120338291920840121796697634050582';
+    const tokenB = '9206230966039593902500188678837968474800794808339831311409762640431411092112';
+    const baseTs = Date.parse('2026-08-09T00:47:13.188Z');
+    const fill = (details) => bot.portfolio.recordFill({
+      marketId: details.tokenId === tokenA ? '3405374' : '3405375',
+      marketSlug: details.tokenId === tokenA
+        ? 'mlb-tor-phi-2026-08-08-total-9pt5'
+        : 'mlb-tor-phi-2026-08-08-total-11pt5',
+      outcome: 'Under',
+      fillDelayMs: details.fillDelayMs,
+      bookAgeMs: 0,
+      wasExecutableAtFill: true,
+      ...details,
+    });
+    fill({ tokenId: tokenA, side: 'buy', price: 0.87, size: 1 / 0.87, strategy: 'SpreadHunter', ts: baseTs, fillSource: 'touch_fill', fillDelayMs: 23_177 });
+    fill({ tokenId: tokenB, side: 'buy', price: 0.93, size: 1 / 0.93, strategy: 'SpreadHunter', ts: baseTs + 15_962, fillSource: 'resting_queue', fillDelayMs: 37_635 });
+    fill({ tokenId: tokenA, side: 'sell', price: 0.46, size: 1 / 0.87, strategy: 'StopLossExit', ts: baseTs + 40_068, fillSource: 'crossed_bid_ask', fillDelayMs: 1_493, wasExecutableAtPlacement: true });
+    fill({ tokenId: tokenB, side: 'sell', price: 0.79, size: 1 / 0.93, strategy: 'StopLossExit', ts: baseTs + 94_035, fillSource: 'crossed_bid_ask', fillDelayMs: 1_160, wasExecutableAtPlacement: true });
+
+    const spreadLedger = bot.portfolio.strategyLedger((strategy) => strategy === 'SpreadHunter', new Map([
+      [tokenA, 0.35],
+      [tokenB, 0.75],
+    ]), baseTs + 120_000);
+    assertApprox(spreadLedger.openPnl, 0, 1e-12, 'closed cross-strategy lots must not survive as SpreadHunter open PnL');
+    assert.strictEqual(spreadLedger.currentPositionExposureUsd, 0);
+
+    const breakdown = bot.portfolio.pnlBreakdownByStrategy(new Map(), baseTs + 120_000);
+    const expectedRealized = ((0.46 - 0.87) / 0.87) + ((0.79 - 0.93) / 0.93);
+    assertApprox(breakdown.pnlByStrategy.SpreadHunter.openPnl, 0, 1e-12, 'zero portfolio exposure must imply zero SpreadHunter open PnL');
+    assertApprox(breakdown.pnlByStrategy.StopLossExit.closedPnl, expectedRealized, 1e-12, 'durable realized PnL must remain attributed to the closing strategy');
+    assertApprox(
+      Object.values(breakdown.pnlByStrategy).reduce((sum, item) => sum + item.closedPnl, 0),
+      bot.portfolio.closedPnl,
+      1e-12,
+      'durable strategy PnL must reconcile to total closed PnL'
+    );
+  }
+
+  {
+    const bot = makeBot({
+      maxAdverseMovePct: 4,
+      paperFillMinDelayMs: 1_000,
+      paperFillMaxBookAgeMs: 3_000,
+      minFillUsd: 0.01,
+    });
+    const tokenId = 'real-toxic-fill-897242-guard';
+    const placementBook = makeBook({
+      bestBid: 0.87,
+      bestAsk: 0.92,
+      midpoint: 0.895,
+      spread: 0.05,
+      bids: [{ price: 0.87, size: 95 }],
+      asks: [{ price: 0.92, size: 35 }],
+    });
+    const signal = makeSignal({ tokenId, price: 0.88, sizeUsd: 1, ttlMs: 45_000 });
+    assert.strictEqual(bot.execution.place(signal, placementBook), true, 'toxic-fill regression should place a passive BUY');
+    const order = [...bot.portfolio.openOrders.values()][0];
+    order.createdAt = Date.now() - 7_190;
+    order.expiresAt = Date.now() + 30_000;
+
+    bot.execution.processOpenOrders({
+      tokenId,
+      book: makeBook({
+        bestBid: 0.53,
+        bestAsk: 0.59,
+        midpoint: 0.56,
+        spread: 0.06,
+        bids: [{ price: 0.53, size: 507 }],
+        asks: [{ price: 0.59, size: 5.44 }],
+      }),
+    });
+
+    assert.strictEqual(bot.portfolio.fills.length, 0, '39% adverse repricing must not fill the stale 0.88 quote');
+    assert.strictEqual(bot.portfolio.position(tokenId), 0, 'canceled toxic quote must not create inventory');
+    assert.strictEqual(bot.portfolio.openOrders.size, 0, 'invalidated resting quote must use the normal cancellation path');
+    const invalidation = bot.portfolio.executionEvents.find((event) => event.type === 'order_signal_invalidated');
+    assert(invalidation, 'toxic quote cancellation must be auditable');
+    assert.strictEqual(invalidation.reason, 'resting_adverse_move');
+    assertApprox(invalidation.adverseMovePct, ((0.87 - 0.53) / 0.87) * 100, 1e-12, 'regression must preserve the real adverse move');
+    assert.strictEqual(invalidation.maxAdverseMovePct, 4, 'regression must exercise the configured limit');
+  }
+
+  {
+    const bot = makeBot({
+      maxAdverseMovePct: 4,
+      paperFillMinDelayMs: 1_000,
+      paperFillMaxBookAgeMs: 3_000,
+      minFillUsd: 0.01,
+    });
+    const tokenId = 'legitimate-resting-maker-control';
+    const placementBook = makeBook({
+      bestBid: 0.85,
+      bestAsk: 0.91,
+      midpoint: 0.88,
+      spread: 0.06,
+      bids: [{ price: 0.85, size: 60 }],
+      asks: [{ price: 0.91, size: 115 }],
+    });
+    const signal = makeSignal({ tokenId, price: 0.87, sizeUsd: 1, ttlMs: 45_000 });
+    assert.strictEqual(bot.execution.place(signal, placementBook), true, 'control should place a passive BUY');
+    const order = [...bot.portfolio.openOrders.values()][0];
+    order.createdAt = Date.now() - 23_177;
+    order.expiresAt = Date.now() + 20_000;
+
+    bot.execution.processOpenOrders({
+      tokenId,
+      book: makeBook({
+        bestBid: 0.84,
+        bestAsk: 0.87,
+        midpoint: 0.855,
+        spread: 0.03,
+        bids: [{ price: 0.84, size: 134 }],
+        asks: [{ price: 0.87, size: 119 }],
+      }),
+    });
+
+    assert.strictEqual(bot.portfolio.fills.length, 1, '1.18% adverse move must preserve a legitimate touch fill');
+    assert.strictEqual(bot.portfolio.fills[0].fillSource, 'touch_fill');
+    assertApprox(bot.portfolio.fills[0].price, 0.87, 1e-12, 'control fill must retain the resting limit price');
+    assert(bot.portfolio.position(tokenId) > 0, 'control fill must create the expected paper position');
+    assert.strictEqual(
+      bot.portfolio.executionEvents.some((event) => event.type === 'order_signal_invalidated'),
+      false,
+      'control fill must not be mislabeled as toxic'
+    );
   }
 
   {

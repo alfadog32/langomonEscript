@@ -207,8 +207,19 @@ async function main() {
 
   await withEnv(baseEnv, async () => {
     const adapter = new LiveAdapter({ baseDir: root });
+    let networkOrSigningCalls = 0;
+    adapter.live.init = async () => { networkOrSigningCalls += 1; throw new Error('fixture must refuse before init'); };
+    adapter.live.getOpenOrders = async () => { networkOrSigningCalls += 1; throw new Error('fixture must refuse before network'); };
+    adapter.live.signOrderOnly = async () => { networkOrSigningCalls += 1; throw new Error('fixture must refuse before signing'); };
+    adapter.live.postSignedOrder = async () => { networkOrSigningCalls += 1; throw new Error('fixture must refuse before submission'); };
     const result = await adapter.handleIntent(makeIntent(), { mode: 'dry-run', fetchMetadata: false });
-    assert.strictEqual(result.decision, 'DRY_RUN_ALLOWED_BUT_NOT_SUBMITTED', 'dry-run must not submit');
+    assert.strictEqual(result.decision, 'REFUSED', 'missing authenticated account truth must fail closed even in dry-run mode');
+    assert(result.reasons.includes('LIVE_ACCOUNT_IDENTITY_UNCERTAIN'), 'missing authenticated identity must be reported');
+    assert(result.reasons.includes('LIVE_ACCOUNT_SNAPSHOT_STALE'), 'missing authenticated snapshot must be reported');
+    assert.strictEqual(result.safety.submitted, false, 'account-truth refusal must not submit');
+    assert.strictEqual(result.safety.signed, false, 'account-truth refusal must not sign');
+    assert.strictEqual(result.safety.privateKeyAccessed, false, 'account-truth refusal must not access a private key');
+    assert.strictEqual(networkOrSigningCalls, 0, 'account-truth refusal must not initialize, sign, query, or submit');
   });
 
   await withEnv(baseEnv, async () => {
@@ -235,60 +246,33 @@ async function main() {
     assert(evaluation.reasons.includes('RISK_NOT_APPROVED'), 'risk disagreement must block submit');
   });
 
-  // Stage 1 signing proof: kill switch stays ON, dry-run stays ON, only the
-  // explicit LIVE_SIGNING_TEST_ALLOW env opt-in unlocks the non-submitting
-  // signing proof path.  This proves the kill switch does NOT block auth/signing
-  // proofs while it still blocks every real submit/cancel/reconcile path.
+  // The authoritative self-check stays fully locked off. Account-truth and
+  // safety refusal must happen before initialization, signing, or networking.
   await withEnv({
     ...baseEnv,
+    ENABLE_LIVE_TRADING: 'false',
+    LIVE_AUTO_EXECUTE: 'false',
     LIVE_KILL_SWITCH: 'true',
     LIVE_DRY_RUN_ONLY: 'true',
-    LIVE_SIGNING_TEST_ALLOW: 'true',
-    LIVE_AUTH_CHECK_ALLOW: 'true',
-    LIVE_TRADING_STAGE: '1',
+    LIVE_SUBMIT_CONFIRM: 'false',
     LIVE_FINAL_BOSS_READY: 'false',
   }, async () => {
     const adapter = new LiveAdapter({ baseDir: root });
-    const result = await adapter.signingTest(makeIntent());
-    assert.strictEqual(result.submitted, false, 'signing test must never submit');
-
-    // Strict: if signing did not actually produce a signed order, the only
-    // acceptable classification is that the network is required and unreachable
-    // here. We do NOT treat that as a Stage 1 pass — we classify it and FAIL
-    // the readiness gate so callers know real network/CLOB/RPC access is needed.
-    if (result.signed !== true) {
-      const offline =
-        result.signingProofError === 'NETWORK_REQUIRED_FOR_SIGNING_PROOF' ||
-        result.clobReachable === false ||
-        result.rpcReachable === false;
-      if (offline) {
-        // Exit with a distinct, non-zero, network-required code so CI / human
-        // operators see it but do NOT mistake it for a pass.
-        console.log(JSON.stringify({
-          status: 'NETWORK_REQUIRED_FOR_SIGNING_PROOF',
-          message: 'Stage 1 signing proof requires CLOB and Polygon RPC connectivity. Re-run with network access.',
-          clobReachable: result.clobReachable,
-          clobReachableError: result.clobReachableError,
-          rpcReachable: result.rpcReachable,
-          rpcReachableError: result.rpcReachableError,
-          signingProofError: result.signingProofError,
-          signingProofPassed: false,
-          errors: result.errors || [],
-        }, null, 2));
-        process.exit(2);
-      }
-      // Any other signing failure (with reachable network) is a hard fail.
-      throw new Error(
-        `signing test failed without a network classification; ` +
-        `errors=${JSON.stringify(result.errors || [])} ` +
-        `signingProofError=${result.signingProofError}`
-      );
-    }
-
-    assert.strictEqual(result.signingProofPassed, true, 'signingProofPassed must be true on signed proof');
-    assert.strictEqual(result.clobReachable, true, 'clobReachable must be true when signing proof passed');
-    assert.strictEqual(result.rpcReachable, true, 'rpcReachable must be true when signing proof passed');
-    assert(Number.isFinite(result.orderConstructionLatencyMs), 'orderConstructionLatencyMs must be reported');
+    let networkOrSigningCalls = 0;
+    adapter.live.init = async () => { networkOrSigningCalls += 1; throw new Error('locked-off fixture must refuse before init'); };
+    adapter.live.getOpenOrders = async () => { networkOrSigningCalls += 1; throw new Error('locked-off fixture must refuse before network'); };
+    adapter.live.signOrderOnly = async () => { networkOrSigningCalls += 1; throw new Error('locked-off fixture must refuse before signing'); };
+    adapter.live.postSignedOrder = async () => { networkOrSigningCalls += 1; throw new Error('locked-off fixture must refuse before submission'); };
+    const result = await adapter.handleIntent(makeIntent(), { mode: 'submit', fetchMetadata: false });
+    assert.strictEqual(result.decision, 'REFUSED', 'locked-off configuration must refuse live submission');
+    assert(result.reasons.includes('LIVE_DISABLED'), 'locked-off refusal must report live trading disabled');
+    assert(result.reasons.includes('AUTO_EXECUTE_DISABLED'), 'locked-off refusal must report auto-execute disabled');
+    assert(result.reasons.includes('KILL_SWITCH_ACTIVE'), 'locked-off refusal must report the kill switch');
+    assert(result.reasons.includes('DRY_RUN_ONLY'), 'locked-off refusal must report dry-run-only mode');
+    assert.strictEqual(result.safety.submitted, false, 'locked-off refusal must not submit');
+    assert.strictEqual(result.safety.signed, false, 'locked-off refusal must not sign');
+    assert.strictEqual(result.safety.privateKeyAccessed, false, 'locked-off refusal must not access a private key');
+    assert.strictEqual(networkOrSigningCalls, 0, 'locked-off refusal must not initialize, sign, query, or submit');
   });
 
   {

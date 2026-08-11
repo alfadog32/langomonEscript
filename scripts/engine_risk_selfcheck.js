@@ -152,9 +152,9 @@ function run() {
     const { portfolio, risk } = makeRisk();
     seedPosition(portfolio, { qty: 1, avg: 0.4 });
     const result = risk.evaluate(makeSignal({ side: 'sell', sizeUsd: 10, price: 0.50 }));
-    assert.strictEqual(result, null, 'sell below MIN_ORDER_USD should block after position clamp');
-    assert.strictEqual(risk.lastBlockReason, 'sell_size_below_min');
-    assert(risk.lastBlockDetails.availableSellQty > 0);
+    assert(result, 'strictly exposure-reducing sell should remain eligible below MIN_ORDER_USD after position clamp');
+    assert.strictEqual(result.sizeUsd, 0.5, 'reduce-only sell should clamp to the exact available position value');
+    assert.strictEqual(risk.lastBlockReason, null, 'legitimate reduce-only sell must not be blocked by the ordinary entry floor');
   }
 
   {

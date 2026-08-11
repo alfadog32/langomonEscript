@@ -17,6 +17,7 @@ const {
 } = require('../live_adapter_polymarket');
 const { readConfig: readTelegramConfig } = require('../telegram/telegram_approval_bot');
 const { analyzeStateFileUsage, buildSettingsStatus, readState } = require('../dashboard_server');
+const { SCOPE: SINGLE_CANARY_SCOPE, evaluateSingleCanaryBaseline } = require('../lib/stage5_canary_session');
 
 const ROOT = process.cwd();
 const REQUIRED_PM2 = {
@@ -603,6 +604,14 @@ async function main() {
   }
 
   const liveConfig = readLiveConfig(ROOT);
+  let accountTruthSnapshot = null;
+  try {
+    const snapshotPath = path.resolve(ROOT, process.env.LIVE_ACCOUNT_TRUTH_SNAPSHOT_PATH || './runtime_monitor/polymarket_live_account_truth.json');
+    accountTruthSnapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+  } catch (_) {
+    accountTruthSnapshot = null;
+  }
+  const singleCanaryPolicy = evaluateSingleCanaryBaseline({ snapshot: accountTruthSnapshot, watcherHealth: accountTruthSnapshot?.watcher, nowMs: Date.now(), requireWatcher: true });
   const safetyFlags = {
     ENABLE_LIVE_TRADING: boolStatus(liveConfig.enableLiveTrading, false),
     LIVE_AUTO_EXECUTE: boolStatus(liveConfig.liveAutoExecute, false),
@@ -759,6 +768,11 @@ async function main() {
       maxTotalOpenOrderUsd: CONFIG.maxTotalOpenOrderUsd,
     },
     liveFinalBossGate: {
+      globalOrderHistoryReconciled: accountTruthSnapshot?.reconciliation?.orderCountReconciled === true,
+      singleCanarySessionEligible: singleCanaryPolicy.eligible,
+      singleCanaryReadinessScope: SINGLE_CANARY_SCOPE,
+      singleCanaryBlockers: singleCanaryPolicy.blockers,
+      unrestrictedLiveReadiness: false,
       configuredReadyFlag: liveConfig.liveFinalBossReady,
       configuredStage: liveConfig.liveTradingStage,
       configuredStageProfile: liveConfig.liveStageProfile || null,

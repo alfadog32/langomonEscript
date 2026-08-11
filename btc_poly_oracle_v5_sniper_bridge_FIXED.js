@@ -25,6 +25,7 @@ const path = require('path');
 loadDotEnvFile();
 
 function loadDotEnvFile(filePath = path.join(process.cwd(), '.env')) {
+  if (process.env.MM_SKIP_LOCAL_ENV_FILE === 'true' || process.env.SKIP_LOCAL_ENV_FILE === 'true') return;
   try {
     if (!fs.existsSync(filePath)) return;
     const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/);
@@ -72,6 +73,9 @@ const CONFIG = {
 
   upTokenId: envStr('BTC_UP_TOKEN_ID', ''),
   downTokenId: envStr('BTC_DOWN_TOKEN_ID', ''),
+  marketSlug: envStr('BTC_ORACLE_MARKET_SLUG', ''),
+  marketQuestion: envStr('BTC_ORACLE_MARKET_QUESTION', ''),
+  marketStartTsSec: envNum('BTC_ORACLE_MARKET_START_TS_SEC', NaN),
 
   signalPath: envStr('BTC_ORACLE_EXTERNAL_SIGNALS_JSON_PATH', envStr('BTC_ORACLE_SIGNAL_PATH', './external_signals.json')),
   signalLogPath: envStr('BTC_ORACLE_EXTERNAL_EVENTS_PATH', envStr('BTC_ORACLE_SIGNAL_LOG_PATH', './external_signal_events.ndjson')),
@@ -95,7 +99,10 @@ const CONFIG = {
   // Example: if BTC moved 0.30%, and polyMoveWeight=0.50,
   // Polymarket midpoint must have moved <= 0.15% to count as lagging.
   polyMoveWeight: envNum('BTC_ORACLE_POLY_MOVE_WEIGHT', 0.50),
-  minLagScore: envNum('BTC_ORACLE_MIN_LAG_SCORE', 0.001),
+  // Keep the lag floor coherent with the configured impulse population. A
+  // stricter value remains available explicitly, but the fallback must not be
+  // ten times a lowered BTC_ORACLE_THRESHOLD and make confirmation unreachable.
+  minLagScore: envNum('BTC_ORACLE_MIN_LAG_SCORE', envNum('BTC_ORACLE_THRESHOLD', 0.003)),
 
   minDepthUsd: envNum('OBI_MIN_DEPTH_USD', 25),
   execDepthUsd: envNum('OBI_EXEC_DEPTH_USD', 10),
@@ -454,6 +461,13 @@ function createSignalPayload({ impulse, latest, persistedAbsMove, finalBook }) {
   const obiConfirmed = directionObiConfirmed(impulse.direction, finalBook);
 
   const hardInterrupt = polyLagConfirmed && lagScorePass && obiConfirmed;
+  const marketStartTsSec = Number.isFinite(CONFIG.marketStartTsSec) ? CONFIG.marketStartTsSec : null;
+  const confirmationBlockers = [
+    finalBook.valid ? null : `book_${finalBook.reason || 'invalid'}`,
+    polyLagConfirmed ? null : 'poly_lag_not_confirmed',
+    lagScorePass ? null : 'lag_score_not_confirmed',
+    obiConfirmed ? null : 'obi_not_confirmed',
+  ].filter(Boolean);
 
   return {
     timestamp: nowIso(),
@@ -464,6 +478,12 @@ function createSignalPayload({ impulse, latest, persistedAbsMove, finalBook }) {
 
     external_source: 'binance_btcusdt_trade_ws',
     polymarket_source: 'polymarket_clob_market_ws',
+
+    market_slug: CONFIG.marketSlug || null,
+    market_question: CONFIG.marketQuestion || null,
+    market_start_ts_sec: marketStartTsSec,
+    market_start_time: marketStartTsSec === null ? null : new Date(marketStartTsSec * 1000).toISOString(),
+    market_end_time: marketStartTsSec === null ? null : new Date((marketStartTsSec + 300) * 1000).toISOString(),
 
     direction: impulse.direction,
     suggested_action: impulse.direction === 'UP' ? 'BUY_BTC_UP_TOKEN' : 'BUY_BTC_DOWN_TOKEN',
@@ -512,6 +532,16 @@ function createSignalPayload({ impulse, latest, persistedAbsMove, finalBook }) {
     },
 
     obi_confirmed: obiConfirmed,
+    confirmed: hardInterrupt,
+    confirmation_blockers: confirmationBlockers,
+    confirmation_config: {
+      btc_threshold: CONFIG.triggerThreshold,
+      persistence_min_pct: CONFIG.persistenceMinPct,
+      poly_move_weight: CONFIG.polyMoveWeight,
+      min_lag_score: CONFIG.minLagScore,
+      obi_threshold: CONFIG.obiThreshold,
+      exec_depth_usd: CONFIG.execDepthUsd,
+    },
     confidence: Math.max(0.35, Math.min(0.95, 0.50 + lagScore * 60 + (polyLagConfirmed ? 0.10 : 0) + (obiConfirmed ? 0.10 : 0))),
     suggested_max_paper_usd: CONFIG.suggestedMaxPaperUsd,
     action: 'TELEGRAM_ALERT_ONLY',
@@ -720,9 +750,10 @@ function shutdown() {
 function logStartup() {
   console.log('[ORACLE] BTC + Polymarket OBI Hub v5 Online.');
   console.log(`[ORACLE] BTC threshold=${fmtPct(CONFIG.triggerThreshold)} persistence=${CONFIG.persistenceMs}ms minPersist=${fmtPct(CONFIG.persistenceMinPct)}`);
-  console.log(`[ORACLE] Poly lag rule: polyMove <= btcMove * ${CONFIG.polyMoveWeight}`);
+  console.log(`[ORACLE] Poly lag rule: polyMove <= btcMove * ${CONFIG.polyMoveWeight} minLagScore=${CONFIG.minLagScore}`);
   console.log(`[ORACLE] OBI threshold=${CONFIG.obiThreshold} minDepth=$${CONFIG.minDepthUsd} execDepth=$${CONFIG.execDepthUsd} maxSpread=$${CONFIG.maxSpread}`);
   console.log(`[ORACLE] UP token=${shortId(CONFIG.upTokenId)} DOWN token=${shortId(CONFIG.downTokenId)}`);
+  console.log(`[ORACLE] marketSlug=${CONFIG.marketSlug || 'unknown'} marketStartTsSec=${Number.isFinite(CONFIG.marketStartTsSec) ? CONFIG.marketStartTsSec : 'unknown'}`);
   console.log(
     `[ORACLE OUTPUT] externalSignalEventsPath=${path.resolve(CONFIG.signalLogPath)} ` +
     `externalSignalsPath=${path.resolve(CONFIG.signalPath)} tradeIntentPath=${path.resolve(CONFIG.tradeIntentPath)} ` +

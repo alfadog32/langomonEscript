@@ -3,7 +3,20 @@
 
 const assert = require('assert');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+
+process.env.MM_SKIP_LOCAL_ENV_FILE = 'true';
+process.env.SKIP_LOCAL_ENV_FILE = 'true';
+const stage5DiagnosticFixturePath = path.join(os.tmpdir(), `stage5-paper-diagnostic-selfcheck-${process.pid}.ndjson`);
+process.env.STAGE5_PAPER_CANDIDATE_DIAGNOSTICS_PATH = stage5DiagnosticFixturePath;
+process.on('exit', () => {
+  try {
+    fs.unlinkSync(stage5DiagnosticFixturePath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+});
 
 const {
   DEFAULT_PROXY_WALLET,
@@ -20,6 +33,8 @@ const {
   RiskEngine,
   SpreadHunterStrategy,
   VolatilityGuard,
+  resolvedMarketEvidenceForToken,
+  settlementEvidenceHash,
 } = require('../moneymaker_v3');
 const { readConfig: readLiveConfig } = require('../live_adapter_polymarket');
 const { analyzeStateFileUsage, buildSettingsStatus } = require('../dashboard_server');
@@ -44,6 +59,21 @@ function tempPath(name) {
 
 function tempDir(name) {
   return fs.mkdtempSync(path.join('/tmp', `${name}-${process.pid}-`));
+}
+
+function markFixtureResolved(portfolio, tokenId, {
+  payoutPerShare = 0,
+  winningOutcome = 'Down',
+} = {}) {
+  const metadata = portfolio.positionMetadata.get(String(tokenId || '')) || {};
+  portfolio.positionMetadata.set(String(tokenId || ''), {
+    ...metadata,
+    resolutionStatus: 'resolved',
+    resolutionEvidenceVerified: true,
+    settlementEvidenceBlocker: null,
+    payoutPerShare,
+    winningOutcome,
+  });
 }
 
 function makeProfile() {
@@ -201,19 +231,25 @@ function writeOracleSignal(filePath, {
   direction = 'UP',
   fresh = true,
   confidence = 0.82,
-  includeLegacyConfirmFields = false,
+  includeLegacyConfirmFields = true,
+  polyLagConfirmed = true,
+  lagScorePass = true,
+  obiConfirmed = true,
   explicitConfirmedField = undefined,
-  lagScore = 0,
+  timestampMs = Date.now(),
+  marketSlug = undefined,
+  marketStartTsSec = undefined,
+  lagScore = 0.00012,
   btcTriggerMovePct = 0.00016,
   btcPersistedMovePct = 0.00018,
-  polyMidMovePct = 0.03,
+  polyMidMovePct = 0.00002,
   polyMoveWeightLimitPct = 0.00005,
   initialBtcPrice = 66500,
   triggerBtcPrice = direction === 'UP' ? 66510 : 66490,
   currentBtcPrice = direction === 'UP' ? 66518 : 66482,
   bookAfterPersistence = {},
 } = {}) {
-  const now = Date.now();
+  const now = timestampMs;
   const payload = {
     timestamp: new Date(now).toISOString(),
     expires_at: new Date(now + (fresh ? 20_000 : -5_000)).toISOString(),
@@ -243,10 +279,16 @@ function writeOracleSignal(filePath, {
       ...bookAfterPersistence,
     },
   };
+  if (marketSlug !== undefined) payload.market_slug = marketSlug;
+  if (marketStartTsSec !== undefined) {
+    payload.market_start_ts_sec = marketStartTsSec;
+    payload.market_start_time = new Date(marketStartTsSec * 1000).toISOString();
+    payload.market_end_time = new Date((marketStartTsSec + 300) * 1000).toISOString();
+  }
   if (includeLegacyConfirmFields) {
-    payload.poly_lag_confirmed = true;
-    payload.lag_score_pass = true;
-    payload.obi_confirmed = true;
+    payload.poly_lag_confirmed = polyLagConfirmed;
+    payload.lag_score_pass = lagScorePass;
+    payload.obi_confirmed = obiConfirmed;
   }
   if (explicitConfirmedField !== undefined) {
     payload.confirmed = explicitConfirmedField;
@@ -355,6 +397,10 @@ async function run() {
   const signalPath = tempPath('gabagool-signal');
   const targetPath = tempPath('gabagool-target');
   const eventsPath = tempPath('gabagool-events');
+  const realOracleFixture = JSON.parse(fs.readFileSync(
+    path.join(__dirname, 'fixtures', 'btc_oracle_20260807T175015Z.json'),
+    'utf8'
+  ));
 
   const model = buildBehaviorModel({
     profile: makeProfile(),
@@ -556,6 +602,118 @@ async function run() {
     assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 0, 'not-confirmed oracle signal must be blocked before Sophie');
     assert.strictEqual(report.signalStats.oracleSignalsNotConfirmedLastHour, 1, 'not-confirmed oracle signal count should be included in the btc oracle report');
     assert.strictEqual(report.signalStats.lastNotConfirmedReason, 'btc_move_below_threshold', 'not-confirmed signal should include a specific reason');
+    assert.deepStrictEqual(health.oracleNotConfirmedReasonsLastHour, { btc_move_below_threshold: 1 });
+    assert.strictEqual(health.dominantOracleNotConfirmedReasonLastHour, 'btc_move_below_threshold');
+    assert(bot.formatBtcOracleReport(report).includes('btc_move_below_threshold:1'));
+  }
+
+  {
+    writeOracleTarget(targetPath, baseStartSec);
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    wireBooks(bot);
+    writeOracleSignal(signalPath, {
+      fresh: true,
+      polyLagConfirmed: false,
+      lagScorePass: true,
+      obiConfirmed: true,
+      explicitConfirmedField: false,
+    });
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 0, 'an actually unconfirmed signal must remain blocked');
+    assert.strictEqual(health.oracleNotConfirmedReasonsLastHour.poly_lag_not_confirmed, 1);
+    assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 0, 'confirmation must never be bypassed');
+  }
+
+  {
+    writeOracleTarget(targetPath, baseStartSec);
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    wireBooks(bot);
+    const evidenceTimestamp = Date.now();
+    writeOracleSignal(signalPath, {
+      timestampMs: evidenceTimestamp,
+      polyLagConfirmed: true,
+      lagScorePass: false,
+      obiConfirmed: true,
+      explicitConfirmedField: false,
+    });
+    await bot.runGabagoolBtcOracleImitation();
+    writeOracleSignal(signalPath, {
+      timestampMs: evidenceTimestamp,
+      polyLagConfirmed: true,
+      lagScorePass: true,
+      obiConfirmed: true,
+      explicitConfirmedField: true,
+    });
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.oracleSignalsNotConfirmedLastHour, 1, 'initial incomplete evidence should be counted once');
+    assert.strictEqual(health.oracleSignalsConfirmedLastHour, 1, 'superseding confirmation evidence must escape the negative-event cache');
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'superseding valid evidence should build the production candidate');
+  }
+
+  {
+    const signalMarketSlug = `btc-updown-5m-${baseStartSec}`;
+    writeOracleTarget(targetPath, baseStartSec + 300);
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+    wireBooks(bot);
+    writeOracleSignal(signalPath, {
+      marketSlug: signalMarketSlug,
+      marketStartTsSec: baseStartSec,
+      explicitConfirmedField: true,
+    });
+    await bot.runGabagoolBtcOracleImitation();
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.oracleNotConfirmedReasonsLastHour.market_mismatch, 1, 'rollover must identify the stale producing market exactly once');
+    assert.strictEqual(health.duplicateOracleSignalsSkippedLastHour, 1, 'target rollover must not rebind and re-evaluate the signal on the new market');
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 0, 'old-window signals must never attach to the next five-minute market');
+  }
+
+  {
+    writeOracleTarget(targetPath, baseStartSec);
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, { sophieMinExecutionQuality: 0.10 }));
+    wireBooks(bot);
+    writeOracleSignal(signalPath, {
+      tokenId: 'down-token',
+      direction: 'DOWN',
+      fresh: true,
+      explicitConfirmedField: true,
+      marketSlug: `btc-updown-5m-${baseStartSec}`,
+      marketStartTsSec: baseStartSec,
+    });
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'confirmed BTC Down mapping should build a candidate');
+    assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 1, 'confirmed BTC Down should reach Sophie');
+    assert.strictEqual(health.gabagoolRiskEvaluatedLastHour, 1, 'admitted BTC Down should reach RiskEngine');
+  }
+
+  {
+    writeOracleTarget(targetPath, baseStartSec);
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, { sophieMinExecutionQuality: 0.10 }));
+    wireBooks(bot);
+    writeJsonFile(signalPath, {
+      ...realOracleFixture,
+      timestamp: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 20_000).toISOString(),
+      token_id: 'up-token',
+      market_slug: `btc-updown-5m-${baseStartSec}`,
+      market_start_ts_sec: baseStartSec,
+      market_start_time: new Date(baseStartSec * 1000).toISOString(),
+      market_end_time: new Date((baseStartSec + 300) * 1000).toISOString(),
+      lag_score_pass: true,
+      confirmed: true,
+      confirmation_blockers: [],
+      confirmation_config: { min_lag_score: 0.0001 },
+    });
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(realOracleFixture.lag_score_pass, false, 'real fixture must preserve the pre-fix failure');
+    assert.strictEqual(health.oracleSignalsConfirmedLastHour, 1, 'corrected producer contract should confirm the real qualifying fixture');
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'real qualifying fixture should build a production-path candidate');
+    assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 1, 'real qualifying fixture should reach Sophie');
+    assert.strictEqual(health.gabagoolRiskEvaluatedLastHour, 1, 'admitted real fixture should reach RiskEngine');
   }
 
   {
@@ -565,7 +723,7 @@ async function run() {
     await bot.runGabagoolBtcOracleImitation();
     const health = bot.portfolio.executionHealth();
     const report = bot.buildBtcOracleReport(bot.cache.markPrices(), Date.now());
-    assert.strictEqual(report.signalStats.confirmedSource, 'derived_from_persistence', 'fresh signal without explicit confirmed field should derive confirmation from persistence');
+    assert.strictEqual(report.signalStats.confirmedSource, 'oracle_confirmation_fields', 'fresh signal should require the oracle lag and OBI confirmation fields');
     assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'fresh oracle signal should build one candidate');
     assert.strictEqual(bot.portfolio.openOrders.size, 0, 'Sophie-rejected candidate must not place an order');
     assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 1, 'fresh confirmed oracle signal should reach Sophie');
@@ -576,6 +734,113 @@ async function run() {
       'PAPER ONLY BTC GABAGOOL SOPHIE_BLOCKED',
       'Sophie block should use the final Telegram state label'
     );
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile: tempPath('legacy-expired-pipeline-state'),
+      sophieMinExecutionQuality: 0.10,
+      maxTotalExposureUsd: 2,
+      btcExposureBucketShare: 1,
+      maxMarketExposureUsd: 10,
+      maxPositionUsdPerAsset: 10,
+      gabagoolMaxPaperDrawdownPct: 100,
+      gabagoolMaxPaperClosedLossUsd: 100,
+    }));
+    wireBooks(bot);
+    const legacyTokenId = 'legacy-expired-pipeline-token';
+    const legacyMarketId = 'legacy-expired-pipeline-market';
+    const expiredStartSec = baseStartSec - 900;
+    bot.portfolio.positions.set(legacyTokenId, 4);
+    bot.portfolio.costBasis.set(legacyTokenId, 0.50);
+    bot.portfolio.positionMarkets.set(legacyTokenId, legacyMarketId);
+    bot.portfolio.setMarkPrice(legacyTokenId, 0.50);
+    bot.portfolio.fills = [];
+    bot.portfolio.positionMetadata.clear();
+    bot.poly.fetchMarketById = async (requestedMarketId) => ({
+      id: requestedMarketId,
+      slug: `btc-updown-5m-${expiredStartSec}`,
+      question: 'Bitcoin Up or Down - legacy pipeline fixture',
+      clobTokenIds: JSON.stringify([legacyTokenId, 'legacy-expired-pipeline-other-token']),
+      outcomes: JSON.stringify(['Up', 'Down']),
+      outcomePrices: JSON.stringify(['0', '1']),
+      closed: true,
+      acceptingOrders: false,
+      umaResolutionStatus: 'resolved',
+      endDate: new Date((expiredStartSec + 300) * 1000).toISOString(),
+    });
+    writeOracleSignal(signalPath, { fresh: true });
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'fixture should build a real Gabagool candidate');
+    assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 1, 'verified aged-out inventory should no longer stop the candidate before Sophie');
+    assert.strictEqual(health.gabagoolRiskEvaluatedLastHour, 1, 'verified aged-out inventory should allow the candidate to reach RiskEngine');
+    assert.strictEqual(health.gabagoolPlacementAttemptedLastHour, 1, 'verified aged-out inventory should allow a real paper placement attempt');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'the nearest production path should place a genuine resting paper order');
+    const afterPlacementExposure = bot.risk.exposureBreakdown();
+    assert.strictEqual(afterPlacementExposure.expiredBtc5mExposureUsd, 0, 'resolved legacy inventory should settle before production-path admission');
+    assert.strictEqual(bot.portfolio.settlements.length, 1, 'production path should preserve a durable market-settlement audit record');
+    assert.strictEqual(afterPlacementExposure.capBlockingExposureUsd, 1, 'only the genuine new paper order should be cap blocking after admission');
+  }
+
+  {
+    const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile: tempPath('pending-resolution-pipeline-state'),
+      sophieMinExecutionQuality: 0.10,
+      maxTotalExposureUsd: 2,
+      btcExposureBucketShare: 1,
+      maxMarketExposureUsd: 10,
+      maxPositionUsdPerAsset: 10,
+      gabagoolMaxPaperDrawdownPct: 100,
+      gabagoolMaxPaperClosedLossUsd: 100,
+    }));
+    wireBooks(bot);
+    const pendingToken = 'pending-resolution-pipeline-token';
+    const pendingOtherToken = 'pending-resolution-pipeline-other-token';
+    const pendingMarketId = 'pending-resolution-pipeline-market';
+    const pendingStartSec = baseStartSec - 900;
+    const pendingSlug = `btc-updown-5m-${pendingStartSec}`;
+    bot.portfolio.recordFill({
+      tokenId: pendingToken,
+      marketId: pendingMarketId,
+      marketSlug: pendingSlug,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+      ts: Date.now() - 11 * 60_000,
+    });
+    bot.portfolio.setMarkPrice(pendingToken, 0.50);
+    bot.poly.fetchMarketById = async (requestedMarketId) => {
+      assert.strictEqual(requestedMarketId, pendingMarketId, 'pending-resolution fixture must query the exact retained market');
+      return {
+        id: pendingMarketId,
+        slug: pendingSlug,
+        clobTokenIds: JSON.stringify([pendingToken, pendingOtherToken]),
+        outcomes: JSON.stringify(['Up', 'Down']),
+        outcomePrices: JSON.stringify(['0.5', '0.5']),
+        closed: true,
+        acceptingOrders: false,
+        umaResolutionStatus: 'proposed',
+        endDate: new Date((pendingStartSec + 300) * 1000).toISOString(),
+      };
+    };
+    writeOracleSignal(signalPath, { fresh: true });
+    await bot.runGabagoolBtcOracleImitation();
+    const health = bot.portfolio.executionHealth();
+    const exposure = bot.risk.exposureBreakdown();
+    assert.strictEqual(health.gabagoolCandidatesBuiltLastHour, 1, 'pending inventory fixture should build one production-path candidate');
+    assert.strictEqual(health.gabagoolSophieEvaluatedLastHour, 1, 'pending inventory must not stop the candidate before Sophie');
+    assert.strictEqual(health.gabagoolRiskEvaluatedLastHour, 1, 'pending inventory must not stop the candidate before RiskEngine');
+    assert.strictEqual(health.gabagoolPlacementAttemptedLastHour, 1, 'pending inventory must allow a genuine paper placement attempt');
+    assert.strictEqual(bot.portfolio.openOrders.size, 1, 'pending inventory fixture should place a genuine realistic paper order');
+    assert.strictEqual(exposure.resolutionPendingExposureUsd, 2, 'pending inventory must remain visible after the new candidate proceeds');
+    assert.strictEqual(exposure.capBlockingExposureUsd, 1, 'only the genuine new paper order may block the cap');
+    assert.strictEqual(bot.portfolio.positions.has(pendingToken), true, 'pending inventory must remain persisted for future settlement');
+    assert.strictEqual(bot.portfolio.settlements.length, 0, 'ambiguous evidence must not create a settlement');
   }
 
   {
@@ -681,6 +946,7 @@ async function run() {
     portfolio.setMarkPrice('stale-btc-b', 0.50);
     portfolio.paperTokenTradeability.set('stale-btc-a', { status: 'stale_token_cooldown' });
     portfolio.paperTokenTradeability.set('stale-btc-b', { status: 'no_orderbook_404' });
+    markFixtureResolved(portfolio, 'stale-btc-a');
     const admitted = risk.evaluate({
       strategy: 'GabagoolBtcOracleStrategy',
       tokenId: 'fresh-btc-entry',
@@ -770,7 +1036,7 @@ async function run() {
     });
     pendingPortfolio.setMarkPrice('pending-btc-token', 0.50);
     pendingPortfolio.paperTokenTradeability.set('pending-btc-token', { status: 'stale_token_cooldown' });
-    const pendingBlocked = pendingRisk.evaluate({
+    const pendingAdmitted = pendingRisk.evaluate({
       strategy: 'GabagoolBtcOracleStrategy',
       tokenId: 'fresh-btc-entry-3',
       marketId: 'btc-fresh-market-3',
@@ -790,10 +1056,13 @@ async function run() {
         },
       },
     });
-    assert.strictEqual(pendingBlocked, null, 'resolution-pending BTC exposure above the bucket cap should still be blocked');
-    assert.strictEqual(pendingRisk.lastBlockReason, 'btc_bucket_exposure', 'resolution-pending BTC exposure should still count against the BTC bucket');
-    assert.strictEqual(pendingRisk.lastBlockDetails.resolutionPendingExposureUsd, 8, 'resolution-pending BTC exposure should be reported separately');
-    assert.strictEqual(pendingRisk.lastBlockDetails.strategyBucketExposureExclusionUsd, 0, 'resolution-pending BTC exposure must remain conservative');
+    assert(pendingAdmitted, 'resolution-pending BTC inventory must not block an otherwise valid paper candidate');
+    const pendingDetails = pendingRisk.riskDetails(pendingAdmitted);
+    assert.strictEqual(pendingDetails.resolutionPendingExposureUsd, 8, 'resolution-pending BTC exposure should remain reported separately');
+    assert.strictEqual(pendingDetails.strategyBucketExposureExclusionUsd, 8, 'resolution-pending BTC exposure should be excluded from the normal paper bucket cap');
+    assert.strictEqual(pendingDetails.strategyBucketExposureUsd, 0, 'resolution-pending BTC exposure must not consume the normal paper bucket');
+    assert.strictEqual(pendingDetails.capBlockingExposureUsd, 0, 'resolution-pending BTC exposure must not consume the global paper cap');
+    assert.strictEqual(pendingPortfolio.positions.size, 1, 'cap exclusion must not silently delete pending inventory');
   }
 
   {
@@ -825,6 +1094,555 @@ async function run() {
     assert.strictEqual(scan.candidates.length, 0, 'no real bid should produce no reduce-only candidates');
     assert.strictEqual(scan.capTriggerReason, 'active_tradable_exposure_over_cap', 'scan should expose the active cap-trigger reason');
     assert(scan.blockedReasonSummary.includes('stale_token_cooldown_active_window:1'), 'scan should expose the active-window stale no-bid reason');
+  }
+
+  {
+    const config = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      maxTotalExposureUsd: 10,
+      btcExposureBucketShare: 0.6,
+    });
+    const bot = new BotEngine(config);
+    const tokenId = 'aged-out-fill-token';
+    const marketId = 'aged-out-fill-market';
+    const expiredStartSec = baseStartSec - 900;
+    bot.portfolio.positions.set(tokenId, 4);
+    bot.portfolio.costBasis.set(tokenId, 0.50);
+    bot.portfolio.positionMarkets.set(tokenId, marketId);
+    bot.portfolio.setMarkPrice(tokenId, 0.50);
+    bot.portfolio.fills = [];
+    bot.portfolio.positionMetadata.clear();
+
+    const before = bot.risk.exposureBreakdown(null, { markPrices: bot.cache.markPrices() });
+    assert.strictEqual(before.activeTradableExposureUsd, 2, 'unattributed inventory must remain cap blocking before objective verification');
+    assert.strictEqual(before.expiredBtc5mExposureUsd, 0, 'unknown inventory must not be guessed to be expired');
+
+    bot.poly.fetchMarketById = async (requestedMarketId) => ({
+      id: requestedMarketId,
+      slug: `btc-updown-5m-${expiredStartSec}`,
+      question: 'Bitcoin Up or Down - fixture',
+      clobTokenIds: JSON.stringify([tokenId, 'aged-out-fill-other-token']),
+      outcomes: JSON.stringify(['Up', 'Down']),
+      outcomePrices: JSON.stringify(['0', '1']),
+      closed: true,
+      acceptingOrders: false,
+      umaResolutionStatus: 'resolved',
+      endDate: new Date((expiredStartSec + 300) * 1000).toISOString(),
+    });
+    const refresh = await bot.refreshGabagoolPositionMetadata(Date.now());
+    assert.deepStrictEqual(refresh, { attempted: 1, verified: 1, unresolved: 0 }, 'Gamma lookup should verify the aged-out BTC position');
+
+    const after = bot.risk.exposureBreakdown(null, { markPrices: bot.cache.markPrices() });
+    assert.strictEqual(after.activeTradableExposureUsd, 0, 'verified expired BTC inventory must stop blocking the cap');
+    assert.strictEqual(after.expiredBtc5mExposureUsd, 2, 'verified expired BTC inventory should move to the expired bucket');
+    assert.strictEqual(after.capBlockingExposureUsd, 0, 'verified expired BTC inventory should not count against paper entry exposure');
+    assert.strictEqual(after.btcOraclePositionExposureUsd, 2, 'strategy exposure should survive retained-fill truncation');
+    assert.strictEqual(after.nonBtcPositionExposureUsd, 0, 'verified BTC inventory must not be mislabeled as non-BTC');
+
+    const restartedPortfolio = new PaperPortfolio(config);
+    restartedPortfolio.hydratePersistedState(bot.portfolio.buildPersistedState());
+    const restartedRisk = new RiskEngine(config, restartedPortfolio);
+    const restarted = restartedRisk.exposureBreakdown(null, { markPrices: restartedPortfolio.markPricesSnapshot() });
+    assert.strictEqual(restarted.expiredBtc5mExposureUsd, 2, 'verified position metadata must survive a normal state save/load');
+    assert.strictEqual(restarted.capBlockingExposureUsd, 0, 'restart must not recreate the false exposure blocker');
+
+    const unknownToken = 'unverified-aged-out-token';
+    bot.portfolio.positions.set(unknownToken, 4);
+    bot.portfolio.costBasis.set(unknownToken, 0.50);
+    bot.portfolio.positionMarkets.set(unknownToken, 'unverified-market');
+    bot.portfolio.setMarkPrice(unknownToken, 0.50);
+    bot.poly.fetchMarketById = async (requestedMarketId) => ({
+      id: requestedMarketId,
+      slug: `btc-updown-5m-${expiredStartSec}`,
+      clobTokenIds: JSON.stringify(['different-token']),
+      outcomes: JSON.stringify(['Up']),
+      closed: true,
+      acceptingOrders: false,
+    });
+    const unresolved = await bot.refreshGabagoolPositionMetadata(Date.now() + 5 * 60_000);
+    assert.strictEqual(unresolved.verified, 0, 'a market response that does not contain the token must not verify ownership');
+    const failClosed = bot.risk.exposureBreakdown(null, { markPrices: bot.cache.markPrices() });
+    assert.strictEqual(failClosed.activeTradableExposureUsd, 2, 'unverified inventory must remain cap blocking');
+  }
+
+  {
+    const config = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile: tempPath('resolved-settlement-state'),
+    });
+    const bot = new BotEngine(config);
+    const expiredStartSec = baseStartSec - 900;
+    const marketId = 'resolved-settlement-market';
+    const marketSlug = `btc-updown-5m-${expiredStartSec}`;
+    const upToken = 'resolved-settlement-up-token';
+    const downToken = 'resolved-settlement-down-token';
+    bot.portfolio.recordFill({
+      tokenId: upToken,
+      marketId,
+      marketSlug,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    bot.portfolio.recordFill({
+      tokenId: downToken,
+      marketId,
+      marketSlug,
+      outcome: 'Down',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    assert.strictEqual(bot.portfolio.equity(), 96, 'unresolved expired inventory must be excluded from reliable equity');
+    bot.poly.fetchMarketById = async () => ({
+      id: marketId,
+      slug: marketSlug,
+      question: 'Bitcoin Up or Down - settlement fixture',
+      clobTokenIds: JSON.stringify([upToken, downToken]),
+      outcomes: JSON.stringify(['Up', 'Down']),
+      outcomePrices: JSON.stringify(['1', '0']),
+      closed: true,
+      acceptingOrders: false,
+      umaResolutionStatus: 'resolved',
+      resolutionSource: 'fixture-resolution-source',
+      endDate: new Date((expiredStartSec + 300) * 1000).toISOString(),
+      closedTime: new Date((expiredStartSec + 300) * 1000).toISOString(),
+    });
+    const reconciled = await bot.reconcileResolvedPaperPositions(Date.now());
+    assert.deepStrictEqual(reconciled, { attempted: 2, settled: 2, pending: 0 });
+    assert.strictEqual(bot.portfolio.positions.size, 0, 'settled positions must leave the open position ledger');
+    assert.strictEqual(bot.portfolio.settlements.length, 2, 'winner and loser settlement audit records must both persist');
+    assert.strictEqual(bot.portfolio.cash, 100, 'winner must pay one dollar per share and loser must pay zero');
+    assert.strictEqual(bot.portfolio.closedPnl, 0, 'combined winner and loser realized settlement PnL should reconcile');
+    assert.strictEqual(bot.portfolio.equity(), 100, 'equity must equal settled cash after positions close');
+    const duplicate = bot.portfolio.settleResolvedPosition({
+      tokenId: upToken,
+      evidence: bot.portfolio.settlements.find((entry) => entry.tokenId === upToken).evidence,
+    });
+    assert.strictEqual(duplicate.duplicate, true, 'the durable settlement key must prevent repeated payout');
+    const restarted = new PaperPortfolio(config);
+    restarted.hydratePersistedState(bot.portfolio.buildPersistedState());
+    assert.strictEqual(restarted.settlements.length, 2, 'settlement audit history must survive state hydration');
+    assert.strictEqual(restarted.settlementKeys.size, 2, 'idempotency keys must survive state hydration');
+    assert(bot.portfolio.settlements.every((entry) => entry.evidenceHash === settlementEvidenceHash(entry.evidence)), 'settlement records must persist deterministic evidence hashes');
+    const ledger = restarted.strategyLedger((strategy) => strategy === 'GabagoolBtcOracleStrategy');
+    assert.strictEqual(ledger.settlementsCount, 2, 'trusted strategy PnL must include objective market settlements');
+    assert.strictEqual(ledger.trustedClosedPnl, 0, 'trusted settlement PnL must reconcile through the strategy ledger');
+    assert.strictEqual(ledger.currentPositionExposureUsd, 0, 'settled fill lots must not survive as phantom strategy exposure');
+    assert.strictEqual(ledger.perTokenExposure.length, 0, 'settled tokens must leave strategy per-token exposure');
+
+    const pendingConfig = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile: tempPath('pending-settlement-state'),
+    });
+    const pendingBot = new BotEngine(pendingConfig);
+    pendingBot.portfolio.recordFill({
+      tokenId: upToken,
+      marketId,
+      marketSlug,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    pendingBot.poly.fetchMarketById = async () => ({
+      id: marketId,
+      slug: marketSlug,
+      clobTokenIds: JSON.stringify([upToken, downToken]),
+      outcomes: JSON.stringify(['Up', 'Down']),
+      outcomePrices: JSON.stringify(['0.5', '0.5']),
+      closed: true,
+      acceptingOrders: false,
+      umaResolutionStatus: 'proposed',
+      endDate: new Date((expiredStartSec + 300) * 1000).toISOString(),
+    });
+    const pending = await pendingBot.reconcileResolvedPaperPositions(Date.now());
+    assert.deepStrictEqual(pending, { attempted: 1, settled: 0, pending: 1 });
+    assert.strictEqual(pendingBot.portfolio.positions.size, 1, 'ambiguous resolution must retain the position');
+    assert.strictEqual(pendingBot.portfolio.settlements.length, 0, 'ambiguous resolution must not fabricate settlement');
+    assert.strictEqual(pendingBot.portfolio.equity(), 98, 'pending resolution cost must stay outside reliable equity');
+    const pendingExposure = pendingBot.risk.exposureBreakdown();
+    assert.strictEqual(pendingExposure.resolutionPendingExposureUsd, 2, 'ambiguous resolution must use the pending bucket');
+    assert.strictEqual(pendingExposure.excludedDeadExposureUsd, 0, 'ambiguous resolution must not count as confirmed dead');
+    assert.strictEqual(pendingExposure.capBlockingExposureUsd, 0, 'ambiguous resolution must not block the normal global paper cap');
+    assert.strictEqual(pendingBot.risk.exposureBucketState({ strategy: 'GabagoolBtcOracleStrategy', side: 'buy', sizeUsd: 1 }, pendingExposure).strategyBucketExposureUsd, 0, 'ambiguous resolution must not block the Gabagool paper bucket');
+    pendingBot.portfolio.paperTokenTradeability.set(upToken, { status: 'no_orderbook_404' });
+    const pendingNoBookExposure = pendingBot.risk.exposureBreakdown();
+    assert.strictEqual(pendingNoBookExposure.resolutionPendingExposureUsd, 2, 'expired no-book inventory without resolution proof must remain pending');
+    assert.strictEqual(pendingNoBookExposure.confirmedNoOrderbook404ExposureUsd, 0, 'an expired 404 must not override missing resolution evidence');
+  }
+
+  {
+    const stateFile = tempPath('standard-settlement-real-characteristics-state');
+    const config = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile,
+      maxTotalExposureUsd: 8,
+      standardExposureBucketShare: 0.5,
+    });
+    const bot = new BotEngine(config);
+    const fixtures = [
+      {
+        tokenId: '70754151140016266921164956760483788029340576041455876128222747444483880527185',
+        otherTokenId: '38410698283767127398742019309168536543792244747816607463407366447758077453222',
+        marketId: '3276452',
+        marketSlug: 'lol-t1-hle1-2026-08-08-total-games-2pt5',
+        outcome: 'Over',
+        outcomes: ['Over', 'Under'],
+        outcomePrices: [1, 0],
+        entryPrice: 0.65,
+        mark: 0.57,
+        closedTime: '2026-08-08T13:23:00.000Z',
+      },
+      {
+        tokenId: '89535822439559695331746132462978157222180050647924770918964479731303792316026',
+        otherTokenId: '95968977050074120413876909833798622722288635977338912048510921419928661095848',
+        marketId: '3285896',
+        marketSlug: 'lol-lgd-al-2026-08-08-total-games-2pt5',
+        outcome: 'Over',
+        outcomes: ['Over', 'Under'],
+        outcomePrices: [0, 1],
+        entryPrice: 0.17,
+        mark: 0.07,
+        closedTime: '2026-08-08T14:03:15.000Z',
+      },
+      {
+        tokenId: '76073147559295528213098377778077503433003193159387639418630910211792453287184',
+        otherTokenId: '65229114994463166123276141069161084375168779366225791850381813504475206256202',
+        marketId: '3405001',
+        marketSlug: 'cs2-eye-pha-2026-08-08-game2',
+        outcome: 'EYEBALLERS',
+        outcomes: ['EYEBALLERS', 'Phantom'],
+        outcomePrices: [0, 1],
+        entryPrice: 0.52,
+        mark: 0.035,
+        closedTime: '2026-08-08T13:31:55.000Z',
+      },
+      {
+        tokenId: '82163733115918728572083283131773429629266071008421689272651250216974263714339',
+        otherTokenId: '86389089648674011884114763286975909594313918763448185164084052958510839514759',
+        marketId: '3405026',
+        marketSlug: 'cs2-eye-pha-2026-08-08',
+        outcome: 'EYEBALLERS',
+        outcomes: ['EYEBALLERS', 'Phantom'],
+        outcomePrices: [1, 0],
+        entryPrice: 0.42,
+        mark: 0.9855,
+        closedTime: '2026-08-08T14:37:12.000Z',
+      },
+    ];
+    const markets = new Map();
+    for (const fixture of fixtures) {
+      bot.portfolio.recordFill({
+        tokenId: fixture.tokenId,
+        marketId: fixture.marketId,
+        marketSlug: '',
+        outcome: fixture.outcome,
+        side: 'buy',
+        price: fixture.entryPrice,
+        size: 1 / fixture.entryPrice,
+        strategy: 'SpreadHunter',
+      });
+      bot.portfolio.setMarkPrice(fixture.tokenId, fixture.mark);
+      markets.set(fixture.marketId, {
+        id: fixture.marketId,
+        slug: fixture.marketSlug,
+        question: `standard settlement fixture ${fixture.marketId}`,
+        clobTokenIds: JSON.stringify([fixture.tokenId, fixture.otherTokenId]),
+        outcomes: JSON.stringify(fixture.outcomes),
+        outcomePrices: JSON.stringify(fixture.outcomePrices.map(String)),
+        closed: true,
+        acceptingOrders: false,
+        closedTime: fixture.closedTime,
+      });
+    }
+    const beforeExposure = bot.risk.exposureBreakdown(null, { markPrices: bot.portfolio.markPricesSnapshot() });
+    const beforeBucket = bot.risk.exposureBucketState({
+      strategy: 'SpreadHunter', side: 'buy', price: 0.50, sizeUsd: 1,
+    }, beforeExposure);
+    assert(Math.abs(beforeExposure.activeTradableExposureUsd - 3.7024240465416938) < 1e-9, 'real standard fixture marks must reproduce the stale exposure');
+    assert(beforeBucket.strategyBucketWouldExposureUsd > beforeBucket.strategyBucketCapUsd, 'stale standard fixture exposure must reproduce the bucket block');
+
+    bot.poly.fetchMarketById = async (marketId) => markets.get(String(marketId));
+    const expectedPayout = fixtures.reduce((sum, fixture) => (
+      sum + ((1 / fixture.entryPrice) * fixture.outcomePrices[fixture.outcomes.indexOf(fixture.outcome)])
+    ), 0);
+    const expectedSettlementPnl = expectedPayout - fixtures.length;
+    const reconciled = await bot.reconcileResolvedPaperPositions(Date.now());
+    assert.deepStrictEqual(reconciled, { attempted: 4, settled: 4, pending: 0 });
+    assert(Math.abs(expectedPayout - 3.9194139194139193) < 1e-12, 'real standard regression characteristics must derive the authoritative payout');
+    assert(Math.abs(bot.portfolio.cash - (100 - fixtures.length + expectedPayout)) < 1e-9, 'standard winner payouts and loser zero payouts must credit cash exactly once');
+    assert(Math.abs(bot.portfolio.closedPnl - expectedSettlementPnl) < 1e-9, 'standard settlement PnL must reconcile from cost and payout');
+    assert.strictEqual(bot.portfolio.positions.size, 0, 'standard settlements must remove every resolved position');
+    assert.strictEqual(bot.portfolio.settlements.length, 4, 'standard settlements must persist one audit record per position');
+    assert(bot.portfolio.settlements.every((entry) => entry.strategy === 'SpreadHunter'), 'standard settlement PnL attribution must remain with SpreadHunter');
+    assert(bot.portfolio.settlements.every((entry) => entry.evidence.marketType === 'standard_binary'), 'standard settlements must retain their evidence class');
+    assert(bot.portfolio.settlements.every((entry) => entry.evidence.resolutionProof === 'standard_closed_binary_payout'), 'standard settlements must retain the exact proof type');
+    assert(bot.portfolio.settlements.every((entry) => entry.evidenceHash === settlementEvidenceHash(entry.evidence)), 'standard settlement evidence hashes must be deterministic');
+    const afterExposure = bot.risk.exposureBreakdown(null, { markPrices: bot.portfolio.markPricesSnapshot() });
+    const afterBucket = bot.risk.exposureBucketState({
+      strategy: 'SpreadHunter', side: 'buy', price: 0.50, sizeUsd: 1,
+    }, afterExposure);
+    assert.strictEqual(afterExposure.activeTradableExposureUsd, 0, 'settled standard inventory must leave active exposure');
+    assert(afterBucket.strategyBucketWouldExposureUsd <= afterBucket.strategyBucketCapUsd, 'settled standard inventory must release the standard bucket');
+    bot.portfolio.setMarkPrice(fixtures[0].tokenId, 0.99);
+    assert.strictEqual(bot.portfolio.position(fixtures[0].tokenId), 0, 'a stale post-settlement mark must not recreate a position');
+    assert.strictEqual(bot.portfolio.positionExposureUsd(bot.portfolio.markPricesSnapshot()), 0, 'a stale post-settlement mark must not recreate exposure');
+    assert.deepStrictEqual(await bot.reconcileResolvedPaperPositions(Date.now() + 1), { attempted: 0, settled: 0, pending: 0 }, 'reconciliation must be idempotent once standard positions are gone');
+
+    const restarted = new PaperPortfolio(config);
+    restarted.hydratePersistedState(JSON.parse(fs.readFileSync(stateFile, 'utf8')));
+    assert.strictEqual(restarted.positions.size, 0, 'restart must not restore settled standard positions');
+    assert.strictEqual(restarted.settlements.length, 4, 'restart must preserve all standard settlements');
+    assert.strictEqual(restarted.settlementKeys.size, 4, 'restart must preserve standard idempotency keys');
+    assert(Math.abs(restarted.cash - bot.portfolio.cash) < 1e-9, 'restart must preserve standard settlement cash');
+    assert(Math.abs(restarted.closedPnl - bot.portfolio.closedPnl) < 1e-9, 'restart must preserve standard settlement PnL');
+    const firstSettlement = restarted.settlements.find((entry) => entry.tokenId === fixtures[0].tokenId);
+    const duplicate = restarted.settleResolvedPosition({ tokenId: fixtures[0].tokenId, evidence: firstSettlement.evidence });
+    assert.strictEqual(duplicate.duplicate, true, 'restart idempotency must refuse duplicate standard payout');
+    assert(Math.abs(restarted.cash - bot.portfolio.cash) < 1e-9, 'duplicate standard retry must not change cash');
+  }
+
+  {
+    const standardToken = 'standard-adversarial-held-token';
+    const standardOtherToken = 'standard-adversarial-other-token';
+    const standardMarketId = 'standard-adversarial-market';
+    const standardMarketSlug = 'standard-adversarial-slug';
+    const baseMarket = {
+      id: standardMarketId,
+      slug: standardMarketSlug,
+      clobTokenIds: JSON.stringify([standardToken, standardOtherToken]),
+      outcomes: JSON.stringify(['Yes', 'No']),
+      outcomePrices: JSON.stringify(['1', '0']),
+      closed: true,
+      acceptingOrders: false,
+      closedTime: new Date(Date.now() - 60_000).toISOString(),
+    };
+    const runRefusal = async (label, market, expectedMetadataBlocker, reconcileAt = Date.now()) => {
+      const bot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+        saveState: true,
+        stateFile: tempPath(`standard-settlement-refusal-${label.replace(/[^a-z0-9]+/gi, '-')}`),
+      }));
+      bot.portfolio.recordFill({
+        tokenId: standardToken,
+        marketId: standardMarketId,
+        marketSlug: standardMarketSlug,
+        outcome: 'Yes',
+        side: 'buy',
+        price: 0.40,
+        size: 2.5,
+        strategy: 'SpreadHunter',
+      });
+      const before = bot.portfolio.captureSettlementState();
+      bot.poly.fetchMarketById = async () => market;
+      const result = await bot.reconcileResolvedPaperPositions(reconcileAt);
+      assert.deepStrictEqual(result, { attempted: 1, settled: 0, pending: 1 }, `${label} must remain pending`);
+      assert.strictEqual(bot.portfolio.cash, before.cash, `${label} must not change cash`);
+      assert.strictEqual(bot.portfolio.closedPnl, before.closedPnl, `${label} must not change PnL`);
+      assert.strictEqual(bot.portfolio.position(standardToken), before.positions.get(standardToken), `${label} must retain the position`);
+      assert.strictEqual(bot.portfolio.settlements.length, 0, `${label} must not create a settlement`);
+      assert.strictEqual(bot.portfolio.positionMetadata.get(standardToken).settlementEvidenceBlocker, expectedMetadataBlocker, `${label} must retain the exact blocker`);
+    };
+    await runRefusal('unresolved standard market', { ...baseMarket, closed: false }, 'market_not_closed');
+    await runRefusal('closed standard market with explicit pending status', { ...baseMarket, umaResolutionStatus: 'proposed' }, 'market_resolution_pending');
+    await runRefusal('mismatched standard token', { ...baseMarket, clobTokenIds: JSON.stringify(['different-token', standardOtherToken]) }, 'resolution_token_not_in_market');
+    await runRefusal('mismatched standard outcome', { ...baseMarket, outcomes: JSON.stringify(['No', 'Yes']) }, 'resolution_outcome_mismatch');
+    await runRefusal('ambiguous standard payout', { ...baseMarket, outcomePrices: JSON.stringify(['0.5', '0.5']) }, 'resolution_payout_vector_ambiguous');
+    await runRefusal('missing standard accepting-orders evidence', (() => {
+      const market = { ...baseMarket };
+      delete market.acceptingOrders;
+      return market;
+    })(), 'market_accepting_orders_evidence_missing');
+    await runRefusal('malformed standard payout evidence', { ...baseMarket, outcomePrices: '{not-json' }, 'resolution_binary_shape_invalid');
+    await runRefusal('incomplete standard closed-time evidence', { ...baseMarket, closedTime: '' }, 'resolution_closed_time_missing');
+    await runRefusal('stale standard evidence', baseMarket, 'settlement_evidence_stale', Date.now() - (5 * 60_000) - 1_000);
+
+    const persistenceBot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile: tempPath('standard-settlement-persistence-failure'),
+    }));
+    persistenceBot.portfolio.recordFill({
+      tokenId: standardToken,
+      marketId: standardMarketId,
+      marketSlug: standardMarketSlug,
+      outcome: 'Yes',
+      side: 'buy',
+      price: 0.40,
+      size: 2.5,
+      strategy: 'SpreadHunter',
+    });
+    persistenceBot.poly.fetchMarketById = async () => baseMarket;
+    const persistenceBefore = persistenceBot.portfolio.captureSettlementState();
+    persistenceBot.portfolio.saveState = () => ({ ok: false, error: 'fixture_standard_atomic_save_failure' });
+    const failed = await persistenceBot.reconcileResolvedPaperPositions(Date.now());
+    assert.strictEqual(failed.blocker, 'settlement_state_save_failed', 'standard save failure must fail closed');
+    assert.strictEqual(failed.rolledBackSettlements, 1, 'standard save failure must report its rolled-back settlement');
+    assert.strictEqual(persistenceBot.portfolio.cash, persistenceBefore.cash, 'standard save failure must roll back cash');
+    assert.strictEqual(persistenceBot.portfolio.closedPnl, persistenceBefore.closedPnl, 'standard save failure must roll back PnL');
+    assert.strictEqual(persistenceBot.portfolio.position(standardToken), persistenceBefore.positions.get(standardToken), 'standard save failure must restore the position');
+    assert.strictEqual(persistenceBot.portfolio.settlements.length, 0, 'standard save failure must remove the uncommitted audit record');
+    assert.strictEqual(persistenceBot.portfolio.settlementKeys.size, 0, 'standard save failure must remove the uncommitted idempotency key');
+  }
+
+  {
+    const expiredStartSec = baseStartSec - 1_200;
+    const marketId = 'settlement-trust-boundary-market';
+    const marketSlug = `btc-updown-5m-${expiredStartSec}`;
+    const upToken = 'settlement-trust-boundary-up';
+    const downToken = 'settlement-trust-boundary-down';
+    const market = {
+      id: marketId,
+      slug: marketSlug,
+      clobTokenIds: JSON.stringify([upToken, downToken]),
+      outcomes: JSON.stringify(['Up', 'Down']),
+      outcomePrices: JSON.stringify(['1', '0']),
+      closed: true,
+      acceptingOrders: false,
+      umaResolutionStatus: 'resolved',
+      resolutionSource: 'fixture-resolution-source',
+      endDate: new Date((expiredStartSec + 300) * 1000).toISOString(),
+    };
+    const makePortfolio = () => {
+      const portfolio = new PaperPortfolio(makeConfig({ modelPath, signalPath, targetPath, eventsPath }));
+      portfolio.recordFill({
+        tokenId: upToken,
+        marketId,
+        marketSlug,
+        outcome: 'Up',
+        side: 'buy',
+        price: 0.50,
+        size: 4,
+        strategy: 'GabagoolBtcOracleStrategy',
+      });
+      return portfolio;
+    };
+    const evidence = resolvedMarketEvidenceForToken(market, {
+      tokenId: upToken,
+      expectedMarketId: marketId,
+      expectedMarketSlug: marketSlug,
+    });
+    assert.strictEqual(evidence.verified, true, 'trust-boundary fixture must start with verified evidence');
+    const negativeCases = [
+      ['wrong market', { ...evidence, marketId: 'wrong-market' }, 'settlement_market_id_mismatch'],
+      ['wrong slug', { ...evidence, marketSlug: `${marketSlug}-wrong` }, 'settlement_market_slug_mismatch'],
+      ['wrong token', { ...evidence, tokenId: downToken, tokenIds: [downToken, 'other-token'] }, 'settlement_token_membership_mismatch'],
+      ['reversed outcome', { ...evidence, outcome: 'Down' }, 'settlement_outcome_mismatch'],
+      ['arbitrary payout', { ...evidence, payoutPerShare: 0 }, 'settlement_token_payout_mismatch'],
+      ['malformed payout vector', { ...evidence, outcomePrices: [1, 1] }, 'settlement_payout_vector_invalid'],
+      ['timestamp mismatch', { ...evidence, marketEndTime: new Date((expiredStartSec + 360) * 1000).toISOString() }, 'settlement_market_end_mismatch'],
+      ['unverified evidence', { ...evidence, verified: false, resolutionEvidenceVerified: false }, 'settlement_evidence_unverified'],
+    ];
+    for (const [label, candidateEvidence, expectedBlocker] of negativeCases) {
+      const portfolio = makePortfolio();
+      const before = portfolio.captureSettlementState();
+      const result = portfolio.settleResolvedPosition({ tokenId: upToken, evidence: candidateEvidence });
+      assert.strictEqual(result.settled, false, `${label} must not settle`);
+      assert.strictEqual(result.blocker, expectedBlocker, `${label} must fail at the settlement trust boundary`);
+      assert.strictEqual(portfolio.cash, before.cash, `${label} must not change cash`);
+      assert.strictEqual(portfolio.closedPnl, before.closedPnl, `${label} must not change closed PnL`);
+      assert.strictEqual(portfolio.positions.get(upToken), before.positions.get(upToken), `${label} must retain the open position`);
+      assert.strictEqual(portfolio.settlements.length, 0, `${label} must not append an audit record`);
+      assert.strictEqual(portfolio.settlementKeys.size, 0, `${label} must not add an idempotency key`);
+    }
+  }
+
+  {
+    const expiredStartSec = baseStartSec - 1_500;
+    const marketId = 'settlement-persistence-market';
+    const marketSlug = `btc-updown-5m-${expiredStartSec}`;
+    const upToken = 'settlement-persistence-up';
+    const downToken = 'settlement-persistence-down';
+    const stateFile = tempPath('settlement-persistence-state');
+    const config = makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile,
+    });
+    const market = {
+      id: marketId,
+      slug: marketSlug,
+      clobTokenIds: JSON.stringify([upToken, downToken]),
+      outcomes: JSON.stringify(['Up', 'Down']),
+      outcomePrices: JSON.stringify(['1', '0']),
+      closed: true,
+      acceptingOrders: false,
+      umaResolutionStatus: 'resolved',
+      resolutionSource: 'fixture-resolution-source',
+      endDate: new Date((expiredStartSec + 300) * 1000).toISOString(),
+    };
+    const bot = new BotEngine(config);
+    bot.portfolio.recordFill({
+      tokenId: upToken,
+      marketId,
+      marketSlug,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    bot.poly.fetchMarketById = async () => market;
+    const before = bot.portfolio.captureSettlementState();
+    const originalSaveState = bot.portfolio.saveState.bind(bot.portfolio);
+    bot.portfolio.saveState = () => ({ ok: false, skipped: false, error: 'fixture_atomic_save_failure' });
+    const failed = await bot.reconcileResolvedPaperPositions(Date.now());
+    assert.strictEqual(failed.blocker, 'settlement_state_save_failed', 'save failure must fail the settlement batch closed');
+    assert.strictEqual(failed.rolledBackSettlements, 1, 'save failure must report the rolled-back settlement count');
+    assert.strictEqual(bot.settlementPersistenceBlocked, true, 'save failure must block further settlement attempts');
+    assert.strictEqual(bot.portfolio.cash, before.cash, 'save failure must roll back cash');
+    assert.strictEqual(bot.portfolio.closedPnl, before.closedPnl, 'save failure must roll back closed PnL');
+    assert.strictEqual(bot.portfolio.positions.get(upToken), before.positions.get(upToken), 'save failure must restore positions');
+    assert.strictEqual(bot.portfolio.strategyPnl.get('GabagoolBtcOracleStrategy'), before.strategyPnl.get('GabagoolBtcOracleStrategy'), 'save failure must restore strategy PnL');
+    assert.strictEqual(bot.portfolio.positionMetadata.get(upToken).marketSlug, before.positionMetadata.get(upToken).marketSlug, 'save failure must restore metadata');
+    assert.strictEqual(bot.portfolio.settlements.length, 0, 'save failure must remove uncommitted settlement records');
+    assert.strictEqual(bot.portfolio.settlementKeys.size, 0, 'save failure must remove uncommitted idempotency keys');
+
+    bot.portfolio.saveState = originalSaveState;
+    const retried = await bot.reconcileResolvedPaperPositions(Date.now() + 1);
+    assert.deepStrictEqual(retried, { attempted: 1, settled: 1, pending: 0 }, 'retry may commit only after persistence recovers');
+    assert.strictEqual(bot.settlementPersistenceBlocked, false, 'successful recovery save must unblock settlement');
+    assert.strictEqual(bot.portfolio.cash, before.cash + 4, 'successful retry must apply the payout exactly once');
+    assert.strictEqual(bot.portfolio.closedPnl, before.closedPnl + 2, 'successful retry must apply settlement PnL exactly once');
+    assert.strictEqual(bot.portfolio.positions.size, 0, 'successful retry must remove the settled position');
+    assert.strictEqual(bot.portfolio.settlements.length, 1, 'successful retry must persist exactly one settlement');
+
+    const persisted = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    const restarted = new PaperPortfolio(config);
+    restarted.hydratePersistedState(persisted);
+    assert.strictEqual(restarted.cash, bot.portfolio.cash, 'restart must preserve committed settlement cash');
+    assert.strictEqual(restarted.closedPnl, bot.portfolio.closedPnl, 'restart must preserve committed settlement PnL');
+    assert.strictEqual(restarted.positions.size, 0, 'restart must not restore a settled position');
+    assert.strictEqual(restarted.settlements.length, 1, 'restart must preserve exactly one settlement record');
+    assert.strictEqual(restarted.settlementKeys.size, 1, 'restart must preserve exactly one settlement key');
+    const duplicate = restarted.settleResolvedPosition({ tokenId: upToken, evidence: restarted.settlements[0].evidence });
+    assert.strictEqual(duplicate.duplicate, true, 'restart idempotency key must prevent duplicate payout');
+    assert.strictEqual(restarted.cash, bot.portfolio.cash, 'duplicate retry after restart must not change cash');
+
+    const skippedBot = new BotEngine(makeConfig({ modelPath, signalPath, targetPath, eventsPath }, {
+      saveState: true,
+      stateFile: tempPath('settlement-skipped-save-state'),
+    }));
+    skippedBot.portfolio.recordFill({
+      tokenId: upToken,
+      marketId,
+      marketSlug,
+      outcome: 'Up',
+      side: 'buy',
+      price: 0.50,
+      size: 4,
+      strategy: 'GabagoolBtcOracleStrategy',
+    });
+    skippedBot.poly.fetchMarketById = async () => market;
+    const skippedBefore = skippedBot.portfolio.captureSettlementState();
+    skippedBot.portfolio.saveState = () => ({ ok: false, skipped: true, reason: 'fixture_deliberately_skipped_save' });
+    const skipped = await skippedBot.reconcileResolvedPaperPositions(Date.now());
+    assert.strictEqual(skipped.blocker, 'settlement_state_save_failed', 'a deliberately skipped save must not commit settlement');
+    assert.strictEqual(skippedBot.portfolio.cash, skippedBefore.cash, 'skipped save must roll back cash');
+    assert.strictEqual(skippedBot.portfolio.positions.get(upToken), skippedBefore.positions.get(upToken), 'skipped save must retain the position');
+    assert.strictEqual(skippedBot.portfolio.settlements.length, 0, 'skipped save must not retain a settlement record');
+    assert.strictEqual(skippedBot.settlementPersistenceBlocked, true, 'skipped save must block further settlement attempts');
   }
 
   {
@@ -1693,12 +2511,13 @@ async function run() {
       bot.portfolio.paperTokenTradeability = new Map();
     }
     bot.portfolio.paperTokenTradeability.set('expired-up-token', { status: 'tradable' });
+    markFixtureResolved(bot.portfolio, 'expired-up-token');
     const report = bot.buildBtcOracleReport(new Map([
       ['expired-up-token', 0.50],
     ]), Date.now());
     assert.strictEqual(report.exposure.buckets.expiredBtc5mExposureUsd, 2, 'expired BTC 5m exposure should stay visible in the exposure buckets');
     assert.strictEqual(report.exposure.audit.exposureMismatchUsd, 0, 'intentional expired BTC 5m exclusions should reconcile the exposure audit');
-    assert.strictEqual(report.exposure.audit.exposureMismatchReason, 'intentional_expired_btc_5m_exclusion', 'intentional expired BTC 5m exclusions should not look like a formula divergence');
+    assert.strictEqual(report.exposure.audit.exposureMismatchReason, 'intentional_expired_btc_5m_exclusion', 'verified resolved BTC exclusions should retain their precise reconciliation reason');
   }
 
   {
@@ -2223,6 +3042,7 @@ async function run() {
       outcome: 'Up',
     });
     bot.portfolio.setMarkPrice(tokenId, 0.50);
+    markFixtureResolved(bot.portfolio, tokenId);
     bot.portfolio.cash = 1;
     const equityBefore = bot.portfolio.equity(bot.cache.markPrices());
     const reserveResult = bot.rebalancePaperDeadExposureCashReserve(bot.cache.markPrices(), Date.now());
@@ -2283,6 +3103,21 @@ async function run() {
   assert.strictEqual(liveConfig.liveKillSwitch, true, 'live kill switch must stay enabled');
   assert.strictEqual(liveConfig.liveDryRunOnly, true, 'live dry run must stay enabled');
   assert.strictEqual(liveConfig.liveSubmitConfirm, false, 'live submit confirm must stay disabled');
+
+  assert(fs.existsSync(stage5DiagnosticFixturePath), 'successful Gabagool paper placements must create the locked-off Stage 5 diagnostic fixture');
+  const stage5Diagnostics = fs.readFileSync(stage5DiagnosticFixturePath, 'utf8')
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(JSON.parse);
+  assert(stage5Diagnostics.length > 0, 'at least one successful paper placement diagnostic is required');
+  assert(stage5Diagnostics.every((record) => record.source === 'gabagool_successful_paper_placement'));
+  assert(stage5Diagnostics.every((record) => record.paperPlacementSucceeded === true));
+  assert(stage5Diagnostics.every((record) => record.stage5SizingEvaluated === true));
+  assert(stage5Diagnostics.every((record) => Object.prototype.hasOwnProperty.call(record, 'stage5CandidateGateEligible')));
+  assert(stage5Diagnostics.every((record) => Object.prototype.hasOwnProperty.call(record, 'stage5AdjustedRiskEligible')));
+  assert(stage5Diagnostics.every((record) => record.stage5EligibilityBlocker === record.candidateWriterBlocker));
+  assert(stage5Diagnostics.every((record) => Object.prototype.hasOwnProperty.call(record, 'candidateWriterBlocker')));
+  assert(stage5Diagnostics.every((record) => Object.prototype.hasOwnProperty.call(record, 'adjustedStage5SizeUsd')));
 
   console.log('engine gabagool btc self-check passed');
 }

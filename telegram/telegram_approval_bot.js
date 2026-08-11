@@ -178,8 +178,12 @@ function escapeHtml(s) {
 }
 
 function formatIntentMessage(intent) {
+  const isOracleSignal = intent.source === 'BTC_ORACLE' ||
+    String(intent.action || '').includes('TELEGRAM_ALERT_ONLY');
   const lines = [];
-  lines.push('🚨 <b>Trade Approval Request</b>');
+  lines.push(isOracleSignal
+    ? '📡 <b>BTC Oracle Signal — No Trade</b>'
+    : '🚨 <b>Trade Approval Request</b>');
   lines.push('');
   lines.push(`<b>Source:</b> ${escapeHtml(intent.source)}`);
   lines.push(`<b>Strategy:</b> ${escapeHtml(intent.strategy)}`);
@@ -189,7 +193,9 @@ function formatIntentMessage(intent) {
   lines.push(`<b>Token:</b> <code>${escapeHtml(shortId(intent.token_id, 8))}</code>`);
   if (intent.market_id) lines.push(`<b>Market:</b> <code>${escapeHtml(shortId(intent.market_id, 8))}</code>`);
   if (Number.isFinite(intent.price)) lines.push(`<b>Price:</b> $${intent.price.toFixed(3)}`);
-  if (Number.isFinite(intent.size_usd)) lines.push(`<b>Max Size:</b> $${intent.size_usd.toFixed(2)}`);
+  if (Number.isFinite(intent.size_usd)) {
+    lines.push(`<b>${isOracleSignal ? 'Indicative Paper Max' : 'Max Size'}:</b> $${intent.size_usd.toFixed(2)}`);
+  }
   if (Number.isFinite(intent.confidence)) lines.push(`<b>Confidence:</b> ${intent.confidence.toFixed(3)}`);
   if (intent.route) lines.push(`<b>Route:</b> ${escapeHtml(intent.route)}`);
   if (intent.expires_at) lines.push(`<b>Expires:</b> ${escapeHtml(intent.expires_at)}`);
@@ -198,7 +204,9 @@ function formatIntentMessage(intent) {
   lines.push('');
   lines.push(`<code>${escapeHtml(intent.intent_id)}</code>`);
   lines.push('');
-  lines.push('Safety: paper approval only. This bot does not execute trades.');
+  lines.push(isOracleSignal
+    ? 'Safety: oracle signal only. No paper order, fill, approval execution, or live order occurred.'
+    : 'Safety: paper approval only. This bot does not execute trades.');
   return lines.join('\n');
 }
 

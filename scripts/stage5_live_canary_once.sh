@@ -1,16 +1,33 @@
 #!/usr/bin/env bash
 # OPERATOR-ONLY: DO NOT RUN WITHOUT AN EXPLICIT LIVE-CANARY AUTHORIZATION.
-# This script may place at most one real order, up to $5, during its 180-second
+# This script may place at most one real order, up to $5, during its 60-second
 # Stage 5 window. It always returns .env to the Stage 2 locked-off baseline.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+STAGE5_CONFIDENCE_FLOOR="$(
+  env MM_SKIP_LOCAL_ENV_FILE=true SKIP_LOCAL_ENV_FILE=true \
+    node -e 'process.stdout.write(require("./lib/stage5_policy").resolveStage5GabagoolConfidenceFloor().toFixed(2))'
+)"
+[[ "$STAGE5_CONFIDENCE_FLOOR" == '0.70' ]] || {
+  printf '[stage5-canary] ERROR: authoritative Stage 5 confidence policy is unavailable\n' >&2
+  exit 1
+}
 
 ENV_FILE="$ROOT/.env"
-RUN_DIR="$ROOT/runtime_backups/stage5_live_canary_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+if [[ "${1:-}" == '--selfcheck-signal-handler' ]]; then
+  RUN_DIR="${STAGE5_SIGNAL_FIXTURE_DIR:?STAGE5_SIGNAL_FIXTURE_DIR required}"
+else
+  RUN_DIR="$ROOT/runtime_backups/stage5_live_canary_$(date -u +%Y%m%dT%H%M%SZ)_$$"
+fi
 BACKUP_FILE="$RUN_DIR/.env.before_stage5_canary"
-WINDOW_SECONDS=180
+WINDOW_SECONDS=60
+ACCOUNT_TRUTH_SNAPSHOT_PATH="$ROOT/runtime_monitor/polymarket_live_account_truth.json"
+ACCOUNT_TRUTH_HEALTH_PATH="$ROOT/runtime_monitor/polymarket_live_account_truth_watch_health.json"
+ACCOUNT_TRUTH_WATCH_LOG="$RUN_DIR/account-truth-watch.log"
+ACCOUNT_TRUTH_WATCH_PID=0
+CANARY_SESSION_PATH="$ROOT/runtime_monitor/stage5_canary_session.json"
 LOCKED=0
 BASELINE_VERIFIED=0
 ARMING_STARTED=0
@@ -65,10 +82,10 @@ BASELINE_KEYS=(
   ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY
   LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID
   MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD
-  LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE LIVE_ROUTER_MODE
+  LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE LIVE_ROUTER_MODE
 )
 BASELINE_EXPECTED=(
-  false false true true false false 2 '' 1 1 1 1 0.67 dry-run
+  false false true true false false 2 '' 1 1 1 1 0.67 0.70 dry-run
 )
 
 mkdir -p "$RUN_DIR"
@@ -150,7 +167,7 @@ baseline_parser_selfcheck() {
     'LIVE_SUBMIT_CONFIRM=false' 'LIVE_FINAL_BOSS_READY=false' 'LIVE_TRADING_STAGE=2' \
     'LIVE_CANARY_MARKET_ID=' 'MAX_LIVE_ORDER_USD=1' 'MAX_LIVE_TOTAL_EXPOSURE_USD=1' \
     'LIVE_DAILY_MAX_LOSS_USD=1' 'LIVE_MAX_ORDERS_PER_HOUR=1' \
-    'AUTO_LIVE_MIN_CONFIDENCE=0.67' 'LIVE_ROUTER_MODE="dry-run"' > "$fixture"
+    'AUTO_LIVE_MIN_CONFIDENCE=0.67' 'STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE=0.70' 'LIVE_ROUTER_MODE="dry-run"' > "$fixture"
   ENV_FILE="$fixture"
   if baseline_diagnostics; then
     rm -f "$fixture"
@@ -262,15 +279,15 @@ runtime_environment_selfcheck() {
   dir="$(mktemp -d /tmp/stage5-runtime-env-selfcheck.XXXXXX)"
   previous_env="$ENV_FILE"; previous_secrets="$SECRETS_FILE"; previous_fixture="${PM2_JLIST_FIXTURE:-}"
   ENV_FILE="$dir/runtime.env"; SECRETS_FILE="$dir/runtime.secrets"
-  printf '%s\n' 'ENABLE_LIVE_TRADING=true' 'LIVE_AUTO_EXECUTE=true' 'LIVE_KILL_SWITCH=false' 'LIVE_DRY_RUN_ONLY=false' 'LIVE_SUBMIT_CONFIRM=true' 'LIVE_FINAL_BOSS_READY=true' 'LIVE_TRADING_STAGE=5' 'LIVE_CANARY_MARKET_ID=fixture-market' 'MAX_LIVE_ORDER_USD=5' 'MAX_LIVE_TOTAL_EXPOSURE_USD=5' 'LIVE_DAILY_MAX_LOSS_USD=5' 'LIVE_MAX_ORDERS_PER_HOUR=1' 'AUTO_LIVE_MIN_CONFIDENCE=0.47' 'LIVE_ROUTER_MODE=submit' > "$ENV_FILE"
+  printf '%s\n' 'ENABLE_LIVE_TRADING=true' 'LIVE_AUTO_EXECUTE=true' 'LIVE_KILL_SWITCH=false' 'LIVE_DRY_RUN_ONLY=false' 'LIVE_SUBMIT_CONFIRM=true' 'LIVE_FINAL_BOSS_READY=true' 'LIVE_TRADING_STAGE=5' 'LIVE_CANARY_MARKET_ID=fixture-market' 'MAX_LIVE_ORDER_USD=5' 'MAX_LIVE_TOTAL_EXPOSURE_USD=5' 'LIVE_DAILY_MAX_LOSS_USD=5' 'LIVE_MAX_ORDERS_PER_HOUR=1' "AUTO_LIVE_MIN_CONFIDENCE=$STAGE5_CONFIDENCE_FLOOR" "STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE=$STAGE5_CONFIDENCE_FLOOR" 'LIVE_ROUTER_MODE=submit' > "$ENV_FILE"
   printf '%s\n' 'TEST_SECRET_SENTINEL=fixture-only-not-printed' > "$SECRETS_FILE"
   load_runtime_environment && verify_shell_profile armed fixture-market || die 'runtime environment selfcheck missed armed load'
-  node -e 'const fs=require("fs"); const env={ENABLE_LIVE_TRADING:"true",LIVE_AUTO_EXECUTE:"true",LIVE_KILL_SWITCH:"false",LIVE_DRY_RUN_ONLY:"false",LIVE_SUBMIT_CONFIRM:"true",LIVE_FINAL_BOSS_READY:"true",LIVE_TRADING_STAGE:"5",LIVE_CANARY_MARKET_ID:"fixture-market",MAX_LIVE_ORDER_USD:"5",MAX_LIVE_TOTAL_EXPOSURE_USD:"5",LIVE_DAILY_MAX_LOSS_USD:"5",LIVE_MAX_ORDERS_PER_HOUR:"1",AUTO_LIVE_MIN_CONFIDENCE:"0.47",LIVE_ROUTER_MODE:"submit"}; fs.writeFileSync(process.argv[1],JSON.stringify(["liveIntentRouter","langomonEscript"].map(name=>({name,pm2_env:{status:"online",env}}))))' "$dir/pm2.json"
+  node -e 'const fs=require("fs"); const floor=process.argv[2]; const env={ENABLE_LIVE_TRADING:"true",LIVE_AUTO_EXECUTE:"true",LIVE_KILL_SWITCH:"false",LIVE_DRY_RUN_ONLY:"false",LIVE_SUBMIT_CONFIRM:"true",LIVE_FINAL_BOSS_READY:"true",LIVE_TRADING_STAGE:"5",LIVE_CANARY_MARKET_ID:"fixture-market",MAX_LIVE_ORDER_USD:"5",MAX_LIVE_TOTAL_EXPOSURE_USD:"5",LIVE_DAILY_MAX_LOSS_USD:"5",LIVE_MAX_ORDERS_PER_HOUR:"1",AUTO_LIVE_MIN_CONFIDENCE:floor,STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE:floor,LIVE_ROUTER_MODE:"submit"}; fs.writeFileSync(process.argv[1],JSON.stringify(["liveIntentRouter","langomonEscript"].map(name=>({name,pm2_env:{status:"online",env}}))))' "$dir/pm2.json" "$STAGE5_CONFIDENCE_FLOOR"
   PM2_JLIST_FIXTURE="$dir/pm2.json"
   pm2_profile_matches liveIntentRouter armed fixture-market true && pm2_profile_matches langomonEscript armed fixture-market true || die 'runtime environment selfcheck missed armed PM2 profile'
-  printf '%s\n' 'ENABLE_LIVE_TRADING=false' 'LIVE_AUTO_EXECUTE=false' 'LIVE_KILL_SWITCH=true' 'LIVE_DRY_RUN_ONLY=true' 'LIVE_SUBMIT_CONFIRM=false' 'LIVE_FINAL_BOSS_READY=false' 'LIVE_TRADING_STAGE=2' 'LIVE_CANARY_MARKET_ID=' 'MAX_LIVE_ORDER_USD=1' 'MAX_LIVE_TOTAL_EXPOSURE_USD=1' 'LIVE_DAILY_MAX_LOSS_USD=1' 'LIVE_MAX_ORDERS_PER_HOUR=1' 'AUTO_LIVE_MIN_CONFIDENCE=0.67' 'LIVE_ROUTER_MODE=dry-run' > "$ENV_FILE"
+  printf '%s\n' 'ENABLE_LIVE_TRADING=false' 'LIVE_AUTO_EXECUTE=false' 'LIVE_KILL_SWITCH=true' 'LIVE_DRY_RUN_ONLY=true' 'LIVE_SUBMIT_CONFIRM=false' 'LIVE_FINAL_BOSS_READY=false' 'LIVE_TRADING_STAGE=2' 'LIVE_CANARY_MARKET_ID=' 'MAX_LIVE_ORDER_USD=1' 'MAX_LIVE_TOTAL_EXPOSURE_USD=1' 'LIVE_DAILY_MAX_LOSS_USD=1' 'LIVE_MAX_ORDERS_PER_HOUR=1' 'AUTO_LIVE_MIN_CONFIDENCE=0.67' 'STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE=0.70' 'LIVE_ROUTER_MODE=dry-run' > "$ENV_FILE"
   load_runtime_environment && verify_shell_profile safe '' || die 'runtime environment selfcheck missed safe replacement'
-  node -e 'const fs=require("fs"); const env={ENABLE_LIVE_TRADING:"false",LIVE_AUTO_EXECUTE:"false",LIVE_KILL_SWITCH:"true",LIVE_DRY_RUN_ONLY:"true",LIVE_SUBMIT_CONFIRM:"false",LIVE_FINAL_BOSS_READY:"false",LIVE_TRADING_STAGE:"2",LIVE_CANARY_MARKET_ID:"",MAX_LIVE_ORDER_USD:"1",MAX_LIVE_TOTAL_EXPOSURE_USD:"1",LIVE_DAILY_MAX_LOSS_USD:"1",LIVE_MAX_ORDERS_PER_HOUR:"1",AUTO_LIVE_MIN_CONFIDENCE:"0.67",LIVE_ROUTER_MODE:"dry-run"}; fs.writeFileSync(process.argv[1],JSON.stringify(["liveIntentRouter","langomonEscript"].map(name=>({name,pm2_env:{status:"online",env}}))))' "$dir/pm2.json"
+  node -e 'const fs=require("fs"); const env={ENABLE_LIVE_TRADING:"false",LIVE_AUTO_EXECUTE:"false",LIVE_KILL_SWITCH:"true",LIVE_DRY_RUN_ONLY:"true",LIVE_SUBMIT_CONFIRM:"false",LIVE_FINAL_BOSS_READY:"false",LIVE_TRADING_STAGE:"2",LIVE_CANARY_MARKET_ID:"",MAX_LIVE_ORDER_USD:"1",MAX_LIVE_TOTAL_EXPOSURE_USD:"1",LIVE_DAILY_MAX_LOSS_USD:"1",LIVE_MAX_ORDERS_PER_HOUR:"1",AUTO_LIVE_MIN_CONFIDENCE:"0.67",STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE:"0.70",LIVE_ROUTER_MODE:"dry-run"}; fs.writeFileSync(process.argv[1],JSON.stringify(["liveIntentRouter","langomonEscript"].map(name=>({name,pm2_env:{status:"online",env}}))))' "$dir/pm2.json"
   pm2_profile_matches liveIntentRouter safe '' true && pm2_profile_matches langomonEscript safe '' true || die 'runtime environment selfcheck missed safe PM2 profile'
   node -e 'const fs=require("fs"),p=process.argv[1],x=JSON.parse(fs.readFileSync(p)); x[0].pm2_env.env.MAX_LIVE_ORDER_USD="9"; fs.writeFileSync(p,JSON.stringify(x))' "$dir/pm2.json"
   if pm2_profile_matches liveIntentRouter safe '' true; then die 'runtime environment selfcheck missed MAX_LIVE_ORDER_USD mismatch'; fi
@@ -324,15 +341,17 @@ set_safe_stage2_baseline() {
   set_env_value LIVE_DAILY_MAX_LOSS_USD 1
   set_env_value LIVE_MAX_ORDERS_PER_HOUR 1
   set_env_value AUTO_LIVE_MIN_CONFIDENCE 0.67
+  set_env_value STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE 0.70
   set_env_value LIVE_ROUTER_MODE dry-run
 }
 
 load_runtime_environment() {
   [[ -r "$ENV_FILE" && -r "$SECRETS_FILE" ]] || return 1
   set -a
-  # Intentionally no tracing or environment output: this only prepares PM2.
-  . "$ENV_FILE"
+  # Intentionally no tracing or environment output. Load secrets first so the
+  # explicit .env safety profile always wins if a secrets file has stale flags.
   . "$SECRETS_FILE"
+  . "$ENV_FILE"
   set +a
 }
 
@@ -340,11 +359,11 @@ verify_shell_profile() {
   local profile="$1" market="$2" key expected i
   local -a keys values
   if [[ "$profile" == armed ]]; then
-    keys=(ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE LIVE_ROUTER_MODE)
-    values=(true true false false true true 5 "$market" 5 5 5 1 0.47 submit)
+    keys=(ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE LIVE_ROUTER_MODE)
+    values=(true true false false true true 5 "$market" 5 5 5 1 "$STAGE5_CONFIDENCE_FLOOR" "$STAGE5_CONFIDENCE_FLOOR" submit)
   else
-    keys=(ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE LIVE_ROUTER_MODE)
-    values=(false false true true false false 2 '' 1 1 1 1 0.67 dry-run)
+    keys=(ENABLE_LIVE_TRADING LIVE_AUTO_EXECUTE LIVE_KILL_SWITCH LIVE_DRY_RUN_ONLY LIVE_SUBMIT_CONFIRM LIVE_FINAL_BOSS_READY LIVE_TRADING_STAGE LIVE_CANARY_MARKET_ID MAX_LIVE_ORDER_USD MAX_LIVE_TOTAL_EXPOSURE_USD LIVE_DAILY_MAX_LOSS_USD LIVE_MAX_ORDERS_PER_HOUR AUTO_LIVE_MIN_CONFIDENCE STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE LIVE_ROUTER_MODE)
+    values=(false false true true false false 2 '' 1 1 1 1 0.67 0.70 dry-run)
   fi
   for i in "${!keys[@]}"; do
     key="${keys[$i]}"
@@ -380,19 +399,19 @@ pm2_profile_matches() {
   local details
   if details="$(pm2_jlist | node -e '
 const fs = require("fs");
-const [name, profile, market, includeRouterMode] = process.argv.slice(1);
+const [name, profile, market, includeRouterMode, stage5ConfidenceFloor] = process.argv.slice(1);
 const items = JSON.parse(fs.readFileSync(0, "utf8"));
 const item = items.find((x) => x.name === name);
 const env = item?.pm2_env?.env || {};
 const expected = profile === "armed"
-  ? { ENABLE_LIVE_TRADING: "true", LIVE_AUTO_EXECUTE: "true", LIVE_KILL_SWITCH: "false", LIVE_DRY_RUN_ONLY: "false", LIVE_SUBMIT_CONFIRM: "true", LIVE_FINAL_BOSS_READY: "true", LIVE_TRADING_STAGE: "5", LIVE_CANARY_MARKET_ID: market, MAX_LIVE_ORDER_USD: "5", MAX_LIVE_TOTAL_EXPOSURE_USD: "5", LIVE_DAILY_MAX_LOSS_USD: "5", LIVE_MAX_ORDERS_PER_HOUR: "1", AUTO_LIVE_MIN_CONFIDENCE: "0.47", LIVE_ROUTER_MODE: "submit" }
-  : { ENABLE_LIVE_TRADING: "false", LIVE_AUTO_EXECUTE: "false", LIVE_KILL_SWITCH: "true", LIVE_DRY_RUN_ONLY: "true", LIVE_SUBMIT_CONFIRM: "false", LIVE_FINAL_BOSS_READY: "false", LIVE_TRADING_STAGE: "2", LIVE_CANARY_MARKET_ID: "", MAX_LIVE_ORDER_USD: "1", MAX_LIVE_TOTAL_EXPOSURE_USD: "1", LIVE_DAILY_MAX_LOSS_USD: "1", LIVE_MAX_ORDERS_PER_HOUR: "1", AUTO_LIVE_MIN_CONFIDENCE: "0.67", LIVE_ROUTER_MODE: "dry-run" };
+  ? { ENABLE_LIVE_TRADING: "true", LIVE_AUTO_EXECUTE: "true", LIVE_KILL_SWITCH: "false", LIVE_DRY_RUN_ONLY: "false", LIVE_SUBMIT_CONFIRM: "true", LIVE_FINAL_BOSS_READY: "true", LIVE_TRADING_STAGE: "5", LIVE_CANARY_MARKET_ID: market, MAX_LIVE_ORDER_USD: "5", MAX_LIVE_TOTAL_EXPOSURE_USD: "5", LIVE_DAILY_MAX_LOSS_USD: "5", LIVE_MAX_ORDERS_PER_HOUR: "1", AUTO_LIVE_MIN_CONFIDENCE: stage5ConfidenceFloor, STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE: stage5ConfidenceFloor, LIVE_ROUTER_MODE: "submit" }
+  : { ENABLE_LIVE_TRADING: "false", LIVE_AUTO_EXECUTE: "false", LIVE_KILL_SWITCH: "true", LIVE_DRY_RUN_ONLY: "true", LIVE_SUBMIT_CONFIRM: "false", LIVE_FINAL_BOSS_READY: "false", LIVE_TRADING_STAGE: "2", LIVE_CANARY_MARKET_ID: "", MAX_LIVE_ORDER_USD: "1", MAX_LIVE_TOTAL_EXPOSURE_USD: "1", LIVE_DAILY_MAX_LOSS_USD: "1", LIVE_MAX_ORDERS_PER_HOUR: "1", AUTO_LIVE_MIN_CONFIDENCE: "0.67", STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE: "0.70", LIVE_ROUTER_MODE: "dry-run" };
 const bad = Object.keys(expected).filter((key) => String(env[key] ?? "") !== expected[key]);
 if (!item) { console.log(`${name}:missing`); process.exit(1); }
 if (item.pm2_env?.status !== "online") bad.unshift("status");
 if (bad.length) { for (const key of bad) console.log(`${name}:${key}`); process.exit(1); }
 ' \
-  "$process_name" "$profile" "$market" "$include_router_mode")"; then
+  "$process_name" "$profile" "$market" "$include_router_mode" "$STAGE5_CONFIDENCE_FLOOR")"; then
     return 0
   fi
   record_runtime_mismatches "$profile" "$details"
@@ -489,8 +508,47 @@ post_lockoff_audit() {
   say 'run summary:'; [[ -f "$RUN_DIR/run-summary.json" ]] && cat "$RUN_DIR/run-summary.json" || true
 }
 
+stop_account_truth_watcher() {
+  (( ACCOUNT_TRUTH_WATCH_PID > 0 )) || return 0
+  if kill -0 "$ACCOUNT_TRUTH_WATCH_PID" 2>/dev/null; then
+    kill -TERM "$ACCOUNT_TRUTH_WATCH_PID" 2>/dev/null || true
+    wait "$ACCOUNT_TRUTH_WATCH_PID" 2>/dev/null || true
+  fi
+  ACCOUNT_TRUTH_WATCH_PID=0
+}
+
+start_account_truth_watcher() {
+  export LIVE_ACCOUNT_TRUTH_SNAPSHOT_PATH="$ACCOUNT_TRUTH_SNAPSHOT_PATH"
+  export LIVE_ACCOUNT_TRUTH_WATCH_HEALTH_PATH="$ACCOUNT_TRUTH_HEALTH_PATH"
+  export LIVE_ACCOUNT_TRUTH_WATCH_SCOPE=single_order_canary_only
+  export STAGE5_CANARY_SESSION_PATH="$CANARY_SESSION_PATH"
+  node scripts/live_account_truth_watch.js >"$ACCOUNT_TRUTH_WATCH_LOG" 2>&1 &
+  ACCOUNT_TRUTH_WATCH_PID=$!
+  local deadline=$((SECONDS + 35))
+  while (( SECONDS < deadline )); do
+    kill -0 "$ACCOUNT_TRUTH_WATCH_PID" 2>/dev/null || die 'account-truth watcher exited before pre-arm readiness'
+    if node scripts/live_account_truth_runner_policy.js "$ACCOUNT_TRUTH_HEALTH_PATH" prearm "$ACCOUNT_TRUTH_SNAPSHOT_PATH" "$CANARY_SESSION_PATH" >/dev/null 2>&1; then
+      say 'account-truth watcher pre-arm readiness: PASS (two snapshots, age <15s, zero blockers)'
+      return 0
+    fi
+    sleep 1
+  done
+  die 'account-truth watcher failed pre-arm readiness within 35 seconds'
+}
+
+verify_account_truth_during_canary() {
+  if ! kill -0 "$ACCOUNT_TRUTH_WATCH_PID" 2>/dev/null; then
+    PROCESS_ERROR=1; add_terminal_reason_once LIVE_ACCOUNT_TRUTH_WATCHER_EXITED
+    die 'account-truth watcher exited during armed window'
+  fi
+  if ! node scripts/live_account_truth_runner_policy.js "$ACCOUNT_TRUTH_HEALTH_PATH" armed "$ACCOUNT_TRUTH_SNAPSHOT_PATH" "$CANARY_SESSION_PATH" >/dev/null; then
+    PROCESS_ERROR=1; add_terminal_reason_once LIVE_ACCOUNT_TRUTH_RECONCILIATION_ABORT
+    die 'account-truth freshness or reconciliation policy requires immediate lockoff'
+  fi
+}
+
 lock_off() {
-  local rc="$?"
+  local rc="${1:-$?}"
   [[ "$LOCKED" == 1 ]] && return "$rc"
   LOCKED=1
   # Freeze the armed-window boundary before changing .env or restarting PM2.
@@ -533,18 +591,61 @@ lock_off() {
     SAFE_BASELINE_RESTORED=true
     SAFE_BASELINE_MISMATCHES=()
     say 'safe baseline verification: PASS'
+    node scripts/stage5_canary_session_control.js lockoff-restored "$CANARY_SESSION_PATH" >/dev/null 2>&1 || { say 'ERROR: canary session lockoff record failed' >&2; rc=1; }
   else
     SAFE_BASELINE_RESTORED=false
     SAFE_BASELINE_MISMATCHES=("${BASELINE_MISMATCHES[@]}")
     say "ERROR: SAFE BASELINE VERIFICATION FAILED: ${SAFE_BASELINE_MISMATCHES[*]}" >&2
     rc=1
+    node scripts/stage5_canary_session_control.js lockoff-failed "$CANARY_SESSION_PATH" >/dev/null 2>&1 || true
   fi
+  # The structurally read-only watcher remains available through restoration,
+  # then stops only after the safe baseline has been verified.
+  stop_account_truth_watcher
   LOCKED_OFF_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   write_run_summary
   post_lockoff_audit
   return "$rc"
 }
-trap lock_off EXIT INT TERM ERR
+handle_exit() {
+  local rc="$?"
+  trap - EXIT INT TERM ERR
+  lock_off "$rc"
+  exit "$?"
+}
+handle_int() {
+  trap - EXIT INT TERM ERR
+  lock_off 130
+  exit 130
+}
+handle_term() {
+  trap - EXIT INT TERM ERR
+  lock_off 143
+  exit 143
+}
+handle_err() {
+  local rc="$?"
+  PROCESS_ERROR=1
+  add_terminal_reason_once RUNNER_ERROR
+  return "$rc"
+}
+trap handle_exit EXIT
+trap handle_int INT
+trap handle_term TERM
+trap handle_err ERR
+if [[ "${1:-}" == '--selfcheck-signal-handler' ]]; then
+  [[ "$RUN_DIR" == /tmp/* ]] || { say 'ERROR: signal fixture directory must be under /tmp' >&2; exit 1; }
+  signal_name="${2:-}"
+  lock_off() {
+    printf '%s\n' "$1" >> "$RUN_DIR/restoration-calls"
+    return "$1"
+  }
+  case "$signal_name" in
+    INT) kill -INT "$$" ;;
+    TERM) kill -TERM "$$" ;;
+    *) exit 2 ;;
+  esac
+fi
 
 validate_precheck_evidence() {
   node - "$RUN_DIR/readiness.json" "$RUN_DIR/supervisor.out" "$RUN_DIR" <<'NODE'
@@ -615,6 +716,9 @@ npm run supervisor:prelive > "$RUN_DIR/supervisor.out" 2>&1 || true
 validate_precheck_evidence
 
 CANARY_MARKET_ID="$(read_fresh_target)"
+load_runtime_environment || die 'required runtime environment file is not readable for the read-only account-truth watcher'
+verify_shell_profile safe '' || die 'account-truth watcher must start from the locked-off profile'
+start_account_truth_watcher
 # Capture the complete run boundary before any Stage 5 mutation or PM2 restart.
 RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CANDIDATES_BEFORE="$(line_count "$CANDIDATES_FILE")"
@@ -643,7 +747,8 @@ set_env_value MAX_LIVE_ORDER_USD 5
 set_env_value MAX_LIVE_TOTAL_EXPOSURE_USD 5
 set_env_value LIVE_DAILY_MAX_LOSS_USD 5
 set_env_value LIVE_MAX_ORDERS_PER_HOUR 1
-set_env_value AUTO_LIVE_MIN_CONFIDENCE 0.47
+set_env_value AUTO_LIVE_MIN_CONFIDENCE "$STAGE5_CONFIDENCE_FLOOR"
+set_env_value STAGE5_CANARY_GABAGOOL_MIN_CONFIDENCE "$STAGE5_CONFIDENCE_FLOOR"
 set_env_value LIVE_ROUTER_MODE submit
 load_runtime_environment || die 'required runtime environment file is not readable'
 verify_shell_profile armed "$CANARY_MARKET_ID" || die 'armed shell environment does not match requested Stage 5 profile'
@@ -659,6 +764,7 @@ fi
 
 deadline=$((SECONDS + WINDOW_SECONDS))
 while (( SECONDS < deadline )); do
+  verify_account_truth_during_canary
   if (( $(line_count "$CANDIDATES_FILE") < CANDIDATES_BEFORE || $(line_count "$INTENTS_FILE") < INTENTS_BEFORE || $(line_count "$ROUTER_EVENTS_FILE") < ROUTER_EVENTS_BEFORE || $(line_count "$ADAPTER_EVENTS_FILE") < ADAPTER_EVENTS_BEFORE || $(line_count "$EXECUTION_EVENTS_FILE") < EXECUTION_EVENTS_BEFORE || $(line_count "$ENGINE_OUT_LOG") < ENGINE_OUT_LINES_BEFORE || $(line_count "$ENGINE_ERROR_LOG") < ENGINE_ERROR_LINES_BEFORE || $(line_count "$ROUTER_OUT_LOG") < ROUTER_OUT_LINES_BEFORE || $(line_count "$ROUTER_ERROR_LOG") < ROUTER_ERROR_LINES_BEFORE )); then
     PROCESS_ERROR=1; TERMINAL_REASONS+=(LOG_ROTATED_OR_TRUNCATED); die 'LOG_ROTATED_OR_TRUNCATED: monitored source became shorter than its pre-arm offset'
   fi
@@ -683,7 +789,7 @@ while (( SECONDS < deadline )); do
   if grep -Eqi 'LIVE_ROUTER_ADAPTER_RESULT.*"adapter_decision"[[:space:]]*:[[:space:]]*"SUBMITTED"|LIVE_ORDER_SUBMITTED.*"decision"[[:space:]]*:[[:space:]]*"SUBMITTED"' <<< "$structured_events" || grep -Eqi '(LIVE-ADAPTER|\[live-router\]).*(submitted|LIVE_ORDER_SUBMITTED)' <<< "$tagged_live_logs"; then
     ADAPTER_SUBMITTED=1; TERMINAL_REASONS+=(STRUCTURED_OR_TAGGED_LIVE_SUBMISSION); die 'terminal adapter submission observed'
   fi
-  if grep -Eqi 'LIVE_ROUTER_ADAPTER_RESULT.*"adapter_decision"[[:space:]]*:[[:space:]]*"REFUSED"|LIVE_(SUBMISSION|ADAPTER_EVALUATION)_REFUSED|LIVE_ADAPTER_EVALUATION.*"decision"[[:space:]]*:[[:space:]]*"REFUSED"|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED|AUTO_EXECUTE_DISABLED' <<< "$structured_events" || grep -Eqi '(LIVE-ADAPTER|\[live-router\]).*(refus|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED|AUTO_EXECUTE_DISABLED)' <<< "$tagged_live_logs"; then
+  if grep -Eqi 'LIVE_ROUTER_ADAPTER_RESULT.*"adapter_decision"[[:space:]]*:[[:space:]]*"(REFUSED|SUBMISSION_OUTCOME_UNKNOWN|SUBMISSION_REJECTED|RECONCILIATION_FAILED)"|LIVE_(SUBMISSION|ADAPTER_EVALUATION)_REFUSED|LIVE_(SUBMISSION_OUTCOME_UNKNOWN|CANARY_RECONCILIATION_FAILED)|LIVE_ADAPTER_EVALUATION.*"decision"[[:space:]]*:[[:space:]]*"REFUSED"|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED|AUTO_EXECUTE_DISABLED' <<< "$structured_events" || grep -Eqi '(LIVE-ADAPTER|\[live-router\]).*(refus|unknown|reconciliation.failed|LIVE_CANARY_MARKET_MISMATCH|MAX_LIVE_.*_EXCEEDED|AUTO_EXECUTE_DISABLED)' <<< "$tagged_live_logs"; then
     ADAPTER_REFUSED=1; TERMINAL_REASONS+=(STRUCTURED_OR_TAGGED_LIVE_REFUSAL); die 'terminal adapter refusal or safety block observed'
   fi
   if { appended_lines "$ENGINE_ERROR_LOG" "$ENGINE_ERROR_LINES_BEFORE"; appended_lines "$ROUTER_ERROR_LOG" "$ROUTER_ERROR_LINES_BEFORE"; } | grep -Eqi '.+'; then

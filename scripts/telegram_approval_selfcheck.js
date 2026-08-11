@@ -3,6 +3,7 @@
 
 const assert = require('assert');
 const {
+  formatIntentMessage,
   makeTelegramPollingBackoff,
   pollingBackoffDelay,
   isTransientTelegramPollingError,
@@ -31,6 +32,19 @@ function run() {
 
   const fatal = new Error('sendMessage failed: HTTP 401 {"ok":false}');
   assert.strictEqual(isTransientTelegramPollingError(fatal), false, 'non-polling auth errors should not be hidden by backoff');
+
+  const oracleMessage = formatIntentMessage({
+    source: 'BTC_ORACLE',
+    strategy: 'BTC_TEMPORAL_LAG_OBI_V5',
+    action: 'TELEGRAM_ALERT_ONLY',
+    side: 'BUY',
+    token_id: 'fixture-token',
+    size_usd: 1,
+    reason: 'BUY_BTC_UP_TOKEN',
+    intent_id: 'fixture-oracle-signal',
+  });
+  assert(oracleMessage.includes('BTC Oracle Signal — No Trade'), 'oracle alert should not be labeled as a trade approval request');
+  assert(oracleMessage.includes('No paper order, fill, approval execution, or live order occurred.'), 'oracle alert should explicitly distinguish signals from trades');
 
   console.log('telegram approval self-check passed');
 }

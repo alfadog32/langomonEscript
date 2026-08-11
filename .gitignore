@@ -20,3 +20,8 @@ live_order_intents.ndjson
 /archived_nested_langomonEscript_*/
 *.bak*
 node_modules/
+/runtime_monitor/
+/runtime_monitor/stage5_paper_candidate_diagnostics.ndjson*
+/runtime_monitor/polymarket_live_account_truth.json*
+/runtime_monitor/polymarket_live_account_truth_watch_health.json*
+/runtime_monitor/stage5_canary_session.json*

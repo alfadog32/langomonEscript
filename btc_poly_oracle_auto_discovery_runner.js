@@ -449,6 +449,7 @@ function startChildForTarget(targetDoc) {
     BTC_DOWN_TOKEN_ID: targetDoc.target.BTC_DOWN_TOKEN_ID,
     BTC_ORACLE_MARKET_SLUG: targetDoc.target.slug,
     BTC_ORACLE_MARKET_QUESTION: targetDoc.target.question,
+    BTC_ORACLE_MARKET_START_TS_SEC: String(targetDoc.target.ts),
     BTC_ORACLE_TARGET_PATH: path.resolve(CONFIG.targetPath),
   };
 

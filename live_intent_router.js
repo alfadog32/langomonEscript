@@ -31,6 +31,7 @@ function nowIso() { return new Date().toISOString(); }
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function loadEnvFile(filePath, { override = false } = {}) {
+  if (envBool('MM_SKIP_LOCAL_ENV_FILE', false) || envBool('SKIP_LOCAL_ENV_FILE', false)) return false;
   const resolved = path.resolve(filePath);
   if (!fs.existsSync(resolved)) return false;
 
@@ -268,6 +269,11 @@ function normalizeCandidate(raw, filePath) {
 
   const sizeShares = firstFinite(raw.sizeShares, raw.size_shares);
   const minOrderSizeRaw = raw.minOrderSize ?? raw.min_order_size ?? null;
+  const currentLiveExposureUsd = firstFinite(raw.currentLiveExposureUsd, raw.current_live_exposure_usd);
+  const paperRiskApprovedSizeUsd = firstFinite(raw.paperRiskApprovedSizeUsd, raw.paper_risk_approved_size_usd, raw.metadata?.paperRiskApprovedSizeUsd);
+  const adjustedCandidateSizeUsd = firstFinite(raw.adjustedCandidateSizeUsd, raw.adjusted_candidate_size_usd, raw.metadata?.adjustedCandidateSizeUsd);
+  const riskApprovedSizeUsd = firstFinite(raw.riskApprovedSizeUsd, raw.risk_approved_size_usd, raw.metadata?.riskApprovedSizeUsd);
+  const adjustedSizeRiskApproved = raw.adjustedSizeRiskApproved ?? raw.adjusted_size_risk_approved ?? raw.metadata?.adjustedSizeRiskApproved ?? null;
 
   return {
     candidateId,
@@ -293,11 +299,38 @@ function normalizeCandidate(raw, filePath) {
     bookFresh: raw.bookFresh !== undefined ? Boolean(raw.bookFresh) : raw.book_fresh !== undefined ? Boolean(raw.book_fresh) : inferBookFresh(raw),
     bookAgeMs: firstFinite(raw.bookAgeMs, raw.book_age_ms, raw.book_after_persistence?.age_ms, raw.bookAfterPersistence?.ageMs),
     whaleCopy: Boolean(raw.whaleCopy || raw.whale_copy || strategy === 'WhaleCopy'),
-    oracleSignal: source === 'BTC_ORACLE' || strategy === 'BTC_TEMPORAL_LAG_OBI_V5',
+    oracleSignal: raw.oracleSignal === true || raw.oracle_signal === true || source === 'BTC_ORACLE' || strategy === 'BTC_TEMPORAL_LAG_OBI_V5',
+    oracleConfirmed: (raw.oracleConfirmed ?? raw.oracle_confirmed) === true,
+    persistenceConfirmed: (raw.persistenceConfirmed ?? raw.persistence_confirmed) === true,
     tickSize: raw.tickSize || raw.tick_size || raw.book_after_persistence?.tick_size || raw.bookAfterPersistence?.tickSize || null,
     negRisk: raw.negRisk ?? raw.neg_risk ?? null,
     sizeShares: Number.isFinite(sizeShares) ? sizeShares : null,
     minOrderSize: minOrderSizeRaw !== null && minOrderSizeRaw !== undefined ? Number(minOrderSizeRaw) : null,
+    paperRiskApprovedSizeUsd: Number.isFinite(paperRiskApprovedSizeUsd) ? paperRiskApprovedSizeUsd : null,
+    adjustedCandidateSizeUsd: Number.isFinite(adjustedCandidateSizeUsd) ? adjustedCandidateSizeUsd : null,
+    riskApprovedSizeUsd: Number.isFinite(riskApprovedSizeUsd) ? riskApprovedSizeUsd : null,
+    adjustedSizeRiskApproved: adjustedSizeRiskApproved === true,
+    adjustedSizeRiskBlocker: firstString(raw.adjustedSizeRiskBlocker, raw.adjusted_size_risk_blocker, raw.metadata?.adjustedSizeRiskBlocker),
+    liveStage: Number(firstFinite(
+      raw.liveStage,
+      raw.live_stage,
+      raw.metadata?.liveStageProfile?.stage,
+    )),
+    currentLiveExposureUsd: Number.isFinite(currentLiveExposureUsd) ? currentLiveExposureUsd : null,
+    currentLiveExposureSource: firstString(raw.currentLiveExposureSource, raw.current_live_exposure_source, raw.metadata?.currentLiveExposure?.source) || 'unavailable_not_authenticated',
+    currentLiveExposureAuthenticatedReconciliation: (raw.currentLiveExposureAuthenticatedReconciliation ?? raw.current_live_exposure_authenticated_reconciliation ?? raw.metadata?.currentLiveExposure?.authenticatedReconciliation) === true,
+    currentLiveExposureObservedAt: firstString(raw.currentLiveExposureObservedAt, raw.current_live_exposure_observed_at, raw.metadata?.currentLiveExposure?.observedAt),
+    currentDailyLivePnlUsd: firstFinite(raw.currentDailyLivePnlUsd, raw.current_daily_live_pnl_usd),
+    currentDailyLivePnlReconciled: (raw.currentDailyLivePnlReconciled ?? raw.current_daily_live_pnl_reconciled ?? raw.metadata?.liveAccountTruth?.dailyLivePnlReconciled) === true,
+    currentDailyLivePnlObservedAt: firstString(raw.currentDailyLivePnlObservedAt, raw.current_daily_live_pnl_observed_at, raw.metadata?.liveAccountTruth?.observedAt),
+    liveOrdersLastHour: firstFinite(raw.liveOrdersLastHour, raw.live_orders_last_hour, raw.currentLiveOrdersLastHour, raw.current_live_orders_last_hour),
+    liveOrdersLastHourReconciled: (raw.liveOrdersLastHourReconciled ?? raw.live_orders_last_hour_reconciled ?? raw.metadata?.liveAccountTruth?.liveOrdersLastHourReconciled) === true,
+    liveOrdersLastHourObservedAt: firstString(raw.liveOrdersLastHourObservedAt, raw.live_orders_last_hour_observed_at, raw.metadata?.liveAccountTruth?.observedAt),
+    accountIdentityMatches: (raw.accountIdentityMatches ?? raw.account_identity_matches ?? raw.metadata?.liveAccountTruth?.accountIdentityMatches) === true,
+    liveAccountSnapshotFresh: (raw.liveAccountSnapshotFresh ?? raw.live_account_snapshot_fresh ?? raw.metadata?.liveAccountTruth?.fresh) === true,
+    liveAccountSnapshotObservedAt: firstString(raw.liveAccountSnapshotObservedAt, raw.live_account_snapshot_observed_at, raw.metadata?.liveAccountTruth?.observedAt),
+    singleCanarySessionEligible: (raw.singleCanarySessionEligible ?? raw.single_canary_session_eligible ?? raw.metadata?.liveAccountTruth?.singleCanarySessionEligible) === true,
+    singleCanaryBaseline: raw.singleCanaryBaseline || raw.single_canary_baseline || null,
     marketSlug: firstString(raw.marketSlug, raw.market_slug, raw.metadata?.marketSlug),
     marketQuestion: firstString(raw.marketQuestion, raw.market_question, raw.metadata?.marketQuestion),
     outcome: firstString(raw.outcome, raw.metadata?.outcome),
@@ -338,14 +371,40 @@ function toLiveAdapterIntent(candidate) {
     consensusScore: Number.isFinite(candidate.consensusScore) ? candidate.consensusScore : null,
     whaleCopy: candidate.whaleCopy,
     oracleSignal: candidate.oracleSignal,
+    oracleConfirmed: candidate.oracleConfirmed,
+    persistenceConfirmed: candidate.persistenceConfirmed,
     bookFresh: candidate.bookFresh,
     bookAgeMs: Number.isFinite(candidate.bookAgeMs) ? candidate.bookAgeMs : null,
     sizeShares: Number.isFinite(candidate.sizeShares) ? candidate.sizeShares : null,
     size_shares: Number.isFinite(candidate.sizeShares) ? candidate.sizeShares : null,
     minOrderSize: candidate.minOrderSize,
     min_order_size: candidate.minOrderSize,
-    currentLiveExposureUsd: 0,
-    currentDailyLivePnlUsd: 0,
+    paperRiskApprovedSizeUsd: candidate.paperRiskApprovedSizeUsd,
+    adjustedCandidateSizeUsd: candidate.adjustedCandidateSizeUsd,
+    riskApprovedSizeUsd: candidate.riskApprovedSizeUsd,
+    adjustedSizeRiskApproved: candidate.adjustedSizeRiskApproved,
+    adjustedSizeRiskBlocker: candidate.adjustedSizeRiskBlocker,
+    liveStage: Number.isFinite(candidate.liveStage) ? candidate.liveStage : null,
+    live_stage: Number.isFinite(candidate.liveStage) ? candidate.liveStage : null,
+    currentLiveExposureUsd: candidate.currentLiveExposureUsd,
+    current_live_exposure_usd: candidate.currentLiveExposureUsd,
+    currentLiveExposureSource: candidate.currentLiveExposureSource,
+    current_live_exposure_source: candidate.currentLiveExposureSource,
+    currentLiveExposureAuthenticatedReconciliation: candidate.currentLiveExposureAuthenticatedReconciliation,
+    current_live_exposure_authenticated_reconciliation: candidate.currentLiveExposureAuthenticatedReconciliation,
+    currentLiveExposureObservedAt: candidate.currentLiveExposureObservedAt || null,
+    currentDailyLivePnlUsd: candidate.currentDailyLivePnlUsd,
+    currentDailyLivePnlReconciled: candidate.currentDailyLivePnlReconciled,
+    currentDailyLivePnlObservedAt: candidate.currentDailyLivePnlObservedAt || null,
+    liveOrdersLastHour: candidate.liveOrdersLastHour,
+    liveOrdersLastHourReconciled: candidate.liveOrdersLastHourReconciled,
+    liveOrdersLastHourObservedAt: candidate.liveOrdersLastHourObservedAt || null,
+    accountIdentityMatches: candidate.accountIdentityMatches,
+    liveAccountSnapshotFresh: candidate.liveAccountSnapshotFresh,
+    liveAccountSnapshotObservedAt: candidate.liveAccountSnapshotObservedAt || null,
+    candidateHash: candidate.rawHash,
+    singleCanarySessionEligible: candidate.singleCanarySessionEligible,
+    singleCanaryBaseline: candidate.singleCanaryBaseline,
     tickSize: candidate.tickSize,
     negRisk: candidate.negRisk,
     marketSlug: candidate.marketSlug || null,
@@ -379,6 +438,12 @@ function evaluateRouterSafety(candidate, config) {
   if (!Number.isFinite(candidate.price) || candidate.price <= 0 || candidate.price >= 1) reasons.push('INVALID_PRICE');
   if (!Number.isFinite(candidate.sizeUsd) || candidate.sizeUsd <= 0) reasons.push('INVALID_SIZE_USD');
   if (Number.isFinite(candidate.sizeUsd) && candidate.sizeUsd > config.maxOrderUsd) reasons.push('ROUTER_MAX_ORDER_USD_EXCEEDED');
+  if (candidate.liveStage === 5) {
+    if (candidate.adjustedSizeRiskApproved !== true) reasons.push('ADJUSTED_SIZE_RISK_NOT_APPROVED');
+    if (!Number.isFinite(candidate.riskApprovedSizeUsd) || Math.abs(candidate.riskApprovedSizeUsd - candidate.sizeUsd) > 1e-9) {
+      reasons.push('RISK_APPROVED_SIZE_MISMATCH');
+    }
+  }
 
   if (!config.allowedSources.has(source)) reasons.push(`SOURCE_NOT_ALLOWED:${source || 'blank'}`);
   if (config.blockedStrategies.has(strategy) || type.includes('REJECTED')) reasons.push(`STRATEGY_BLOCKED:${strategy || type || 'blank'}`);

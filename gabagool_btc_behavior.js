@@ -44,31 +44,20 @@ function normalizeWallet(value) {
 }
 
 function deriveOracleExpectedEdge(oracleSignal = {}) {
-  const abs = (value) => {
-    const n = toNum(value);
-    return Number.isFinite(n) ? Math.abs(n) : NaN;
-  };
-  const initialBtcPrice = toNum(oracleSignal.initial_btc_price);
-  const triggerBtcPrice = toNum(oracleSignal.trigger_btc_price);
-  const currentBtcPrice = toNum(oracleSignal.current_btc_price);
-  const currentVsInitial = Number.isFinite(initialBtcPrice) && initialBtcPrice > 0 && Number.isFinite(currentBtcPrice)
-    ? Math.abs((currentBtcPrice - initialBtcPrice) / initialBtcPrice)
-    : NaN;
-  const currentVsTrigger = Number.isFinite(triggerBtcPrice) && triggerBtcPrice > 0 && Number.isFinite(currentBtcPrice)
-    ? Math.abs((currentBtcPrice - triggerBtcPrice) / triggerBtcPrice)
-    : NaN;
-  const candidates = [
-    abs(oracleSignal.lag_score),
-    abs(oracleSignal.btc_persisted_move_pct),
-    abs(oracleSignal.btc_trigger_move_pct),
-    abs(oracleSignal.poly_mid_move_pct),
-    abs(oracleSignal.poly_move_weight_limit_pct),
-    currentVsInitial,
-    currentVsTrigger,
-  ]
-    .filter((value) => Number.isFinite(value))
-    .map((value) => Math.max(0, value));
-  return candidates.length > 0 ? Math.max(...candidates) : 0;
+  const lagScore = toNum(oracleSignal.lag_score);
+  if (Number.isFinite(lagScore)) return Math.max(0, lagScore);
+
+  // Legacy payload fallback: reconstruct the oracle's own lag formula.  BTC
+  // movement and Polymarket movement are inputs to lag, not interchangeable
+  // expected-edge candidates.  In particular, a large Polymarket move must
+  // never be converted into a large positive edge by taking its absolute
+  // value.
+  const persistedBtcMove = Math.abs(toNum(oracleSignal.btc_persisted_move_pct));
+  const polymarketMove = Math.abs(toNum(oracleSignal.poly_mid_move_pct));
+  if (Number.isFinite(persistedBtcMove) && Number.isFinite(polymarketMove)) {
+    return Math.max(0, persistedBtcMove - polymarketMove);
+  }
+  return 0;
 }
 
 function readJsonFile(filePath, fallback = null) {

@@ -16,6 +16,16 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { buildLiveAccountTruthSnapshot } = require('./lib/polymarket_live_account_truth');
+const { createReadOnlyAccountTruthSource } = require('./lib/polymarket_live_account_truth_readonly_client');
+const {
+  SCOPE: SINGLE_CANARY_SCOPE,
+  STATES: CANARY_STATES,
+  CanarySessionStore,
+  evaluateSingleCanaryBaseline,
+  reconcileExactCanaryOrder,
+  submitCanaryExactlyOnce,
+} = require('./lib/stage5_canary_session');
 
 // -----------------------------
 // Utility helpers
@@ -168,6 +178,7 @@ function firstString(...values) {
 
 function firstNumber(...values) {
   for (const value of values) {
+    if (value === undefined || value === null || value === '') continue;
     const n = Number(value);
     if (Number.isFinite(n)) return n;
   }
@@ -564,7 +575,18 @@ function readIntentFromArgs(baseDir, args, fallback = null) {
     signalAgeMs: 250,
     decisionLatencyMs: 100,
     currentLiveExposureUsd: 0,
+    currentLiveExposureSource: 'synthetic_readiness_fixture',
+    currentLiveExposureAuthenticatedReconciliation: true,
+    currentLiveExposureObservedAt: nowIso(),
     currentDailyLivePnlUsd: 0,
+    currentDailyLivePnlReconciled: true,
+    currentDailyLivePnlObservedAt: nowIso(),
+    liveOrdersLastHour: 0,
+    liveOrdersLastHourReconciled: true,
+    liveOrdersLastHourObservedAt: nowIso(),
+    accountIdentityMatches: true,
+    liveAccountSnapshotFresh: true,
+    liveAccountSnapshotObservedAt: nowIso(),
     tickSize: opts['tick-size'] || fallback?.tickSize || '0.01',
     minOrderSize: opts['min-order-size'] !== undefined ? Number(opts['min-order-size']) : fallback?.minOrderSize ?? 0,
     negRisk: false,
@@ -597,6 +619,7 @@ function readConfig(baseDir = process.cwd()) {
     liveExecutionLogPath: process.env.LIVE_EXECUTION_LOG_PATH || './live_execution_events.ndjson',
     liveAdapterEventsPath: process.env.LIVE_ADAPTER_EVENTS_PATH || './live_adapter_events.ndjson',
     liveReconcileSnapshotPath: process.env.LIVE_RECONCILE_SNAPSHOT_PATH || './live_reconcile_snapshot.json',
+    stage5CanarySessionPath: process.env.STAGE5_CANARY_SESSION_PATH || './runtime_monitor/stage5_canary_session.json',
 
     enableLiveTrading: toBool(process.env.ENABLE_LIVE_TRADING, false),
     liveAutoExecute: toBool(process.env.LIVE_AUTO_EXECUTE, false),
@@ -634,6 +657,7 @@ function readConfig(baseDir = process.cwd()) {
     liveMaxOrderBuildLatencyMs: toNum(process.env.LIVE_MAX_ORDER_BUILD_LATENCY_MS, 2_000),
     liveMaxSubmitDryRunLatencyMs: toNum(process.env.LIVE_MAX_SUBMIT_DRY_RUN_LATENCY_MS, 2_500),
     liveMaxOrdersPerHour: toInt(process.env.LIVE_MAX_ORDERS_PER_HOUR, 25),
+    liveAccountTruthTtlMs: toNum(process.env.LIVE_ACCOUNT_TRUTH_TTL_MS, 30_000),
     liveMinBurnInReports: toNum(process.env.LIVE_BURN_IN_MIN_REPORTS, 3),
     liveMinBurnInClosedPnlUsd: toNum(process.env.LIVE_BURN_IN_MIN_CLOSED_PNL_USD, 0),
     liveMaxBurnInDrawdownPct: toNum(process.env.LIVE_BURN_IN_MAX_DRAWDOWN_PCT, 3),
@@ -688,6 +712,12 @@ function normalizeIntent(rawIntent) {
       riskMeta.approved,
       riskMeta.admitted
     )),
+    paperRiskApprovedSizeUsd: firstNumber(rawIntent.paperRiskApprovedSizeUsd, rawIntent.paper_risk_approved_size_usd, metadata.paperRiskApprovedSizeUsd),
+    adjustedCandidateSizeUsd: firstNumber(rawIntent.adjustedCandidateSizeUsd, rawIntent.adjusted_candidate_size_usd, metadata.adjustedCandidateSizeUsd),
+    riskApprovedSizeUsd: firstNumber(rawIntent.riskApprovedSizeUsd, rawIntent.risk_approved_size_usd, metadata.riskApprovedSizeUsd),
+    adjustedSizeRiskApproved: toOptionalBool(firstDefined(rawIntent.adjustedSizeRiskApproved, rawIntent.adjusted_size_risk_approved, metadata.adjustedSizeRiskApproved)),
+    adjustedSizeRiskBlocker: firstString(rawIntent.adjustedSizeRiskBlocker, rawIntent.adjusted_size_risk_blocker, metadata.adjustedSizeRiskBlocker) || null,
+    liveStage: firstNumber(rawIntent.liveStage, rawIntent.live_stage, metadata.liveStageProfile?.stage),
     whaleCopy: Boolean(rawIntent.whaleCopy || rawIntent.whale_copy || rawIntent.source === 'WhaleCopy'),
     oracleSignal: Boolean(rawIntent.oracleSignal || rawIntent.oracle_signal || rawIntent.source === 'BTCOracle'),
     oracleConfirmed: toOptionalBool(firstDefined(
@@ -712,9 +742,26 @@ function normalizeIntent(rawIntent) {
     repeatCooldownBlocked: toOptionalBool(firstDefined(rawIntent.repeatCooldownBlocked, rawIntent.repeat_cooldown_blocked, metadata.repeatCooldownBlocked)),
     signalAgeMs: firstNumber(rawIntent.signalAgeMs, rawIntent.signal_age_ms, metadata.signalAgeMs),
     decisionLatencyMs: firstNumber(rawIntent.decisionLatencyMs, rawIntent.decision_latency_ms, metadata.decisionLatencyMs),
-    currentLiveExposureUsd: firstNumber(rawIntent.currentLiveExposureUsd, rawIntent.current_live_exposure_usd, 0),
-    currentDailyLivePnlUsd: firstNumber(rawIntent.currentDailyLivePnlUsd, rawIntent.current_daily_live_pnl_usd, 0),
-    currentLiveOrdersLastHour: firstNumber(rawIntent.currentLiveOrdersLastHour, rawIntent.current_live_orders_last_hour, 0),
+    currentLiveExposureUsd: firstNumber(rawIntent.currentLiveExposureUsd, rawIntent.current_live_exposure_usd),
+    currentLiveExposureSource: firstString(rawIntent.currentLiveExposureSource, rawIntent.current_live_exposure_source, metadata.currentLiveExposure?.source) || 'unavailable_not_authenticated',
+    currentLiveExposureAuthenticatedReconciliation: toOptionalBool(firstDefined(
+      rawIntent.currentLiveExposureAuthenticatedReconciliation,
+      rawIntent.current_live_exposure_authenticated_reconciliation,
+      metadata.currentLiveExposure?.authenticatedReconciliation
+    )) === true,
+    currentLiveExposureObservedAt: firstString(rawIntent.currentLiveExposureObservedAt, rawIntent.current_live_exposure_observed_at, metadata.currentLiveExposure?.observedAt) || null,
+    currentDailyLivePnlUsd: firstNumber(rawIntent.currentDailyLivePnlUsd, rawIntent.current_daily_live_pnl_usd),
+    currentDailyLivePnlReconciled: toOptionalBool(firstDefined(rawIntent.currentDailyLivePnlReconciled, rawIntent.current_daily_live_pnl_reconciled, metadata.liveAccountTruth?.dailyLivePnlReconciled)) === true,
+    currentDailyLivePnlObservedAt: firstString(rawIntent.currentDailyLivePnlObservedAt, rawIntent.current_daily_live_pnl_observed_at, metadata.liveAccountTruth?.observedAt) || null,
+    currentLiveOrdersLastHour: firstNumber(rawIntent.liveOrdersLastHour, rawIntent.live_orders_last_hour, rawIntent.currentLiveOrdersLastHour, rawIntent.current_live_orders_last_hour),
+    liveOrdersLastHourReconciled: toOptionalBool(firstDefined(rawIntent.liveOrdersLastHourReconciled, rawIntent.live_orders_last_hour_reconciled, metadata.liveAccountTruth?.liveOrdersLastHourReconciled)) === true,
+    liveOrdersLastHourObservedAt: firstString(rawIntent.liveOrdersLastHourObservedAt, rawIntent.live_orders_last_hour_observed_at, metadata.liveAccountTruth?.observedAt) || null,
+    accountIdentityMatches: toOptionalBool(firstDefined(rawIntent.accountIdentityMatches, rawIntent.account_identity_matches, metadata.liveAccountTruth?.accountIdentityMatches)) === true,
+    liveAccountSnapshotFresh: toOptionalBool(firstDefined(rawIntent.liveAccountSnapshotFresh, rawIntent.live_account_snapshot_fresh, metadata.liveAccountTruth?.fresh)) === true,
+    liveAccountSnapshotObservedAt: firstString(rawIntent.liveAccountSnapshotObservedAt, rawIntent.live_account_snapshot_observed_at, metadata.liveAccountTruth?.observedAt) || null,
+    candidateHash: firstString(rawIntent.candidateHash, rawIntent.candidate_hash) || null,
+    singleCanarySessionEligible: toOptionalBool(firstDefined(rawIntent.singleCanarySessionEligible, rawIntent.single_canary_session_eligible, metadata.liveAccountTruth?.singleCanarySessionEligible)) === true,
+    singleCanaryBaseline: rawIntent.singleCanaryBaseline || rawIntent.single_canary_baseline || null,
     paperBurnIn: rawIntent.paperBurnIn || rawIntent.paper_burn_in || rawIntent.burnIn || rawIntent.burn_in || null,
     tickSize: rawIntent.tickSize || rawIntent.tick_size || null,
     negRisk: firstDefined(rawIntent.negRisk, rawIntent.neg_risk) !== undefined ? Boolean(firstDefined(rawIntent.negRisk, rawIntent.neg_risk)) : null,
@@ -731,6 +778,35 @@ function normalizeIntent(rawIntent) {
   }
 
   return intent;
+}
+
+function buildPolymarketUserOrder(intent, side, builderCode = null) {
+  const price = Number(intent?.price);
+  const sizeUsd = Number(intent?.sizeUsd);
+  const sizeShares = Number(intent?.sizeShares);
+  const minimumShares = Number(intent?.minOrderSize);
+  if (!intent?.tokenId) throw new Error('TOKEN_ID_MISSING');
+  if (!Number.isFinite(price) || price <= 0 || price >= 1) throw new Error('INVALID_PRICE');
+  if (!Number.isFinite(sizeUsd) || sizeUsd <= 0) throw new Error('INVALID_SIZE_USD');
+  if (!Number.isFinite(sizeShares) || sizeShares <= 0) throw new Error('INVALID_SIZE_SHARES');
+  const constructedNotionalUsd = price * sizeShares;
+  const consistencyToleranceUsd = Math.max(1e-9, Math.abs(sizeUsd) * 1e-9);
+  if (Math.abs(constructedNotionalUsd - sizeUsd) > consistencyToleranceUsd) {
+    throw new Error('SIZE_USD_SHARES_MISMATCH');
+  }
+  if (Number.isFinite(minimumShares) && minimumShares > 0 && sizeShares + 1e-9 < minimumShares) {
+    throw new Error('SIZE_BELOW_MIN_ORDER');
+  }
+  const userOrder = {
+    tokenID: intent.tokenId,
+    price,
+    // Preserve the writer's upward-safe share quantity exactly. The adapter
+    // never rounds shares down or re-derives them from a cent-rounded USD size.
+    size: sizeShares,
+    side,
+  };
+  if (builderCode) userOrder.builderCode = builderCode;
+  return userOrder;
 }
 
 // -----------------------------
@@ -765,6 +841,39 @@ function evaluateBurnIn(config, intent) {
   return { ok: reasons.length === 0, reasons, source: 'intent.paperBurnIn' };
 }
 
+function evaluateLiveAccountTruth(config, intent, nowMs = Date.now()) {
+  const reasons = [];
+  const observedMs = parseTimestampMs(intent.liveAccountSnapshotObservedAt);
+  const ageMs = Number.isFinite(observedMs) ? Math.max(0, nowMs - observedMs) : Infinity;
+  const fieldFresh = (value) => {
+    const parsed = parseTimestampMs(value);
+    return Number.isFinite(parsed) && Math.max(0, nowMs - parsed) <= config.liveAccountTruthTtlMs &&
+      Number.isFinite(observedMs) && Math.abs(parsed - observedMs) <= 1000;
+  };
+  if (intent.accountIdentityMatches !== true) reasons.push('LIVE_ACCOUNT_IDENTITY_UNCERTAIN');
+  if (intent.liveAccountSnapshotFresh !== true || !Number.isFinite(ageMs) || ageMs > config.liveAccountTruthTtlMs) {
+    reasons.push('LIVE_ACCOUNT_SNAPSHOT_STALE');
+  }
+  const authoritativeExposureSource = /official_data_api.*official_clob_authenticated/i.test(String(intent.currentLiveExposureSource || ''));
+  if (!Number.isFinite(intent.currentLiveExposureUsd) || intent.currentLiveExposureAuthenticatedReconciliation !== true ||
+      !authoritativeExposureSource || !fieldFresh(intent.currentLiveExposureObservedAt)) {
+    reasons.push('LIVE_EXPOSURE_UNCERTAIN');
+  }
+  if (!Number.isFinite(intent.currentDailyLivePnlUsd) || intent.currentDailyLivePnlReconciled !== true || !fieldFresh(intent.currentDailyLivePnlObservedAt)) {
+    reasons.push('LIVE_DAILY_PNL_UNCERTAIN');
+  }
+  const embeddedWatcher = intent.singleCanaryBaseline?.watcher || {};
+  const canaryPolicy = Number(intent.liveStage) === 5 && intent.singleCanarySessionEligible === true
+    ? evaluateSingleCanaryBaseline({ snapshot: intent.singleCanaryBaseline, watcherHealth: embeddedWatcher, candidate: intent, nowMs, requireWatcher: true })
+    : null;
+  const singleCanaryRateProof = canaryPolicy?.eligible === true;
+  if (!singleCanaryRateProof && (!Number.isFinite(intent.currentLiveOrdersLastHour) || intent.liveOrdersLastHourReconciled !== true || !fieldFresh(intent.liveOrdersLastHourObservedAt))) {
+    reasons.push('LIVE_ORDER_RATE_UNCERTAIN');
+  }
+  if (Number(intent.liveStage) === 5 && intent.singleCanarySessionEligible === true && !singleCanaryRateProof) reasons.push(...(canaryPolicy?.blockers || ['SINGLE_CANARY_BASELINE_UNAVAILABLE']));
+  return { ok: reasons.length === 0, reasons: [...new Set(reasons)], observedAt: intent.liveAccountSnapshotObservedAt, ageMs, canaryPolicy, scope: singleCanaryRateProof ? SINGLE_CANARY_SCOPE : 'global' };
+}
+
 function evaluateStaticSafety(config, intent, options = {}) {
   const reasons = [];
   const submitMode = options.mode === 'submit';
@@ -792,13 +901,26 @@ function evaluateStaticSafety(config, intent, options = {}) {
   if (!Number.isFinite(intent.price) || intent.price <= 0 || intent.price >= 1) reasons.push('INVALID_PRICE');
   if (!Number.isFinite(intent.sizeUsd) || intent.sizeUsd <= 0) reasons.push('INVALID_SIZE_USD');
   if (intent.sizeUsd > effectiveMaxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
-  if (intent.currentLiveExposureUsd + intent.sizeUsd > effectiveMaxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
-  if (intent.currentDailyLivePnlUsd <= -Math.abs(effectiveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
-  if (stageProfile.maxOrdersPerHour > 0 && intent.currentLiveOrdersLastHour >= stageProfile.maxOrdersPerHour) reasons.push('MAX_LIVE_ORDERS_PER_HOUR_EXCEEDED');
+  const liveAccountTruth = evaluateLiveAccountTruth(config, intent, options.nowMs || Date.now());
+  reasons.push(...liveAccountTruth.reasons);
+  if (Number.isFinite(intent.currentLiveExposureUsd) && intent.currentLiveExposureAuthenticatedReconciliation === true &&
+      intent.currentLiveExposureUsd + intent.sizeUsd > effectiveMaxLiveTotalExposureUsd) {
+    reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
+  }
+  if (Number.isFinite(intent.currentDailyLivePnlUsd) && intent.currentDailyLivePnlReconciled === true &&
+      intent.currentDailyLivePnlUsd <= -Math.abs(effectiveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
+  if (stageProfile.maxOrdersPerHour > 0 && Number.isFinite(intent.currentLiveOrdersLastHour) && intent.liveOrdersLastHourReconciled === true &&
+      intent.currentLiveOrdersLastHour >= stageProfile.maxOrdersPerHour) reasons.push('MAX_LIVE_ORDERS_PER_HOUR_EXCEEDED');
 
   if (config.liveRequireSophieApproval && intent.sophieApproved !== true) reasons.push('SOPHIE_NOT_APPROVED');
   if (Number.isFinite(intent.consensusScore) && intent.consensusScore < config.liveSophieMinScore) reasons.push('SOPHIE_SCORE_TOO_LOW');
   if (config.liveRequireRiskApproval && intent.riskApproved !== true) reasons.push('RISK_NOT_APPROVED');
+  if (intent.liveStage === 5) {
+    if (intent.adjustedSizeRiskApproved !== true) reasons.push('ADJUSTED_SIZE_RISK_NOT_APPROVED');
+    if (!Number.isFinite(intent.riskApprovedSizeUsd) || Math.abs(intent.riskApprovedSizeUsd - intent.sizeUsd) > 1e-9) {
+      reasons.push('RISK_APPROVED_SIZE_MISMATCH');
+    }
+  }
   if (config.liveRequireOracleConfirmation && intent.oracleSignal && intent.oracleConfirmed !== true) reasons.push('ORACLE_NOT_CONFIRMED');
   if (config.liveRequirePersistenceConfirmation && intent.oracleSignal && intent.persistenceConfirmed !== true) reasons.push('PERSISTENCE_NOT_CONFIRMED');
   if (Number.isFinite(config.liveMinExpectedEdge) && config.liveMinExpectedEdge > 0) {
@@ -822,6 +944,7 @@ function evaluateStaticSafety(config, intent, options = {}) {
     ok: reasons.length === 0,
     reasons,
     burnIn: burn,
+    liveAccountTruth,
     stageProfile,
     effectiveCaps: {
       maxLiveOrderUsd: effectiveMaxLiveOrderUsd,
@@ -838,10 +961,15 @@ function evaluateLossExposureGuards(config, intent) {
   const effectiveMaxLiveTotalExposureUsd = stageProfile.maxLiveTotalExposureUsd || config.maxLiveTotalExposureUsd;
   const effectiveDailyMaxLossUsd = stageProfile.liveDailyMaxLossUsd || Math.abs(config.liveDailyMaxLossUsd);
   const reasons = [];
-  if (intent.currentDailyLivePnlUsd <= -Math.abs(effectiveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
-  if (intent.currentLiveExposureUsd + intent.sizeUsd > effectiveMaxLiveTotalExposureUsd) reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
+  reasons.push(...evaluateLiveAccountTruth(config, intent).reasons);
+  if (Number.isFinite(intent.currentDailyLivePnlUsd) && intent.currentDailyLivePnlReconciled === true &&
+      intent.currentDailyLivePnlUsd <= -Math.abs(effectiveDailyMaxLossUsd)) reasons.push('DAILY_MAX_LOSS_EXCEEDED');
+  if (Number.isFinite(intent.currentLiveExposureUsd) && intent.currentLiveExposureAuthenticatedReconciliation === true &&
+      intent.currentLiveExposureUsd + intent.sizeUsd > effectiveMaxLiveTotalExposureUsd) {
+    reasons.push('MAX_LIVE_TOTAL_EXPOSURE_EXCEEDED');
+  }
   if (intent.sizeUsd > effectiveMaxLiveOrderUsd) reasons.push('MAX_LIVE_ORDER_USD_EXCEEDED');
-  return { ok: reasons.length === 0, reasons };
+  return { ok: reasons.length === 0, reasons: [...new Set(reasons)] };
 }
 
 function extractBookLevels(levels) {
@@ -1174,13 +1302,7 @@ class PolymarketLiveClient {
     this.assertBuilderCodeReady();
     const sdk = this.sdk;
     const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
-    const userOrder = {
-      tokenID: intent.tokenId,
-      price: Number(intent.price),
-      size: Number(intent.sizeShares),
-      side,
-    };
-    if (this.builderCodeResolution?.builderCode) userOrder.builderCode = this.builderCodeResolution.builderCode;
+    const userOrder = buildPolymarketUserOrder(intent, side, this.builderCodeResolution?.builderCode);
     const startedAt = Date.now();
     const signedOrder = await client.createOrder(userOrder, {
       tickSize: String(meta.tickSize),
@@ -1204,13 +1326,7 @@ class PolymarketLiveClient {
     this.assertBuilderCodeReady();
     const sdk = this.sdk;
     const side = intent.side === 'BUY' ? sdk.Side.BUY : sdk.Side.SELL;
-    const userOrder = {
-      tokenID: intent.tokenId,
-      price: Number(intent.price),
-      size: Number(intent.sizeShares),
-      side,
-    };
-    if (this.builderCodeResolution?.builderCode) userOrder.builderCode = this.builderCodeResolution.builderCode;
+    const userOrder = buildPolymarketUserOrder(intent, side, this.builderCodeResolution?.builderCode);
     const tickSize = String(meta.tickSize || '0.01');
     const negRisk = Boolean(meta.negRisk);
     // Force exchange version 2 for the modern Polymarket exchange. Local-only
@@ -1298,52 +1414,8 @@ class PolymarketLiveClient {
   }
 
   async reconcile(params = {}) {
-    const client = await this.init('reconcile');
-    const sdk = this.sdk;
-    const assetType = sdk.AssetType || { COLLATERAL: 'COLLATERAL', CONDITIONAL: 'CONDITIONAL' };
-    let openOrders = [];
-    let collateral = null;
-    let positions = [];
-    let fills = [];
-    const errors = [];
-
-    try {
-      openOrders = await client.getOpenOrders(params.openOrderParams || undefined);
-    } catch (e) {
-      errors.push(`OPEN_ORDERS_FAILED:${safeError(e)}`);
-    }
-
-    try {
-      collateral = await client.getBalanceAllowance({ asset_type: assetType.COLLATERAL });
-    } catch (e) {
-      errors.push(`USDC_BALANCE_FAILED:${safeError(e)}`);
-    }
-
-    try {
-      if (typeof client.getPositions === 'function') positions = await client.getPositions();
-    } catch (e) {
-      errors.push(`POSITIONS_FAILED:${safeError(e)}`);
-    }
-
-    try {
-      if (typeof client.getTrades === 'function') fills = await client.getTrades();
-    } catch (e) {
-      errors.push(`TRADES_FAILED:${safeError(e)}`);
-    }
-
-    return {
-      timestamp: nowIso(),
-      walletAddress: redactWallet(this.walletAddress),
-      usdcBalance: extractBalance(collateral),
-      gasBalance: null,
-      openOrdersCount: Array.isArray(openOrders) ? openOrders.length : 0,
-      openOrdersUsd: sumOrdersUsd(openOrders),
-      positionsCount: Array.isArray(positions) ? positions.length : 0,
-      positionsUsd: sumPositionsUsd(positions),
-      recentFillsCount: Array.isArray(fills) ? fills.length : 0,
-      lastReconciledAt: nowIso(),
-      errors,
-    };
+    void params;
+    throw new Error('LEGACY_RECONCILE_DISABLED_USE_LIVE_ACCOUNT_TRUTH_READONLY');
   }
 
   async cancelOrder(orderId, purpose = 'cancel') {
@@ -1375,35 +1447,70 @@ class PolymarketLiveClient {
     };
   }
 
+  async postSignedOrder(signedOrder, intent) {
+    const client = await this.init('submit');
+    const sdk = this.sdk;
+    const orderType = sdk.OrderType[intent.orderType] || sdk.OrderType.GTC;
+    const postOnly = intent.postOnly !== undefined ? Boolean(intent.postOnly) : this.config.livePostOnlyDefault;
+    const submitStartedAt = Date.now();
+    const response = await client.postOrder(signedOrder, orderType, postOnly);
+    return { response, submitLatencyMs: Math.max(0, Date.now() - submitStartedAt) };
+  }
+
+  async exactCanaryEvidence(session) {
+    const client = await this.init('submit');
+    const source = createReadOnlyAccountTruthSource({
+      clobClient: client,
+      fetchImpl: globalThis.fetch,
+      dataApiBaseUrl: process.env.POLYMARKET_DATA_API_URL || 'https://data-api.polymarket.com',
+      accountWallet: session.baselineIdentity?.resolvedAccountWallet,
+    });
+    const identity = {
+      signerAddress: session.baselineIdentity?.signerAddress,
+      expectedSignerAddress: session.baselineIdentity?.signerAddress,
+      configuredAccountWallet: session.baselineIdentity?.configuredAccountWallet,
+      resolvedAccountWallet: session.baselineIdentity?.resolvedAccountWallet,
+      configuredSignatureType: session.baselineIdentity?.configuredSignatureType,
+      resolvedSignatureType: session.baselineIdentity?.resolvedSignatureType,
+      resolvedWalletType: session.baselineIdentity?.resolvedWalletType,
+      authenticated: true,
+    };
+    // Read each mutable source once for this reconciliation generation.  The
+    // readonly source caches open orders and trades, so the account snapshot
+    // and exact-order evidence cannot silently combine different responses.
+    const order = await client.getOrder(session.returnedOrderId);
+    const openEnvelope = await source.fetchOpenOrders();
+    const tradeEnvelope = await source.fetchTrades();
+    const afterSnapshot = await buildLiveAccountTruthSnapshot({ source, identity, nowMs: Date.now(), maxAgeMs: this.config.liveAccountTruthTtlMs });
+    return {
+      order,
+      openOrders: openEnvelope.records,
+      trades: tradeEnvelope.records,
+      afterSnapshot,
+      sourceStatus: {
+        directOrder: { authenticated: true, fetched: Boolean(order), complete: Boolean(order) },
+        openOrders: {
+          authenticated: openEnvelope.authenticated === true,
+          fetched: openEnvelope.fetched === true,
+          complete: openEnvelope.complete === true,
+        },
+        trades: {
+          authenticated: tradeEnvelope.authenticated === true,
+          fetched: tradeEnvelope.fetched === true,
+          complete: tradeEnvelope.complete === true,
+          coverageComplete: tradeEnvelope.coverageComplete === true,
+          paginationComplete: tradeEnvelope.paginationComplete === true,
+          terminalCursorReached: tradeEnvelope.terminalCursorReached === true,
+        },
+      },
+    };
+  }
+
   async replaceOrder({ orderId, replacementIntent, meta }) {
     const cancelResponse = await this.cancelOrder(orderId, 'submit');
     const submitResponse = await this.signAndSubmit(replacementIntent, meta);
     return { cancelResponse, submitResponse };
   }
-}
-
-function extractBalance(collateral) {
-  if (!collateral || typeof collateral !== 'object') return null;
-  return firstNumber(collateral.balance, collateral.collateral, collateral.available, collateral.allowance);
-}
-
-function orderUsd(order) {
-  if (!order || typeof order !== 'object') return 0;
-  const price = firstNumber(order.price, order.order_price, order.limitPrice);
-  const size = firstNumber(order.size, order.original_size, order.remaining_size, order.sizeShares);
-  const sizeUsd = firstNumber(order.sizeUsd, order.size_usd, order.amount);
-  if (Number.isFinite(sizeUsd)) return Math.max(0, sizeUsd);
-  if (Number.isFinite(price) && Number.isFinite(size)) return Math.max(0, price * size);
-  return 0;
-}
-
-function sumOrdersUsd(orders) {
-  return Array.isArray(orders) ? Number(orders.reduce((sum, order) => sum + orderUsd(order), 0).toFixed(4)) : 0;
-}
-
-function sumPositionsUsd(positions) {
-  if (!Array.isArray(positions)) return 0;
-  return Number(positions.reduce((sum, pos) => sum + Math.max(0, firstNumber(pos.value, pos.valueUsd, pos.currentValue, 0)), 0).toFixed(4));
 }
 
 function orderId(order) {
@@ -1546,8 +1653,15 @@ function burnInFromState(baseDir) {
 class LiveAdapter {
   constructor(options = {}) {
     this.baseDir = options.baseDir || process.cwd();
-    this.config = readConfig(this.baseDir);
+    this.config = options.config || readConfig(this.baseDir);
+    this.config.liveStageProfile = this.config.liveStageProfile || resolveLiveStageProfile(this.config);
     this.live = new PolymarketLiveClient(this.config);
+    this.canarySessionStore = options.canarySessionStore || new CanarySessionStore({
+      sessionPath: path.resolve(this.baseDir, this.config.stage5CanarySessionPath),
+      now: options.now || Date.now,
+    });
+    this.canaryExactEvidenceProvider = options.canaryExactEvidenceProvider || ((session) => this.live.exactCanaryEvidence(session));
+    this.canaryLockoffRestorer = options.canaryLockoffRestorer || null;
   }
 
   logEvent(event) {
@@ -1600,14 +1714,139 @@ class LiveAdapter {
     };
   }
 
+  async restoreCanaryLockoff(event) {
+    if (typeof this.canaryLockoffRestorer !== 'function') return event;
+    const existingSession = this.canarySessionStore.read();
+    if (existingSession?.state === CANARY_STATES.LOCKOFF_RESTORED && existingSession?.lockoffRestorationState === 'RESTORED') {
+      return { ...event, lockoffRestoration: 'ALREADY_RESTORED' };
+    }
+    try {
+      const result = await this.canaryLockoffRestorer(event);
+      if (result?.restored !== true) throw new Error('LOCKOFF_RESTORATION_FAILED');
+      if (this.canarySessionStore.read()) this.canarySessionStore.recordLockoff({ restored: true });
+      return { ...event, lockoffRestoration: 'RESTORED' };
+    } catch (error) {
+      if (this.canarySessionStore.read()) this.canarySessionStore.recordLockoff({ restored: false, code: 'LOCKOFF_RESTORATION_FAILED' });
+      return { ...event, decision: 'RECONCILIATION_FAILED', reasons: [...new Set([...(event.reasons || []), 'LOCKOFF_RESTORATION_FAILED'])], lockoffRestoration: 'FAILED' };
+    }
+  }
+
+  async handleSingleCanarySubmission(intent, evaluation) {
+    const baseline = intent.singleCanaryBaseline;
+    const watcher = baseline?.watcher || {};
+    const watcherHealth = {
+      running: watcher.running === true,
+      watcherPid: watcher.watcherPid,
+      consecutiveSuccessfulSnapshots: watcher.consecutiveSuccessfulSnapshots,
+      consecutiveFailures: watcher.consecutiveFailures,
+      lastSuccessfulRefresh: watcher.lastSuccessfulRefresh,
+      healthGeneration: watcher.healthGeneration,
+      readinessScope: watcher.readinessScope,
+    };
+    let currentOpenOrders;
+    try {
+      currentOpenOrders = await this.live.getOpenOrders({}, 'submit');
+    } catch (error) {
+      return this.restoreCanaryLockoff({ timestamp: nowIso(), type: 'LIVE_SUBMISSION_REFUSED', decision: 'REFUSED', reasons: ['OPEN_ORDERS_UNAVAILABLE'], adapterResponseClassification: 'refused_before_submission', safety: { submitted: false, signed: false } });
+    }
+    if (!Array.isArray(currentOpenOrders) || currentOpenOrders.length !== 0) {
+      return this.restoreCanaryLockoff({ timestamp: nowIso(), type: 'LIVE_SUBMISSION_REFUSED', decision: 'REFUSED', reasons: ['CANARY_BASELINE_OPEN_ORDERS_NOT_ZERO'], adapterResponseClassification: 'refused_before_submission', safety: { submitted: false, signed: false } });
+    }
+
+    let session;
+    try {
+      session = this.canarySessionStore.createArmEligible({ candidate: intent, baselineSnapshot: baseline, watcherHealth });
+    } catch (error) {
+      return this.restoreCanaryLockoff({ timestamp: nowIso(), type: 'LIVE_SUBMISSION_REFUSED', decision: 'REFUSED', reasons: error.blockers || [String(error.message || 'CANARY_SESSION_REFUSED').split(':')[0]], adapterResponseClassification: 'refused_before_submission', safety: { submitted: false, signed: false } });
+    }
+
+    let signed;
+    try {
+      signed = await this.live.signOrderOnly(intent, evaluation.metadata, 'submit');
+    } catch (error) {
+      this.canarySessionStore.withLock(() => this.canarySessionStore.transitionLocked(this.canarySessionStore.read(), CANARY_STATES.RECONCILIATION_FAILED, { blockers: ['CANARY_ORDER_CONSTRUCTION_FAILED'] }));
+      return this.restoreCanaryLockoff({ timestamp: nowIso(), type: 'LIVE_SUBMISSION_REFUSED', decision: 'REFUSED', reasons: ['CANARY_ORDER_CONSTRUCTION_FAILED'], adapterResponseClassification: 'refused_before_submission', safety: { submitted: false, signed: false } });
+    }
+
+    let submission;
+    try {
+      submission = await submitCanaryExactlyOnce({
+        store: this.canarySessionStore,
+        candidate: intent,
+        signedOrder: signed.signedOrder,
+        postOrder: async () => (await this.live.postSignedOrder(signed.signedOrder, intent)).response,
+      });
+    } catch (error) {
+      try {
+        this.canarySessionStore.withLock(() => this.canarySessionStore.transitionLocked(this.canarySessionStore.read(), CANARY_STATES.RECONCILIATION_FAILED, {
+          blockers: [String(error.message || 'CANARY_SUBMISSION_GUARD_FAILED').split(':')[0]],
+        }));
+      } catch (_) {
+        // Preserve the original durable state and fail closed if a concurrent
+        // process owns the session lock.
+      }
+      let attemptPersisted = false;
+      try { attemptPersisted = this.canarySessionStore.read()?.submissionAttempted === true; } catch (_) { attemptPersisted = false; }
+      return this.restoreCanaryLockoff({
+        timestamp: nowIso(), type: 'LIVE_SUBMISSION_REFUSED', decision: 'REFUSED',
+        reasons: [String(error.message || 'CANARY_SUBMISSION_GUARD_FAILED').split(':')[0]],
+        adapterResponseClassification: 'refused_before_submission',
+        safety: { submitted: false, signed: true, submissionAttempted: attemptPersisted, automaticRetryCount: 0 },
+      });
+    }
+    if (submission.classification === 'submission_outcome_unknown') {
+      return this.restoreCanaryLockoff({
+        timestamp: nowIso(), type: 'LIVE_SUBMISSION_OUTCOME_UNKNOWN', decision: 'SUBMISSION_OUTCOME_UNKNOWN',
+        reasons: [submission.errorCode || 'SUBMISSION_OUTCOME_UNKNOWN'], adapterResponseClassification: submission.classification,
+        sessionId: submission.session.sessionId, safety: { submitted: null, signed: true, submissionAttempted: true, automaticRetryCount: 0 },
+      });
+    }
+    if (submission.classification === 'submission_attempted_definitive_rejection') {
+      return this.restoreCanaryLockoff({
+        timestamp: nowIso(), type: 'LIVE_SUBMISSION_REJECTED', decision: 'SUBMISSION_REJECTED', reasons: ['DEFINITIVE_REJECTION'],
+        adapterResponseClassification: submission.classification, sessionId: submission.session.sessionId,
+        response: { success: submission.response?.success, status: submission.response?.status || null },
+        safety: { submitted: false, signed: true, submissionAttempted: true, automaticRetryCount: 0 },
+      });
+    }
+
+    session = this.canarySessionStore.startReconciliation();
+    let reconciliation;
+    try {
+      const evidence = await this.canaryExactEvidenceProvider(session);
+      reconciliation = reconcileExactCanaryOrder({ session, ...evidence });
+    } catch (error) {
+      reconciliation = { ok: false, state: CANARY_STATES.RECONCILIATION_FAILED, blockers: ['CANARY_RECONCILIATION_SOURCE_UNAVAILABLE'], errorCode: error?.code || null };
+    }
+    const reconciledSession = this.canarySessionStore.recordReconciliation(reconciliation);
+    const event = {
+      timestamp: nowIso(),
+      type: reconciliation.ok ? 'LIVE_ORDER_SUBMITTED' : 'LIVE_CANARY_RECONCILIATION_FAILED',
+      decision: reconciliation.ok ? 'SUBMITTED' : 'RECONCILIATION_FAILED',
+      reasons: reconciliation.blockers || [],
+      adapterResponseClassification: submission.classification,
+      returnedOrderId: submission.orderId,
+      sessionId: reconciledSession.sessionId,
+      reconciliationState: reconciledSession.finalState,
+      response: { success: submission.response?.success, status: submission.response?.status || null, orderID: submission.orderId },
+      safety: { submitted: true, signed: true, submissionAttempted: true, automaticRetryCount: 0, liveTradingStage: 5 },
+    };
+    this.logExecution(event);
+    return this.restoreCanaryLockoff(event);
+  }
+
   async handleIntent(rawIntent, options = {}) {
     const submitMode = options.mode === 'submit';
     const evaluation = await this.evaluate(rawIntent, { ...options, fetchMetadata: submitMode || options.fetchMetadata === true });
 
     if (evaluation.decision !== 'ALLOW_LIVE_SUBMISSION') {
-      this.logEvent(evaluation);
+      const normalizedRefusedIntent = normalizeIntent(rawIntent);
+      const refusedResult = Number(normalizedRefusedIntent.liveStage) === 5 && normalizedRefusedIntent.singleCanarySessionEligible === true
+        ? await this.restoreCanaryLockoff({ ...evaluation, adapterResponseClassification: 'refused_before_submission' })
+        : evaluation;
+      this.logEvent(refusedResult);
       console.warn(`[LIVE-ADAPTER REFUSED] source=${evaluation.intent.source} side=${evaluation.intent.side} token=${shortId(evaluation.intent.tokenId)} price=${evaluation.intent.price} size=$${evaluation.intent.sizeUsd} reasons=${evaluation.reasons.join(',')}`);
-      return evaluation;
+      return refusedResult;
     }
 
     // Even if static checks pass, this final guard prevents accidental submissions unless the command is explicitly submit.
@@ -1620,6 +1859,11 @@ class LiveAdapter {
     }
 
     const intent = normalizeIntent(rawIntent);
+    if (Number(intent.liveStage) === 5 && intent.singleCanarySessionEligible === true) {
+      const canaryResult = await this.handleSingleCanarySubmission(intent, evaluation);
+      this.logEvent(canaryResult);
+      return canaryResult;
+    }
     let openOrders = [];
     try {
       openOrders = await this.live.getOpenOrders({ openOrderParams: { asset_id: intent.tokenId } }, 'submit');
@@ -1746,47 +1990,22 @@ class LiveAdapter {
   }
 
   async reconcile() {
-    const allowed = this.live.secretAccessDecision('reconcile');
-    if (!allowed.ok) {
-      const event = {
-        timestamp: nowIso(),
-        type: 'LIVE_RECONCILE_REFUSED',
-        decision: 'REFUSED',
-        reasons: allowed.reasons,
-        walletAddress: redactWallet(resolvePolymarketFunderAddress(process.env).funderAddress),
-        usdcBalance: null,
-        gasBalance: null,
-        openOrdersCount: 0,
-        openOrdersUsd: 0,
-        positionsCount: 0,
-        positionsUsd: 0,
-        lastReconciledAt: nowIso(),
-        submitted: false,
-        signed: false,
-      };
-      this.saveReconcileSnapshot(event);
-      this.logExecution(event);
-      return event;
-    }
-
-    let state;
-    try {
-      state = await this.live.reconcile();
-    } catch (e) {
-      state = {
-        timestamp: nowIso(),
-        walletAddress: null,
-        usdcBalance: null,
-        gasBalance: null,
-        openOrdersCount: 0,
-        openOrdersUsd: 0,
-        positionsCount: 0,
-        positionsUsd: 0,
-        lastReconciledAt: nowIso(),
-        errors: [safeError(e)],
-      };
-    }
-    const event = { ...state, type: state.errors?.length ? 'LIVE_RECONCILE_REFUSED' : 'LIVE_RECONCILE', decision: state.errors?.length ? 'REFUSED' : 'OK', submitted: false, signed: false };
+    const event = {
+      timestamp: nowIso(),
+      type: 'LIVE_RECONCILE_REFUSED',
+      decision: 'REFUSED',
+      reasons: ['LEGACY_RECONCILE_DISABLED_USE_LIVE_ACCOUNT_TRUTH_READONLY'],
+      walletAddress: null,
+      usdcBalance: null,
+      gasBalance: null,
+      openOrdersCount: null,
+      openOrdersUsd: null,
+      positionsCount: null,
+      positionsUsd: null,
+      lastReconciledAt: null,
+      submitted: false,
+      signed: false,
+    };
     this.saveReconcileSnapshot(event);
     this.logExecution(event);
     return event;
@@ -2095,7 +2314,21 @@ function redactIntent(intent) {
     bestBid: Number.isFinite(intent.bestBid) ? intent.bestBid : null,
     bestAsk: Number.isFinite(intent.bestAsk) ? intent.bestAsk : null,
     currentLiveExposureUsd: intent.currentLiveExposureUsd,
+    currentLiveExposureSource: intent.currentLiveExposureSource,
+    currentLiveExposureAuthenticatedReconciliation: intent.currentLiveExposureAuthenticatedReconciliation,
+    currentLiveExposureObservedAt: intent.currentLiveExposureObservedAt,
+    riskApprovedSizeUsd: Number.isFinite(intent.riskApprovedSizeUsd) ? intent.riskApprovedSizeUsd : null,
+    adjustedSizeRiskApproved: intent.adjustedSizeRiskApproved,
+    adjustedSizeRiskBlocker: intent.adjustedSizeRiskBlocker,
     currentDailyLivePnlUsd: intent.currentDailyLivePnlUsd,
+    currentDailyLivePnlReconciled: intent.currentDailyLivePnlReconciled,
+    currentDailyLivePnlObservedAt: intent.currentDailyLivePnlObservedAt,
+    liveOrdersLastHour: intent.currentLiveOrdersLastHour,
+    liveOrdersLastHourReconciled: intent.liveOrdersLastHourReconciled,
+    liveOrdersLastHourObservedAt: intent.liveOrdersLastHourObservedAt,
+    accountIdentityMatches: intent.accountIdentityMatches,
+    liveAccountSnapshotFresh: intent.liveAccountSnapshotFresh,
+    liveAccountSnapshotObservedAt: intent.liveAccountSnapshotObservedAt,
     paperBurnIn: intent.paperBurnIn,
   };
 }
@@ -2230,9 +2463,11 @@ module.exports = {
   PolymarketLiveClient,
   readConfig,
   normalizeIntent,
+  buildPolymarketUserOrder,
   evaluateStaticSafety,
   evaluateMetadataSafety,
   evaluateBurnIn,
+  evaluateLiveAccountTruth,
   evaluateLossExposureGuards,
   probeHostReachable,
   probeRpcReachable,

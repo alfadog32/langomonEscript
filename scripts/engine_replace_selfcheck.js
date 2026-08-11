@@ -42,6 +42,33 @@ function makeBook() {
   };
 }
 
+function makeHistoricalPlacementBook() {
+  return {
+    bestBid: 0.69,
+    bestAsk: 0.73,
+    midpoint: 0.71,
+    spread: 0.04,
+    tickSize: 0.01,
+    cachedAt: Date.now(),
+    bids: [{ price: 0.69, size: 5 }],
+    asks: [{ price: 0.73, size: 13 }],
+  };
+}
+
+function makeHistoricalTouchBook({ marketable = true } = {}) {
+  const bestAsk = marketable ? 0.70 : 0.71;
+  return {
+    bestBid: 0.63,
+    bestAsk,
+    midpoint: (0.63 + bestAsk) / 2,
+    spread: bestAsk - 0.63,
+    tickSize: 0.01,
+    cachedAt: Date.now(),
+    bids: [{ price: 0.63, size: 28.7 }],
+    asks: [{ price: bestAsk, size: 5 }],
+  };
+}
+
 function makeSignal(overrides = {}) {
   return new Signal({
     strategy: 'SpreadHunter',
@@ -121,6 +148,48 @@ function run() {
     assert.strictEqual(engine.place(makeSignal({ price: 0.770 }), makeBook()), false, 'age guard should keep duplicate protection active');
     assert.strictEqual(portfolio.openOrders.size, 1);
     assert.strictEqual(portfolio.openOrderExposureUsd(), 3);
+  }
+
+  {
+    const config = makeConfig({
+      orderTtlMs: 45_000,
+      paperRealisticFills: true,
+      paperFillMinDelayMs: 1_000,
+      paperFillMaxBookAgeMs: 3_000,
+      paperQueueHaircutPct: 0.50,
+      partialFillDepthFraction: 0.80,
+      minFillUsd: 0.50,
+    });
+    const portfolio = new PaperPortfolio(config);
+    const engine = new PaperExecutionEngine(config, portfolio, { getBook: () => null }, null);
+    const signal = makeSignal({ price: 0.70, sizeUsd: 1, ttlMs: 45_000 });
+    assert.strictEqual(engine.place(signal, makeHistoricalPlacementBook()), true);
+    const order = ageOnlyOrder(portfolio, 44_847);
+    order.expiresAt = Date.now() + 153;
+
+    const touchBook = makeHistoricalTouchBook();
+    engine.processOpenOrders({ tokenId: signal.tokenId, book: touchBook });
+    assert.strictEqual(portfolio.openOrders.size, 0, 'fresh touch must fill before replacement or expiry');
+    const fill = portfolio.fills.at(-1);
+    assert(fill, 'historical touch regression must create a fill');
+    assert.strictEqual(fill.fillSource, 'touch_fill');
+    assert.strictEqual(fill.wasExecutableAtPlacement, false);
+    assert.strictEqual(fill.wasExecutableAtFill, true);
+    assert.strictEqual(fill.price, 0.70);
+  }
+
+  {
+    const config = makeConfig({ orderTtlMs: 45_000, paperRealisticFills: true });
+    const portfolio = new PaperPortfolio(config);
+    const engine = new PaperExecutionEngine(config, portfolio, { getBook: () => null }, null);
+    const signal = makeSignal({ price: 0.70, sizeUsd: 1, ttlMs: 45_000 });
+    assert.strictEqual(engine.place(signal, makeHistoricalPlacementBook()), true);
+    const order = ageOnlyOrder(portfolio, 44_847);
+    order.expiresAt = Date.now() + 153;
+
+    engine.processOpenOrders({ tokenId: signal.tokenId, book: makeHistoricalTouchBook({ marketable: false }) });
+    assert.strictEqual(portfolio.openOrders.size, 1, 'non-marketable historical control must remain resting');
+    assert.strictEqual(portfolio.fills.length, 0, 'non-marketable historical control must not fabricate a fill');
   }
 
   console.log('engine replace self-check passed');
