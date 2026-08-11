@@ -190,7 +190,16 @@ async function run() {
     async fetchMarketFeeMetadata() { return null; },
   };
   const integrationResearch = new ResearchEngine(integrationPoly, integrationCache, integrationConfig);
-  const integrationSelected = await integrationResearch.discoverCandidates();
+  const originalDateNow = Date.now;
+  let integrationSelected;
+  try {
+    // The fixture market is defined relative to NOW. Freeze the production
+    // branch to that same instant so this selfcheck cannot expire at wall time.
+    Date.now = () => NOW;
+    integrationSelected = await integrationResearch.discoverCandidates();
+  } finally {
+    Date.now = originalDateNow;
+  }
   assert.strictEqual(integrationSelected.length, 2, 'production discovery branch must respect its asset budget');
   assert(integrationSelected.every((value) => value.discoveryStrategies.includes('TailEndMispricing')));
   assert.deepStrictEqual(integrationCache.selected, integrationSelected, 'production discovery must publish the selected profile assets');
