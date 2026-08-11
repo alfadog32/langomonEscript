@@ -382,9 +382,11 @@ async function main() {
         Number.isFinite(result.hours) && result.hours > 0 && result.hours <= config.tailEndHours
       ).length,
       strategyEligibleAssetsBeforeRanking: tailEligible.length,
+      strategyEligibleMarketsBeforeRanking: new Set(tailEligible.map(({ entry }) => entry.market.marketId)).size,
       strategyEligibleAssetsPassingLegacyDiscoveryFilters: tailScored.length,
       selectedTimeWindowAssets: selectedTailTimePopulation,
       selectedStrategyEligibleAssets: tailSelectedEligible,
+      selectedStrategyEligibleMarkets: new Set(tailSelected.map(({ entry }) => entry.market.marketId)).size,
       selectedBuyCandidatesWithoutInventory: tailCandidateBuy,
       selectedSellSignalsRequiringInventory: tailCandidateSellNeedsInventory,
       lostToRankingTotal: tailEligible.length - tailSelectedEligible,
@@ -419,6 +421,9 @@ async function main() {
       selectedAssets: strategyAware.selected.length,
       selectedMarkets: new Set(strategyAware.selected.map((asset) => asset.market.marketId)).size,
       selectedTailEligibleAssets: tailEligible.filter(({ entry }) => strategyAwareKeys.has(assetKey(entry))).length,
+      selectedTailEligibleMarkets: new Set(tailEligible
+        .filter(({ entry }) => strategyAwareKeys.has(assetKey(entry)))
+        .map(({ entry }) => entry.market.marketId)).size,
       selectedComplementPairs: completeBinaryPairs(strategyAware.selected
         .filter((asset) => asset.discoveryStrategies?.includes('ComplementArb'))
         .map((asset) => ({
