@@ -107,6 +107,7 @@ const CONFIG = {
   maxMarkets: envInt('MAX_MARKETS', 20),
   maxOutcomesPerMarket: envInt('MAX_OUTCOMES_PER_MARKET', 2),
   marketRefreshEveryCycles: envInt('REFRESH_RESEARCH_EVERY', 10),
+  strategyAwareDiscoveryEnabled: envBool('STRATEGY_AWARE_DISCOVERY_ENABLED', true),
 
   minLiquidity: envNum('MIN_LIQUIDITY', 500),
   minVolume24h: envNum('MIN_VOLUME_24H', 50),
@@ -1512,10 +1513,11 @@ class CLOBWebSocketClient {
 // =========================
 
 class ResearchEngine {
-  constructor(poly, cache, config) {
+  constructor(poly, cache, config, portfolio = null) {
     this.poly = poly;
     this.cache = cache;
     this.config = config;
+    this.portfolio = portfolio;
   }
 
   async discoverCandidates() {
@@ -1523,7 +1525,7 @@ class ResearchEngine {
 
     const events = await this.poly.fetchActiveEvents();
     const markets = this.poly.extractTradableMarkets(events);
-    const assets = [];
+    const observedAssets = [];
 
     for (const market of markets) {
       const outcomes = market.outcomes.slice(0, this.config.maxOutcomesPerMarket);
@@ -1533,12 +1535,11 @@ class ResearchEngine {
           const book = await this.poly.getOrderBook(outcome.tokenId);
           this.cache.setBook(outcome.tokenId, book);
 
-          const conditionId = String(book.market || market.conditionId || '');
-          const scored = this.scoreAsset(market, outcome, book);
-          if (scored) {
-            scored.conditionId = conditionId;
-            scored.negRisk = book.negRisk === true;
-            assets.push(scored);
+          if (isBookComplete(book)) {
+            observedAssets.push(makeDiscoveryAsset(market, outcome, book, {
+              conditionId: String(book.market || market.conditionId || ''),
+              negRisk: book.negRisk === true,
+            }));
           }
         } catch (e) {
           warn(`Skipping book for ${shortId(outcome.tokenId)}: ${e.message}`);
@@ -1548,8 +1549,21 @@ class ResearchEngine {
       }
     }
 
-    assets.sort((a, b) => b.score - a.score);
-    const selection = selectPairPreservingAssets(assets, this.config.maxMarkets);
+    let assets;
+    let selection;
+    if (this.config.strategyAwareDiscoveryEnabled) {
+      assets = buildStrategyAwareDiscoveryAssets(observedAssets, this.config, this.portfolio);
+      selection = selectStrategyAwareAssets(assets, this.config.maxMarkets);
+    } else {
+      assets = observedAssets
+        .map((asset) => this.scoreAsset(asset.market, {
+          tokenId: asset.tokenId,
+          outcome: asset.outcome,
+        }, asset.book))
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score);
+      selection = selectPairPreservingAssets(assets, this.config.maxMarkets);
+    }
     const selected = selection.selected;
     this.cache.setCandidates(selected);
 
@@ -1563,14 +1577,16 @@ class ResearchEngine {
     }
 
     info(
-      `Research selected ${selected.length} assets from ${assets.length} scored assets ` +
+      `Research selected ${selected.length} assets from ${assets.length} strategy-compatible assets ` +
       `(markets=${selection.marketsSelected} completeBinaryMarkets=${selection.completeBinaryMarkets} ` +
-      `orphanedOutcomesAvoided=${selection.orphanedOutcomesAvoided} budget=${this.config.maxMarkets})`
+      `orphanedOutcomesAvoided=${selection.orphanedOutcomesAvoided} budget=${this.config.maxMarkets} ` +
+      `strategyAware=${this.config.strategyAwareDiscoveryEnabled === true})`
     );
     for (const a of selected.slice(0, 10)) {
       info(
         `SELECT score=${a.score.toFixed(1)} ${a.outcome.padEnd(8)} ` +
         `bid=${fmtPrice(a.book.bestBid)} ask=${fmtPrice(a.book.bestAsk)} spread=${fmtPrice(a.book.spread)} ` +
+        `strategies=${(a.discoveryStrategies || ['legacy']).join('+')} ` +
         `liq=$${a.market.liquidity.toFixed(0)} vol24h=$${a.market.volume24h.toFixed(0)} :: ${a.market.question.slice(0, 90)}`
       );
     }
@@ -1579,59 +1595,253 @@ class ResearchEngine {
   }
 
   scoreAsset(market, outcome, book) {
-    if (!isBookComplete(book)) return null;
-    if (book.bestBid < this.config.minBestBid) return null;
-    if (book.bestAsk > this.config.maxBestAsk) return null;
+    return scoreLegacyDiscoveryAsset(market, outcome, book, this.config);
+  }
+}
 
-    const maxSpread = this.config.hunterMode ? this.config.hunterMaxSpread : this.config.maxSpread;
-    if (book.spread <= 0 || book.spread > maxSpread) return null;
+function makeDiscoveryAsset(market, outcome, book, extra = {}) {
+  return {
+    assetKey: `${market.marketId}:${outcome.tokenId}`,
+    market,
+    outcome: outcome.outcome,
+    tokenId: outcome.tokenId,
+    book,
+    score: Number(extra.score || 0),
+    topBidDepthUsd: topDepthUsd(book.bids, 3),
+    topAskDepthUsd: topDepthUsd(book.asks, 3),
+    topDepthTotalUsd: topDepthUsd(book.bids, 1) + topDepthUsd(book.asks, 1),
+    discoveredAt: Date.now(),
+    ...extra,
+  };
+}
 
-    const topBid1Usd = topDepthUsd(book.bids, 1);
-    const topAsk1Usd = topDepthUsd(book.asks, 1);
-    const topBid3Usd = topDepthUsd(book.bids, 3);
-    const topAsk3Usd = topDepthUsd(book.asks, 3);
-    const topOneSideUsd = Math.min(topBid1Usd, topAsk1Usd);
-    const topDepthTotalUsd = topBid1Usd + topAsk1Usd;
+function scoreLegacyDiscoveryAsset(market, outcome, book, config) {
+  if (!isBookComplete(book)) return null;
+  if (book.bestBid < config.minBestBid) return null;
+  if (book.bestAsk > config.maxBestAsk) return null;
 
-    if (topOneSideUsd < this.config.hunterMinTopDepthUsd) return null;
-    if (topDepthTotalUsd > this.config.hunterMaxTopDepthUsd) return null;
+  const maxSpread = config.hunterMode ? config.hunterMaxSpread : config.maxSpread;
+  if (book.spread <= 0 || book.spread > maxSpread) return null;
 
-    const balance = Math.min(topBid3Usd, topAsk3Usd) / Math.max(1, Math.max(topBid3Usd, topAsk3Usd));
-    const agePenalty = endingSoonPenalty(market.endDate);
-    const extremePenalty = priceExtremePenalty(book.midpoint);
+  const topBid1Usd = topDepthUsd(book.bids, 1);
+  const topAsk1Usd = topDepthUsd(book.asks, 1);
+  const topBid3Usd = topDepthUsd(book.bids, 3);
+  const topAsk3Usd = topDepthUsd(book.asks, 3);
+  const topOneSideUsd = Math.min(topBid1Usd, topAsk1Usd);
+  const topDepthTotalUsd = topBid1Usd + topAsk1Usd;
 
-    let score;
-    if (this.config.hunterMode) {
-      const spreadScore = book.spread * 1000;
-      const shallowBookBonus = Math.max(0, 140 - topDepthTotalUsd / 10);
-      const volumeSanity = Math.min(70, Math.log10(1 + market.volume24h) * 17);
-      const liquiditySanity = Math.min(50, Math.log10(1 + market.liquidity) * 11);
-      const balanceScore = balance * 30;
-      const tooWidePenalty = book.spread > 0.14 ? (book.spread - 0.14) * 700 : 0;
+  if (topOneSideUsd < config.hunterMinTopDepthUsd) return null;
+  if (topDepthTotalUsd > config.hunterMaxTopDepthUsd) return null;
 
-      score = spreadScore + shallowBookBonus + volumeSanity + liquiditySanity + balanceScore - extremePenalty - tooWidePenalty - agePenalty;
-    } else {
-      const liquidityScore = Math.log10(1 + market.liquidity) * 18;
-      const volumeScore = Math.log10(1 + market.volume24h) * 14;
-      const spreadScore = Math.min(45, book.spread * 500);
-      const balanceScore = balance * 20;
+  const balance = Math.min(topBid3Usd, topAsk3Usd) / Math.max(1, Math.max(topBid3Usd, topAsk3Usd));
+  const agePenalty = endingSoonPenalty(market.endDate);
+  const extremePenalty = priceExtremePenalty(book.midpoint);
 
-      score = liquidityScore + volumeScore + spreadScore + balanceScore - extremePenalty - agePenalty;
+  let score;
+  if (config.hunterMode) {
+    const spreadScore = book.spread * 1000;
+    const shallowBookBonus = Math.max(0, 140 - topDepthTotalUsd / 10);
+    const volumeSanity = Math.min(70, Math.log10(1 + market.volume24h) * 17);
+    const liquiditySanity = Math.min(50, Math.log10(1 + market.liquidity) * 11);
+    const balanceScore = balance * 30;
+    const tooWidePenalty = book.spread > 0.14 ? (book.spread - 0.14) * 700 : 0;
+
+    score = spreadScore + shallowBookBonus + volumeSanity + liquiditySanity + balanceScore - extremePenalty - tooWidePenalty - agePenalty;
+  } else {
+    const liquidityScore = Math.log10(1 + market.liquidity) * 18;
+    const volumeScore = Math.log10(1 + market.volume24h) * 14;
+    const spreadScore = Math.min(45, book.spread * 500);
+    const balanceScore = balance * 20;
+
+    score = liquidityScore + volumeScore + spreadScore + balanceScore - extremePenalty - agePenalty;
+  }
+
+  return makeDiscoveryAsset(market, outcome, book, {
+    score,
+    topBidDepthUsd: topBid3Usd,
+    topAskDepthUsd: topAsk3Usd,
+    topDepthTotalUsd,
+  });
+}
+
+function tailEndDiscoveryOpportunity(asset, config, now = Date.now()) {
+  if (!config.tailEndEnabled || !isBookComplete(asset?.book)) return null;
+  const endMs = Date.parse(asset?.market?.endDate || '');
+  if (!Number.isFinite(endMs)) return null;
+  const untilMs = endMs - now;
+  if (untilMs <= 0 || untilMs > config.tailEndHours * 60 * 60 * 1000) return null;
+
+  const confidence = confidenceFromPrice(asset.book.midpoint);
+  if (confidence < config.tailEndMinConfidence || asset.book.spread > 0.08) return null;
+  const edge = Math.abs(asset.book.midpoint - 0.5) - asset.book.spread - config.slippageBuffer;
+  if (edge < config.minSignalEdge) return null;
+
+  return {
+    score: confidence * 100 + edge * 100 - asset.book.spread * 50,
+    confidence,
+    edge,
+    hoursUntilEnd: untilMs / (60 * 60 * 1000),
+  };
+}
+
+function complementArbDiscoveryOpportunity(group, config) {
+  if (!config.complementArbEnabled || !isCompleteBinaryComplementGroup(group)) return null;
+  if (group.some((asset) => !isBookComplete(asset.book) || asset.book.negRisk === true)) return null;
+  if (group.some((asset) => asset.book.minOrderSizeReported !== true)) return null;
+
+  const topAskSum = group[0].book.bestAsk + group[1].book.bestAsk;
+  if (!(topAskSum > 0)) return null;
+  const budgetUsd = Math.min(config.baseOrderUsd, config.maxMarketExposureUsd / 4);
+  const shares = budgetUsd / topAskSum;
+  const requiredMinShares = Math.max(...group.map((asset) => Number(asset.book.minOrderSize)));
+  if (!Number.isFinite(requiredMinShares) || !(shares >= requiredMinShares)) return null;
+
+  return {
+    score: (1 - topAskSum) * 100,
+    topAskSum,
+    shares,
+    requiredMinShares,
+    budgetUsd,
+  };
+}
+
+function addDiscoveryProfileAsset(byKey, asset, strategy, score, details = {}) {
+  const existing = byKey.get(asset.assetKey) || {
+    ...asset,
+    discoveryStrategies: [],
+    discoveryScores: {},
+    discoveryDetails: {},
+  };
+  if (!existing.discoveryStrategies.includes(strategy)) existing.discoveryStrategies.push(strategy);
+  existing.discoveryScores[strategy] = score;
+  existing.discoveryDetails[strategy] = details;
+  existing.score = Math.max(...Object.values(existing.discoveryScores));
+  byKey.set(asset.assetKey, existing);
+}
+
+function buildStrategyAwareDiscoveryAssets(observedAssets, config, portfolio = null, now = Date.now()) {
+  const byKey = new Map();
+  const legacyProfileEnabled = config.spreadHunterEnabled ||
+    (config.enableWhaleTracking && config.enableWhaleCopyStrategy);
+
+  for (const asset of observedAssets) {
+    const outcome = { tokenId: asset.tokenId, outcome: asset.outcome };
+    const legacy = legacyProfileEnabled
+      ? scoreLegacyDiscoveryAsset(asset.market, outcome, asset.book, config)
+      : null;
+    if (legacy && config.spreadHunterEnabled) {
+      addDiscoveryProfileAsset(byKey, asset, 'SpreadHunter', legacy.score);
+    }
+    if (legacy && config.enableWhaleTracking && config.enableWhaleCopyStrategy) {
+      addDiscoveryProfileAsset(byKey, asset, 'WhaleCopy', legacy.score);
     }
 
-    return {
-      assetKey: `${market.marketId}:${outcome.tokenId}`,
-      market,
-      outcome: outcome.outcome,
-      tokenId: outcome.tokenId,
-      book,
-      score,
-      topBidDepthUsd: topBid3Usd,
-      topAskDepthUsd: topAsk3Usd,
-      topDepthTotalUsd,
-      discoveredAt: Date.now(),
-    };
+    const tail = tailEndDiscoveryOpportunity(asset, config, now);
+    if (tail) addDiscoveryProfileAsset(byKey, asset, 'TailEndMispricing', tail.score, tail);
+
+    const positionQty = Number(portfolio?.position?.(asset.tokenId) || 0);
+    if (config.inventoryExitEnabled && positionQty > 0) {
+      addDiscoveryProfileAsset(
+        byKey,
+        asset,
+        'InventoryExit',
+        positionQty * asset.book.midpoint,
+        { positionQty, positionUsd: positionQty * asset.book.midpoint }
+      );
+    }
   }
+
+  const byMarket = new Map();
+  for (const asset of observedAssets) {
+    const marketId = String(asset?.market?.marketId || '');
+    if (!marketId) continue;
+    if (!byMarket.has(marketId)) byMarket.set(marketId, []);
+    byMarket.get(marketId).push(asset);
+  }
+  for (const group of byMarket.values()) {
+    const complement = complementArbDiscoveryOpportunity(group, config);
+    if (!complement) continue;
+    for (const asset of group) {
+      addDiscoveryProfileAsset(byKey, asset, 'ComplementArb', complement.score, complement);
+    }
+  }
+
+  return [...byKey.values()];
+}
+
+const DISCOVERY_STRATEGY_ORDER = [
+  'InventoryExit',
+  'ComplementArb',
+  'TailEndMispricing',
+  'SpreadHunter',
+  'WhaleCopy',
+];
+
+function selectStrategyAwareAssets(strategyAssets, assetBudget) {
+  const budget = Math.max(0, Number(assetBudget) || 0);
+  const byMarket = new Map();
+  for (const asset of strategyAssets) {
+    const marketId = String(asset?.market?.marketId || '');
+    if (!marketId) continue;
+    if (!byMarket.has(marketId)) byMarket.set(marketId, []);
+    byMarket.get(marketId).push(asset);
+  }
+
+  const groups = [...byMarket.entries()].map(([marketId, group]) => ({ marketId, group }));
+  const strategies = DISCOVERY_STRATEGY_ORDER.filter((strategy) =>
+    strategyAssets.some((asset) => Number.isFinite(asset.discoveryScores?.[strategy]))
+  );
+  const rankedByStrategy = new Map(strategies.map((strategy) => [
+    strategy,
+    groups
+      .filter(({ group }) => group.some((asset) => Number.isFinite(asset.discoveryScores?.[strategy])))
+      .sort((a, b) => {
+        const score = (entry) => Math.max(...entry.group.map((asset) => asset.discoveryScores?.[strategy] ?? -Infinity));
+        return score(b) - score(a);
+      }),
+  ]));
+  const cursors = new Map(strategies.map((strategy) => [strategy, 0]));
+  const selected = [];
+  const selectedMarkets = new Set();
+  const oversizedMarkets = new Set();
+  let orphanedOutcomesAvoided = 0;
+  let madeProgress = true;
+
+  while (selected.length < budget && madeProgress) {
+    madeProgress = false;
+    for (const strategy of strategies) {
+      const ranked = rankedByStrategy.get(strategy);
+      let cursor = cursors.get(strategy);
+      while (cursor < ranked.length) {
+        const candidate = ranked[cursor];
+        cursor += 1;
+        cursors.set(strategy, cursor);
+        if (selectedMarkets.has(candidate.marketId)) continue;
+        if (candidate.group.length > budget - selected.length) {
+          if (!oversizedMarkets.has(candidate.marketId)) {
+            oversizedMarkets.add(candidate.marketId);
+            orphanedOutcomesAvoided += candidate.group.length;
+          }
+          continue;
+        }
+        selected.push(...candidate.group);
+        selectedMarkets.add(candidate.marketId);
+        madeProgress = true;
+        break;
+      }
+      if (selected.length >= budget) break;
+    }
+  }
+
+  const completeBinaryMarkets = [...selectedMarkets].filter((marketId) =>
+    isCompleteBinaryComplementGroup(byMarket.get(marketId))
+  ).length;
+  return {
+    selected,
+    marketsSelected: selectedMarkets.size,
+    completeBinaryMarkets,
+    orphanedOutcomesAvoided,
+  };
 }
 
 /**
@@ -8544,7 +8754,7 @@ class BotEngine {
     this.execution.paperUpdates = this.paperUpdates;
     this.execution.bot = this;
 
-    this.research = new ResearchEngine(this.poly, this.cache, config);
+    this.research = new ResearchEngine(this.poly, this.cache, config, this.portfolio);
     this.assets = [];
     this.cycle = 0;
     this.wsClient = null;
@@ -17255,8 +17465,12 @@ module.exports = {
   Signal,
   SpreadHunterStrategy,
   ComplementArbStrategy,
+  buildStrategyAwareDiscoveryAssets,
+  selectStrategyAwareAssets,
   selectPairPreservingAssets,
   isCompleteBinaryComplementGroup,
+  tailEndDiscoveryOpportunity,
+  complementArbDiscoveryOpportunity,
   VolatilityGuard,
   isBookComplete,
   topDepthUsd,
