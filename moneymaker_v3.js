@@ -50,6 +50,10 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { resolveLiveStageProfile } = require('./live_adapter_polymarket');
+// Shared executable-depth and official fee maths. Reused rather than
+// reimplemented so ComplementArb and the forward research collectors price a
+// walked order book identically.
+const { walk: walkOrderBookLevels, feeUsd: complementLegFeeUsd } = require('./lib/btc_latency_shadow');
 const {
   DEFAULT_PROXY_WALLET,
   DEFAULT_USERNAME,
@@ -321,6 +325,12 @@ const CONFIG = {
   tailEndEnabled: envBool('STRAT_TAIL_END', true),
 
   complementArbMinEdge: envNum('COMPLEMENT_ARB_MIN_EDGE', 0.012),
+  // ComplementArb prices fees from CURRENT official CLOB market metadata
+  // (/clob-markets/<conditionId> -> fd.r / fd.e), never from a static default.
+  // A configured value would not be authoritative: observed live rates differ
+  // per market (0.05 seen where a hardcoded 0.07 had been assumed), so an
+  // assumption can be anti-conservative on any market with a higher rate.
+  complementArbFeeMaxAgeMs: envInt('COMPLEMENT_ARB_FEE_MAX_AGE_MS', 15 * 60_000),
   spreadHunterMinEdge: envNum('SPREAD_HUNTER_MIN_EDGE', 0.01),
   tailEndHours: envNum('TAIL_END_HOURS', 36),
   tailEndMinConfidence: envNum('TAIL_END_MIN_CONFIDENCE', 0.58),
@@ -693,6 +703,31 @@ class PolymarketPublicClient {
     return markets;
   }
 
+  // Official CLOB fee descriptor for a condition/market id.
+  // Mirrors the mechanism proven in scripts/btc_latency_shadow.js: fd.r is the
+  // fee rate, fd.e the exponent, fd.to the taker-only flag. Returns null rather
+  // than a guess so callers can fail closed.
+  async fetchMarketFeeMetadata(conditionId) {
+    const id = String(conditionId || '');
+    if (!id) return null;
+    try {
+      const info = await this.http.getJson(`${this.config.clobBaseUrl}/clob-markets/${encodeURIComponent(id)}`);
+      const rate = Number(info?.fd?.r);
+      const exponent = Number(info?.fd?.e);
+      if (!Number.isFinite(rate) || !Number.isFinite(exponent)) return null;
+      return {
+        rate,
+        exponent,
+        takerOnly: info?.fd?.to !== false,
+        conditionId: id,
+        source: 'official_clob_market_info',
+        observedAtMs: Date.now(),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async getOrderBook(tokenId) {
     const url = new URL('/book', this.config.clobBaseUrl);
     url.searchParams.set('token_id', String(tokenId));
@@ -752,6 +787,10 @@ function normalizeBook(raw, fallbackAssetId = '') {
     midpoint,
     spread,
     minOrderSize: toNum(raw?.min_order_size ?? raw?.minOrderSize, 5),
+    // Distinguishes a venue-reported minimum from the fallback above, so
+    // consumers that must not guess (e.g. ComplementArb) can fail closed.
+    minOrderSizeReported: Number.isFinite(toNum(raw?.min_order_size ?? raw?.minOrderSize, NaN)),
+    negRisk: raw?.neg_risk === true || raw?.negRisk === true,
     tickSize: toNum(raw?.tick_size ?? raw?.tickSize, 0.01),
     lastTradePrice: toNum(raw?.last_trade_price ?? raw?.lastTradePrice, NaN),
     cachedAt: Date.now(),
@@ -781,6 +820,25 @@ class MarketCache {
     this.marketsById = new Map();
     this.assetsByToken = new Map();
     this.negativeBookCache = new Map();
+    this.marketFeeMetadata = new Map();
+  }
+
+  setMarketFeeMetadata(conditionId, metadata) {
+    const id = String(conditionId || '');
+    if (!id) return;
+    if (metadata) this.marketFeeMetadata.set(id, metadata);
+    else this.marketFeeMetadata.delete(id);
+  }
+
+  // Returns null when absent or older than maxAgeMs so callers fail closed
+  // instead of pricing a trade with stale fee terms.
+  getMarketFeeMetadata(conditionId, maxAgeMs = null) {
+    const meta = this.marketFeeMetadata.get(String(conditionId || '')) || null;
+    if (!meta) return null;
+    if (Number.isFinite(maxAgeMs) && maxAgeMs > 0) {
+      if (Date.now() - Number(meta.observedAtMs || 0) > maxAgeMs) return null;
+    }
+    return meta;
   }
 
   setCandidates(assets) {
@@ -1042,8 +1100,13 @@ class ResearchEngine {
           const book = await this.poly.getOrderBook(outcome.tokenId);
           this.cache.setBook(outcome.tokenId, book);
 
+          const conditionId = String(book.market || market.conditionId || '');
           const scored = this.scoreAsset(market, outcome, book);
-          if (scored) assets.push(scored);
+          if (scored) {
+            scored.conditionId = conditionId;
+            scored.negRisk = book.negRisk === true;
+            assets.push(scored);
+          }
         } catch (e) {
           warn(`Skipping book for ${shortId(outcome.tokenId)}: ${e.message}`);
         }
@@ -1053,10 +1116,24 @@ class ResearchEngine {
     }
 
     assets.sort((a, b) => b.score - a.score);
-    const selected = assets.slice(0, this.config.maxMarkets);
+    const selection = selectPairPreservingAssets(assets, this.config.maxMarkets);
+    const selected = selection.selected;
     this.cache.setCandidates(selected);
 
-    info(`Research selected ${selected.length} assets from ${assets.length} scored assets.`);
+    // Current official fee terms, fetched only for the SELECTED conditions
+    // (<= maxMarkets assets, so a handful of calls) rather than for every
+    // scanned market. Absent metadata is left absent so consumers fail closed.
+    const feeConditionIds = [...new Set(selected.map((a) => String(a.conditionId || '')).filter(Boolean))];
+    for (const conditionId of feeConditionIds) {
+      if (this.cache.getMarketFeeMetadata(conditionId, this.config.complementArbFeeMaxAgeMs)) continue;
+      this.cache.setMarketFeeMetadata(conditionId, await this.poly.fetchMarketFeeMetadata(conditionId));
+    }
+
+    info(
+      `Research selected ${selected.length} assets from ${assets.length} scored assets ` +
+      `(markets=${selection.marketsSelected} completeBinaryMarkets=${selection.completeBinaryMarkets} ` +
+      `orphanedOutcomesAvoided=${selection.orphanedOutcomesAvoided} budget=${this.config.maxMarkets})`
+    );
     for (const a of selected.slice(0, 10)) {
       info(
         `SELECT score=${a.score.toFixed(1)} ${a.outcome.padEnd(8)} ` +
@@ -1122,6 +1199,67 @@ class ResearchEngine {
       discoveredAt: Date.now(),
     };
   }
+}
+
+/**
+ * A group is a usable ComplementArb pair only when it is EXACTLY the two
+ * complementary outcomes of a binary market. `group.length >= 2` is NOT
+ * sufficient: a multi-outcome market sliced to two outcomes would give two
+ * non-complementary legs whose combined payout is not $1, invalidating the
+ * equal-share arbitrage entirely.
+ */
+function isCompleteBinaryComplementGroup(group) {
+  if (!Array.isArray(group) || group.length !== 2) return false;
+  const [a, b] = group;
+  const marketA = String(a?.market?.marketId || '');
+  const marketB = String(b?.market?.marketId || '');
+  if (!marketA || marketA !== marketB) return false;
+  const tokenA = String(a?.tokenId || '');
+  const tokenB = String(b?.tokenId || '');
+  if (!tokenA || !tokenB || tokenA === tokenB) return false;
+  // The market itself must be binary, judged on its FULL outcome list.
+  const outcomes = Array.isArray(a?.market?.outcomes) ? a.market.outcomes : [];
+  if (outcomes.length !== 2) return false;
+  // The two legs must be precisely the market's two tokens.
+  const marketTokens = outcomes.map((o) => String(o?.tokenId || ''));
+  if (new Set(marketTokens).size !== 2) return false;
+  return marketTokens.includes(tokenA) && marketTokens.includes(tokenB);
+}
+
+function selectPairPreservingAssets(scoredAssets, assetBudget) {
+  const budget = Math.max(0, Number(assetBudget) || 0);
+  const byMarket = new Map();
+  for (const asset of scoredAssets) {
+    const marketId = String(asset?.market?.marketId || '');
+    if (!marketId) continue;
+    if (!byMarket.has(marketId)) byMarket.set(marketId, []);
+    byMarket.get(marketId).push(asset);
+  }
+
+  // Rank markets by their strongest outcome, preserving the existing score order.
+  const ranked = [...byMarket.entries()]
+    .map(([marketId, group]) => ({ marketId, group, bestScore: Math.max(...group.map((a) => a.score)) }))
+    .sort((a, b) => b.bestScore - a.bestScore);
+
+  const selected = [];
+  let marketsSelected = 0;
+  let completeBinaryMarkets = 0;
+  let orphanedOutcomesAvoided = 0;
+
+  for (const { group } of ranked) {
+    if (selected.length >= budget) break;
+    if (group.length > budget - selected.length) {
+      // Admitting part of this market would orphan the rest. Skip it whole and
+      // let a smaller market use the remaining budget.
+      orphanedOutcomesAvoided += group.length;
+      continue;
+    }
+    selected.push(...group);
+    marketsSelected += 1;
+    if (isCompleteBinaryComplementGroup(group)) completeBinaryMarkets += 1;
+  }
+
+  return { selected, marketsSelected, completeBinaryMarkets, orphanedOutcomesAvoided };
 }
 
 function isBookComplete(book) {
@@ -1811,6 +1949,16 @@ class ComplementArbStrategy extends Strategy {
     const siblings = this.cache.getMarketAssets(asset.market.marketId);
     if (siblings.length < 2) return this.skip(asset, book, 'missing_complement_sibling', { siblings: siblings.length });
 
+    // Only an exact binary complement pair has a $1 combined payout. Anything
+    // ambiguous, duplicated or multi-outcome fails closed.
+    if (!isCompleteBinaryComplementGroup(siblings)) {
+      return this.skip(asset, book, 'complement_not_exact_binary_pair', {
+        siblings: siblings.length,
+        marketOutcomeCount: Array.isArray(asset?.market?.outcomes) ? asset.market.outcomes.length : null,
+        distinctTokens: new Set(siblings.map((x) => String(x?.tokenId || ''))).size,
+      });
+    }
+
     const a = siblings[0];
     const b = siblings[1];
     if (asset.tokenId !== a.tokenId) return this.skip(asset, book, 'complement_emit_once_per_market'); // emit once per market
@@ -1832,22 +1980,140 @@ class ComplementArbStrategy extends Strategy {
       });
     }
 
-    const buyBothCost = bookA.bestAsk + bookB.bestAsk;
-    const lockedEdge = 1 - buyBothCost;
-
-    // In a binary market, buying both outcomes below $1 can be a settlement arbitrage.
-    // This still needs both sides filled; paper mode treats them separately and tracks strategy.
-    if (lockedEdge < this.config.complementArbMinEdge) {
-      return this.skip(asset, book, 'complement_edge_below_min', {
-        buyBothCost,
-        lockedEdge,
-        minComplementEdge: this.config.complementArbMinEdge,
+    // Both legs must be observed close enough together to be treated as one
+    // simultaneous state. A stale leg makes the "locked" edge fictional.
+    const now = Date.now();
+    const ageA = now - Number(bookA.cachedAt || 0);
+    const ageB = now - Number(bookB.cachedAt || 0);
+    const skewMs = Math.abs(Number(bookA.cachedAt || 0) - Number(bookB.cachedAt || 0));
+    const maxLegAgeMs = Math.max(1, Number(this.config.paperFillMaxBookAgeMs || 0));
+    const maxSkewMs = Math.max(1, Number(this.config.routeAuthMaxBookAgeMs || 0));
+    if (!(ageA <= maxLegAgeMs && ageB <= maxLegAgeMs && skewMs <= maxSkewMs)) {
+      return this.skip(asset, book, 'complement_books_not_coherent', {
+        legAAgeMs: ageA, legBAgeMs: ageB, skewMs, maxLegAgeMs, maxSkewMs,
       });
     }
 
-    const sizeUsdEach = Math.min(this.config.baseOrderUsd, this.config.maxMarketExposureUsd / 4);
+    if (bookA.negRisk === true || bookB.negRisk === true) {
+      return this.skip(asset, book, 'complement_neg_risk_market', {
+        legANegRisk: bookA.negRisk === true, legBNegRisk: bookB.negRisk === true,
+      });
+    }
+
+    // Equal-share sizing: holding N shares of both outcomes of a binary market
+    // pays exactly N at resolution, so the arbitrage is N - (cost of both legs).
+    const budgetUsd = Math.min(this.config.baseOrderUsd, this.config.maxMarketExposureUsd / 4);
+    const topAskSum = bookA.bestAsk + bookB.bestAsk;
+    if (!(topAskSum > 0)) return this.skip(asset, book, 'complement_invalid_ask_sum', { topAskSum });
+    const shares = budgetUsd / topAskSum;
+    if (!Number.isFinite(shares) || shares <= 0) {
+      return this.skip(asset, book, 'complement_invalid_shares', { shares, budgetUsd, topAskSum });
+    }
+
+    // Minimum-order feasibility on BOTH legs, using each book's own minimum.
+    if (bookA.minOrderSizeReported !== true || bookB.minOrderSizeReported !== true) {
+      return this.skip(asset, book, 'complement_min_order_size_unreported', {
+        legAReported: bookA.minOrderSizeReported === true,
+        legBReported: bookB.minOrderSizeReported === true,
+      });
+    }
+    const minSharesA = Number(bookA.minOrderSize);
+    const minSharesB = Number(bookB.minOrderSize);
+    const requiredMinShares = Math.max(
+      Number.isFinite(minSharesA) ? minSharesA : 0,
+      Number.isFinite(minSharesB) ? minSharesB : 0
+    );
+    if (shares < requiredMinShares) {
+      return this.skip(asset, book, 'complement_below_min_order_size', {
+        shares, requiredMinShares, minSharesA, minSharesB, budgetUsd,
+      });
+    }
+
+    // Executable ASK sum: walk the displayed ladder for the full share count on
+    // each leg. Fails closed when displayed depth cannot fill; hidden liquidity
+    // is never assumed.
+    const legA = walkOrderBookLevels(bookA.asks, shares);
+    const legB = walkOrderBookLevels(bookB.asks, shares);
+    if (!legA.sufficient || !legB.sufficient) {
+      return this.skip(asset, book, 'complement_insufficient_displayed_depth', {
+        shares,
+        legASharesFilled: legA.sharesFilled,
+        legBSharesFilled: legB.sharesFilled,
+      });
+    }
+
+    // Authoritative fee parameters. Absent or invalid fee metadata fails closed:
+    // an unpriced fee is never treated as zero.
+    const conditionId = String(bookA.market || a.conditionId || '');
+    const feeMeta = this.cache.getMarketFeeMetadata?.(conditionId, this.config.complementArbFeeMaxAgeMs) || null;
+    if (!feeMeta || feeMeta.source !== 'official_clob_market_info') {
+      return this.skip(asset, book, 'complement_fee_metadata_unknown', {
+        conditionId,
+        haveFeeMetadata: Boolean(feeMeta),
+        feeSource: feeMeta?.source || null,
+      });
+    }
+    const feeRate = Number(feeMeta.rate);
+    const feeExponent = Number(feeMeta.exponent);
+    const feeA = complementLegFeeUsd(shares, legA.averagePrice, feeRate, feeExponent);
+    const feeB = complementLegFeeUsd(shares, legB.averagePrice, feeRate, feeExponent);
+    if (feeA === null || feeB === null) {
+      return this.skip(asset, book, 'complement_fee_metadata_unknown', { conditionId, feeRate, feeExponent });
+    }
+
+    const executableCostUsd = legA.notionalUsd + legB.notionalUsd;
+    const feesUsd = feeA + feeB;
+    const payoutUsd = shares; // exactly one outcome resolves to $1/share
+    const netEdgeUsd = payoutUsd - executableCostUsd - feesUsd;
+    const netEdgePerShare = netEdgeUsd / shares;
+    const executableAskSum = executableCostUsd / shares;
+
+    const economics = {
+      shares,
+      budgetUsd,
+      topAskSum,
+      executableAskSum,
+      executableCostUsd,
+      feesUsd,
+      feeRate,
+      feeExponent,
+      feeSource: feeMeta.source,
+      feeTakerOnly: feeMeta.takerOnly,
+      feeObservedAtMs: feeMeta.observedAtMs,
+      conditionId,
+      payoutUsd,
+      netEdgeUsd,
+      netEdgePerShare,
+      legAAveragePrice: legA.averagePrice,
+      legBAveragePrice: legB.averagePrice,
+      requiredMinShares,
+      legAAgeMs: ageA,
+      legBAgeMs: ageB,
+      skewMs,
+      minComplementEdge: this.config.complementArbMinEdge,
+    };
+
+    // Require genuine NET executable profit per share after depth and fees --
+    // not a top-of-book price difference.
+    if (!(netEdgePerShare >= this.config.complementArbMinEdge)) {
+      return this.skip(asset, book, 'complement_edge_below_min', economics);
+    }
+
+    const lockedEdge = netEdgePerShare;
+    const sizeUsdA = legA.notionalUsd;
+    const sizeUsdB = legB.notionalUsd;
     const confidence = clamp(0.65 + lockedEdge * 8, 0, 0.98);
     const pairId = crypto.randomUUID();
+
+    const reason = `Complement buy arb: executableAskSum=${executableAskSum.toFixed(4)} ` +
+      `netEdgePerShare=${netEdgePerShare.toFixed(4)} shares=${shares.toFixed(2)} fees=$${feesUsd.toFixed(4)}`;
+    const legMeta = (leg) => ({
+      pairId,
+      complementKey: `${a.tokenId}:${b.tokenId}`,
+      leg,
+      complementEconomics: economics,
+      requiresBothLegs: true,
+    });
 
     return this.emit(asset, book, [
       new Signal({
@@ -1855,32 +2121,32 @@ class ComplementArbStrategy extends Strategy {
         tokenId: a.tokenId,
         marketId: a.market.marketId,
         side: 'buy',
-        price: bookA.bestAsk,
-        sizeUsd: sizeUsdEach,
-        expectedEdge: lockedEdge / 2,
+        price: legA.averagePrice,
+        sizeUsd: sizeUsdA,
+        expectedEdge: netEdgePerShare / 2,
         confidence,
-        reason: `Complement buy arb: askSum=${buyBothCost.toFixed(3)} lockedEdge=${lockedEdge.toFixed(3)}`,
+        reason,
         exitPlan: 'Atomic paper pair: fill both legs together or cancel together',
         ttlMs: Math.min(this.config.orderTtlMs, 15_000),
         maxHoldMs: 24 * 60 * 60_000,
-        metadata: { pairId, complementKey: `${a.tokenId}:${b.tokenId}`, leg: 1, marketQuestion: a.market.question, outcome: a.outcome },
+        metadata: { ...legMeta(1), marketQuestion: a.market.question, outcome: a.outcome },
       }),
       new Signal({
         strategy: this.name,
         tokenId: b.tokenId,
         marketId: b.market.marketId,
         side: 'buy',
-        price: bookB.bestAsk,
-        sizeUsd: sizeUsdEach,
-        expectedEdge: lockedEdge / 2,
+        price: legB.averagePrice,
+        sizeUsd: sizeUsdB,
+        expectedEdge: netEdgePerShare / 2,
         confidence,
-        reason: `Complement buy arb: askSum=${buyBothCost.toFixed(3)} lockedEdge=${lockedEdge.toFixed(3)}`,
+        reason,
         exitPlan: 'Atomic paper pair: fill both legs together or cancel together',
         ttlMs: Math.min(this.config.orderTtlMs, 15_000),
         maxHoldMs: 24 * 60 * 60_000,
-        metadata: { pairId, complementKey: `${a.tokenId}:${b.tokenId}`, leg: 2, marketQuestion: b.market.question, outcome: b.outcome },
+        metadata: { ...legMeta(2), marketQuestion: b.market.question, outcome: b.outcome },
       }),
-    ], { buyBothCost, lockedEdge });
+    ], economics);
   }
 }
 
@@ -15226,6 +15492,8 @@ if (require.main === module) {
 
 module.exports = {
   CONFIG,
+  MarketCache,
+  ResearchEngine,
   BotEngine,
   EngineDiagnostics,
   MultiConsensusEngine,
@@ -15236,6 +15504,9 @@ module.exports = {
   PaperOrder,
   Signal,
   SpreadHunterStrategy,
+  ComplementArbStrategy,
+  selectPairPreservingAssets,
+  isCompleteBinaryComplementGroup,
   VolatilityGuard,
   isBookComplete,
   topDepthUsd,
