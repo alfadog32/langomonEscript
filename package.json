@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node moneymaker_v3.js",
-    "check": "node --check gabagool_btc_behavior.js && node --check moneymaker_v3.js && node --check live_adapter_polymarket.js && node --check live_intent_router.js && node --check telegram/telegram_approval_bot.js && node --check dashboard_server.js && node --check btc_poly_oracle_auto_discovery_runner.js && node --check btc_poly_oracle_v5_sniper_bridge_FIXED.js && node --check scripts/engine_dust_selfcheck.js && node --check scripts/engine_replace_selfcheck.js && node --check scripts/engine_execution_quality_selfcheck.js && node --check scripts/engine_gabagool_btc_selfcheck.js && node --check scripts/research_liveness_selfcheck.js && node --check scripts/telegram_approval_selfcheck.js && node --check scripts/live_readiness_report.js && node --check scripts/live_final_boss_selfcheck.js && node --check scripts/pre_live_supervisor.js",
+    "check": "node --check gabagool_btc_behavior.js && node --check moneymaker_v3.js && node --check live_adapter_polymarket.js && node --check live_intent_router.js && node --check telegram/telegram_approval_bot.js && node --check dashboard_server.js && node --check btc_poly_oracle_auto_discovery_runner.js && node --check btc_poly_oracle_v5_sniper_bridge_FIXED.js && node --check scripts/engine_dust_selfcheck.js && node --check scripts/engine_replace_selfcheck.js && node --check scripts/engine_execution_quality_selfcheck.js && node --check scripts/engine_gabagool_btc_selfcheck.js && node --check scripts/research_liveness_selfcheck.js && node --check scripts/research_strategy_aware_discovery_selfcheck.js && node --check scripts/discovery_strategy_alignment_shadow.js && node --check scripts/telegram_approval_selfcheck.js && node --check scripts/live_readiness_report.js && node --check scripts/live_final_boss_selfcheck.js && node --check scripts/pre_live_supervisor.js",
     "engine:route-selfcheck": "node scripts/engine_route_selfcheck.js",
     "engine:risk-selfcheck": "node scripts/engine_risk_selfcheck.js",
     "engine:confidence-selfcheck": "node scripts/engine_confidence_selfcheck.js",
@@ -18,6 +18,7 @@
     "engine:execution-quality-selfcheck": "node scripts/engine_execution_quality_selfcheck.js",
     "engine:gabagool-btc-selfcheck": "node scripts/engine_gabagool_btc_selfcheck.js",
     "research:liveness-selfcheck": "node scripts/research_liveness_selfcheck.js",
+    "research:strategy-aware-discovery-selfcheck": "node scripts/research_strategy_aware_discovery_selfcheck.js",
     "oracle:check": "node --check btc_poly_oracle_auto_discovery_runner.js && node --check btc_poly_oracle_v5_sniper_bridge_FIXED.js",
     "oracle:doctor": "node btc_poly_oracle_auto_discovery_runner.js doctor",
     "oracle:selfcheck": "node scripts/btc_oracle_selfcheck.js",
