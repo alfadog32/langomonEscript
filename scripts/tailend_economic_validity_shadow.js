@@ -110,7 +110,13 @@ function recordError(message) {
 if (fs.existsSync(OUTPUT)) {
   try {
     const prior = JSON.parse(fs.readFileSync(OUTPUT, 'utf8'));
-    if (prior?.study === state.study && Array.isArray(prior.observations)) state = { ...state, ...prior, reason: 'resumed' };
+    if (prior?.study === state.study && Array.isArray(prior.observations)) {
+      state = { ...state, ...prior, reason: 'resumed' };
+      // Preserve the checkpointed cohort and measurements while reflecting the
+      // current invocation's stopping objective in durable metadata.
+      state.targetUnique = TARGET_UNIQUE;
+      state.minResolved = MIN_RESOLVED;
+    }
   } catch (error) {
     recordError(`resume: ${error.message}`);
   }
